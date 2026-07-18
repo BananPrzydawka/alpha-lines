@@ -1,0 +1,94 @@
+{
+  "models": [
+    {
+      "path": "checkpoints/model_0.pt",
+      "elo": 0
+    },
+    {
+      "path": "checkpoints/model_100.pt",
+      "elo": -7.5
+    },
+    {
+      "path": "checkpoints/model_2.pt",
+      "elo": -7.5
+    },
+    {
+      "path": "checkpoints/model_4.pt",
+      "elo": -7.5
+    },
+    {
+      "path": "checkpoints/model_2.pt",
+      "elo": -7.5
+    },
+    {
+      "path": "checkpoints/model_4.pt",
+      "elo": -5.5
+    },
+    {
+      "path": "checkpoints/model_6.pt",
+      "elo": -4.5
+    },
+    {
+      "path": "checkpoints/model_8.pt",
+      "elo": -4.5
+    },
+    {
+      "path": "checkpoints/model_10.pt",
+      "elo": -4.5
+    },
+    {
+      "path": "checkpoints/model_2.pt",
+      "elo": -4.5
+    },
+    {
+      "path": "checkpoints/model_4.pt",
+      "elo": -4.5
+    },
+    {
+      "path": "checkpoints/model_2.pt",
+      "elo": -4.5
+    }
+  ],
+  "history": [
+    {
+      "batch": 100,
+      "new_wins": 7,
+      "draws": 3,
+      "old_wins": 22,
+      "new_elo": -7.5,
+      "old_elo": 0
+    },
+    {
+      "batch": 4,
+      "new_wins": 6,
+      "draws": 24,
+      "old_wins": 2,
+      "new_elo": -5.5,
+      "old_elo": -7.5
+    },
+    {
+      "batch": 6,
+      "new_wins": 6,
+      "draws": 22,
+      "old_wins": 4,
+      "new_elo": -4.5,
+      "old_elo": -5.5
+    },
+    {
+      "batch": 8,
+      "new_wins": 4,
+      "draws": 24,
+      "old_wins": 4,
+      "new_elo": -4.5,
+      "old_elo": -4.5
+    },
+    {
+      "batch": 10,
+      "new_wins": 3,
+      "draws": 26,
+      "old_wins": 3,
+      "new_elo": -4.5,
+      "old_elo": -4.5
+    }
+  ]
+}

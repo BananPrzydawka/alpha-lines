@@ -1,0 +1,34 @@
+        rock    paper    scisors
+
+rock     0        -1        1
+
+paper    1         0       -1
+
+scisors  -1        1        0
+
+
+
+curret idea:
+write batched mcts
+then run it in paralell to get multithreaded perforance and better gpu utilization
+
+options:
+individual tree traversal, node holds one game
+- simpler mcts code
+- requires game rewrite for single game performance - well desn't strictly require it.
+
+paralell tree exploration, nodes store stats indexed by zorbist hash or move path
+- more complicated mcts
+- potentially faster
+- no game engine rewrite
+
+
+on the same exact request, asking for methods to make single batch implementation faster,
+sonnet: 5% -> 6%        1%
+opus: 6% -> 8%          2%
+fable: 8% -> 13%        5%
+
+
+implement update cap on low probability with gamma
+
+

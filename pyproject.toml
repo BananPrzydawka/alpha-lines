@@ -1,0 +1,14 @@
+[project]
+name = "alpha-lines-folders"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "line-profiler>=5.0.2",
+    "modal>=1.5.1",
+    "numba>=0.66.0",
+    "numpy>=2.1,<2.3",
+    "torch>=2.12.1",
+    "torchinfo>=1.8.0",
+]

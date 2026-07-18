@@ -1,0 +1,67 @@
+ass PuctMCTS:
+    def __init__(self):
+        self.num_sims = mcts_num_simulations
+        self.c_puct = mcts_c_puct
+        self.alpha = mcts_alpha
+        self.epsilon = mcts_epsilon
+
+    def search(self, game, model):
+        encoded_states = torch.cat([game.get_encoded_states(0), game.get_encoded_states(1)], dim=0)
+        priors, _, _, _ = model(encoded_states, apply_softmax=True)
+
+        root = PuctMCTSNode(game.clone_states_to_batch([0]), priors[0], priors[1])
+        root.apply_dirichlet_noise()
+
+        for _ in range(self.num_sims):
+            self._simulate(root, model)
+
+        return (
+            root.visit_counts_p0 / root.visit_counts_p0.sum().clamp_min(1e-8),
+            root.visit_counts_p1 / root.visit_counts_p1.sum().clamp_min(1e-8),
+            root.q_values_p0.clone(),
+            root.q_values_p1.clone(),
+        )
+
+    def _simulate(self, node, model):
+        if node.game.finished[0]:
+            outcomes_p0, outcomes_p1 = node.game.get_terminal_outcomes()
+            value_p0 = 1.0 if outcomes_p0[0] == 0 else (-1.0 if outcomes_p0[0] == 2 else 0.0)
+            value_p1 = 1.0 if outcomes_p1[0] == 0 else (-1.0 if outcomes_p1[0] == 2 else 0.0)
+            return value_p0, value_p1
+
+        action_p0, action_p1 = node.select()
+        edge = (action_p0, action_p1)
+
+        if edge in node.children:
+            value_p0, value_p1 = self._simulate(node.children[edge], model)
+        else:
+            child_game = node.game.clone_states_to_batch([0])
+            child_game.action_step(
+                torch.tensor([action_p0], device=child_game.device),
+                torch.tensor([action_p1], device=child_game.device),
+            )
+
+            if child_game.finished[0]:
+                outcomes_p0, outcomes_p1 = child_game.get_terminal_outcomes()
+                value_p0 = 1.0 if outcomes_p0[0] == 0 else (-1.0 if outcomes_p0[0] == 2 else 0.0)
+                value_p1 = 1.0 if outcomes_p1[0] == 0 else (-1.0 if outcomes_p1[0] == 2 else 0.0)
+                child_prior_p0 = torch.zeros(board_size, device=child_game.device)
+                child_prior_p1 = torch.zeros(board_size, device=child_game.device)
+            else:
+                encoded_states = torch.cat(
+                    [child_game.get_encoded_states(0), child_game.get_encoded_states(1)], dim=0
+                )
+                priors, value_logits, _, _ = model(encoded_states, apply_softmax=True)
+                child_prior_p0, child_prior_p1 = priors[0], priors[1]
+                value_p0 = (value_logits[0, 0] - value_logits[0, 2]).item()
+                value_p1 = (value_logits[1, 0] - value_logits[1, 2]).item()
+
+            node.children[edge] = PuctMCTSNode(child_game, child_prior_p0, child_prior_p1)
+
+        # Backpropagation
+        node.q_values_p0[action_p0] = (node.q_values_p0[action_p0] * node.visit_counts_p0[action_p0] + value_p0) / (node.visit_counts_p0[action_p0] + 1)
+        node.visit_counts_p0[action_p0] += 1
+        node.q_values_p1[action_p1] = (node.q_values_p1[action_p1] * node.visit_counts_p1[action_p1] + value_p1) / (node.visit_counts_p1[action_p1] + 1)
+        node.visit_counts_p1[action_p1] += 1
+
+        return value_p0, value_p1
