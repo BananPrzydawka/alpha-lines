@@ -15,7 +15,7 @@ board_size = height * width
 
 iterations = 1
 num_parallel_games = 512
-batch_size = 2048
+batch_size = 1
 learning_rate = 7e-4
 weight_decay = 1e-4
 
@@ -27,7 +27,7 @@ mcts_epx3_gamma = 0.1
 
 filters = 128               # 256 in alpha zero
 bottleneck = 32             # 32 in lc0
-resblock_number = 30        # 40 in alpha zero
+resblock_number = 1        # 40 in alpha zero
 
 policy_filters = 60         # 80 in lc0
 value_fc = 256
