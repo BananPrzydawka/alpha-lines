@@ -92,6 +92,7 @@ class alpha_lines_net(nn.Module):
     def forward(self, x, apply_softmax=False):
         # ecpects input of dim 4, but in case an idiot calls it
         if x.dim() == 3:
+            print("dumbass")
             x = x.unsqueeze(0)
 
         s = F.silu(self.bn_input(self.conv_input(x)))
