@@ -1,8 +1,9 @@
 import torch
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# uv run --with tensorboard --with torch-tb-profiler tensorboard --logdir=./alpha-lines-folders/logs/tb_logs/
-# ncu --profile-from-start off --target-processes all --set full -f -o alphalines_h100_eager uv run python script.py
+# uv run --with tensorboard --with torch-tb-profiler tensorboard --logdir=./alpha-lines/logs/pytorch/
+# ncu --profile-from-start off --target-processes all --set full -f -o alphalines_h100 uv run python script.py
+# TORCH_LOGS="aot,output_code" uv run main/script.py 2> logs/compile/output.py
 
 gpu = "H100"
 timeout = 600
@@ -14,7 +15,7 @@ height = 10                 # 10
 width = 16                  # 16
 board_size = height * width
 
-iterations = 1
+iterations = 8
 num_parallel_games = 2048
 batch_size = 1
 learning_rate = 7e-4
