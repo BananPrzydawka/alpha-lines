@@ -2,8 +2,9 @@ import torch
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # uv run --with tensorboard --with torch-tb-profiler tensorboard --logdir=./alpha-lines-folders/logs/tb_logs/
+# ncu --profile-from-start off --target-processes all --set full -f -o alphalines_h100_eager uv run python script.py
 
-gpu = "B300"
+gpu = "H100"
 timeout = 600
 host_logs = "./logs"
 log_interval = 10
@@ -14,7 +15,7 @@ width = 16                  # 16
 board_size = height * width
 
 iterations = 1
-num_parallel_games = 512
+num_parallel_games = 2048
 batch_size = 1
 learning_rate = 7e-4
 weight_decay = 1e-4
@@ -27,7 +28,7 @@ mcts_epx3_gamma = 0.1
 
 filters = 128               # 256 in alpha zero
 bottleneck = 32             # 32 in lc0
-resblock_number = 1        # 40 in alpha zero
+resblock_number = 2        # 40 in alpha zero
 
 policy_filters = 60         # 80 in lc0
 value_fc = 256

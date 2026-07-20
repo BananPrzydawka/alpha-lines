@@ -8,6 +8,13 @@ def main():
     model = alpha_lines_net().to(device).eval().to(torch.bfloat16)
     x = torch.zeros(num_parallel_games, 7, height, width, device=device, dtype=torch.bfloat16)
 
+    def hook(module, inputs, output):
+        print("inputs:", [ (t.shape, t.dtype, t.stride()) for t in inputs if torch.is_tensor(t)])
+        print("output:", output.shape, output.dtype, output.stride())
+
+    model.tower[0].se.register_forward_hook(hook)   # the SE block in res block 0
+    model(x)
+
     with torch.no_grad():
         for _ in range(5):
             model(x)
