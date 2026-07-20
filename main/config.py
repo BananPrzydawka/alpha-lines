@@ -1,10 +1,6 @@
 import torch
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# uv run --with tensorboard --with torch-tb-profiler tensorboard --logdir=./alpha-lines/logs/pytorch/
-# ncu --profile-from-start off --target-processes all --set full -f -o alphalines_h100 uv run python script.py
-# TORCH_LOGS="aot,output_code" uv run main/script.py 2> logs/compile/output.py
-
 gpu = "H100"
 timeout = 600
 host_logs = "./logs"
