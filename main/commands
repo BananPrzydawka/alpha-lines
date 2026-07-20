@@ -1,3 +1,5 @@
+git add -A && git commit -m "nothing" && git push
+
 apt-get update && apt-get install -y git curl build-essential tmux
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
@@ -12,4 +14,4 @@ ncu --profile-from-start off --target-processes all --set full -f -o alphalines_
 TORCH_LOGS="aot" uv run main/only_model_speedtest.py
 TORCH_LOGS="output_code" uv run main/only_model_speedtest.py 2> logs/compile/output.py
 
-scp root@0.0.0.0:~/alpha-lines/logs/compile/output.py .
+scp root@0.0.0.0:~/alpha-lines/logs/compile/output.py ~/projects/alpha-lines/logs/compile/output.py
