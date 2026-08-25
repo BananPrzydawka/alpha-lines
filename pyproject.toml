@@ -9,6 +9,8 @@ dependencies = [
     "modal>=1.5.1",
     "numba>=0.66.0",
     "numpy>=2.1,<2.3",
+    "tensorboard>=2.21.0",
     "torch>=2.12.1",
+    "torch-tb-profiler>=0.4.3",
     "torchinfo>=1.8.0",
 ]

@@ -1,0 +1,113 @@
+================================================================================
+  REPO
+================================================================================
+
+git add -A && git commit -m "nothing" && git push
+
+
+================================================================================
+  PROVISION A BOX   (as root; both reboot at the end)
+================================================================================
+
+--- pytorch box ---
+apt-get update && apt-get install -y git curl build-essential tmux rsync
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+git clone https://github.com/BananPrzydawka/alpha-lines ~/projects/alpha-lines
+cd ~/projects/alpha-lines && uv sync
+echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' | tee /etc/modprobe.d/nvidia-profiler.conf
+update-initramfs -u && reboot
+
+--- cuda box (toolkit only) ---
+apt-get update && apt-get install -y git build-essential tmux rsync
+git clone https://github.com/BananPrzydawka/alpha-lines ~/projects/alpha-lines
+echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' | tee /etc/modprobe.d/nvidia-profiler.conf
+update-initramfs -u && reboot
+
+
+================================================================================
+  RUN ON THE BOX
+================================================================================
+
+--- pytorch, profiled ---
+cd ~/projects/alpha-lines
+ncu --profile-from-start off --target-processes all --set full -f \
+    -o logs/ncu/alphalines_h100 uv run python main/ncu_compiled.py
+
+--- cuda kernels  (ARCH explicit: auto-detect gives sm_90, not sm_90a) ---
+cd ~/projects/alpha-lines/cuda && ARCH=sm_90a ./run.sh
+
+--- triton / inductor output ---
+TORCH_LOGS="aot"         uv run main/only_model_speedtest.py
+TORCH_LOGS="output_code" uv run main/only_model_speedtest.py 2> logs/compile/output.py
+
+
+================================================================================
+  PULL RESULTS BACK   (on the laptop)
+================================================================================
+
+HOST=root@0.0.0.0
+rsync -avz $HOST:~/projects/alpha-lines/cuda/out/     ~/projects/alpha-lines/cuda/out/
+rsync -avz $HOST:~/projects/alpha-lines/logs/ncu/     ~/projects/alpha-lines/logs/ncu/
+rsync -avz $HOST:~/projects/alpha-lines/logs/compile/ ~/projects/alpha-lines/logs/compile/
+
+
+================================================================================
+  COMPILE            (no GPU needed -- nvcc/ptxas/nvdisasm are cross-compilers)
+================================================================================
+
+cd ~/projects/alpha-lines/cuda
+
+make inspect ARCH=sm_90a        # -> build/sm_90a/{*.ptx,*.sass,*.cubin,ptxas.txt}
+make inspect ARCH=sm_75
+make clean
+
+make printarch                  # what auto-detect resolved to
+make syms F=add                 # mangled kernel names
+make dis  F=add K=add_vec8P     # SASS for one kernel only
+
+make inspect 2>&1 | grep -E "Compiling|Used|spill" | grep -v "0 bytes spill"
+
+
+================================================================================
+  RUN
+================================================================================
+
+cd ~/projects/alpha-lines/cuda
+
+cd ~/projects/alpha-lines && uv run modal run ./cuda/modal_cuda.py
+
+make bins ARCH=sm_75 && ./build/sm_75/add 50    # quick correctness check
+./run.sh                                         # build + time + profile
+NOPROFILE=latency ./run.sh
+SET=detailed ./run.sh
+NCU="sudo ncu" ./run.sh
+
+
+================================================================================
+  NCU
+================================================================================
+
+--- quick look over ssh, before killing an expensive box ---
+ncu -i out/*/add.ncu-rep --page details --section MemoryWorkloadAnalysis
+ncu -i out/*/add.ncu-rep --page details --section WarpStateStats
+
+--- one kernel inside a big model report ---
+ncu -i logs/ncu/alphalines_h100_compiled.ncu-rep --page details \
+    --kernel-name regex:triton_poi_fused_add_expand_mul_sigmoid_silu
+
+--- targeted metrics, far faster than --set full ---
+ncu --profile-from-start off --metrics \
+gpu__time_duration.sum,dram__bytes_read.sum,dram__bytes_write.sum,\
+lts__t_sector_hit_rate.pct,\
+sm__throughput.avg.pct_of_peak_sustained_elapsed \
+    build/sm_90a/add 200
+
+ncu --list-sets ; ncu --list-sections
+
+
+================================================================================
+  TENSORBOARD
+================================================================================
+
+uv run tensorboard --logdir=./logs/pytorch/

@@ -34,9 +34,7 @@ class res_block(nn.Module):
     def forward(self, x):
         residual = x
         out = self.silu(self.bn1(self.conv1(x)))
-        # out = self.silu(self.conv1(x))
         out = self.bn2(self.conv2(out))
-        # out = (self.conv2(out))
         out = self.se(out)
         out += residual
         return self.silu(out)

@@ -13,9 +13,10 @@ local_dir = Path(__file__).parent
 volume = modal.Volume.from_name("alphalines", create_if_missing=True)
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.1.1-devel-ubuntu22.04", add_python="3.10")
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.13")
     .apt_install("nsight-systems-2024.5.1", "nsight-compute-2024.1.1")
-    .pip_install("torch", "numpy", "line-profiler", "torch-tb-profiler", "numba")
+    .pip_install("torch==2.12.1", "numpy", "line-profiler", "torch-tb-profiler", "numba", "ninja",
+                 index_url="https://download.pytorch.org/whl/cu128")
     .add_local_dir(local_dir, remote_path="/root")
 )
 

@@ -5,10 +5,17 @@ from config import device, height, width, num_parallel_games
 from model import alpha_lines_net
 
 def main():
+    # model = alpha_lines_net().to(device).eval().to(torch.bfloat16)
+    # model = torch.compile(model)
+    
+    # x = torch.zeros(num_parallel_games, 7, height, width, device=device, dtype=torch.bfloat16)
+
     model = alpha_lines_net().to(device).eval().to(torch.bfloat16)
+    model = model.to(memory_format=torch.channels_last)   # <- two additions
     model = torch.compile(model)
     
     x = torch.zeros(num_parallel_games, 7, height, width, device=device, dtype=torch.bfloat16)
+    x = x.to(memory_format=torch.channels_last)
 
     with torch.no_grad():
         for _ in range(5):
