@@ -25,7 +25,7 @@ mcts_epx3_gamma = 0.1
 
 filters = 128               # 256 in alpha zero
 bottleneck = 32             # 32 in lc0
-resblock_number = 2        # 40 in alpha zero
+resblock_number = 4         # 40 in alpha zero
 
 policy_filters = 60         # 80 in lc0
 value_fc = 256
