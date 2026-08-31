@@ -1,0 +1,23 @@
+[package]
+name = "alpha_lines_game"
+version = "0.1.0"
+edition = "2021"
+description = "Reference Rust port of the alpha-lines batched game (main/game.py + main/game_kernels.py)"
+
+# Deliberately zero dependencies: this crate is the reference implementation and must
+# build and run identically anywhere, without a crates.io fetch.
+[dependencies]
+
+[features]
+# per-path counters in the incremental scorer; off by default so timings are uninstrumented
+stats = []
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto = true
+codegen-units = 1
