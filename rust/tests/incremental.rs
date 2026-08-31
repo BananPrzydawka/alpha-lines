@@ -458,3 +458,47 @@ fn from_state_reconstructs_levels_and_scores() {
     assert_eq!(rebuilt.scores, inc.scores);
     rebuilt.check_invariants().unwrap();
 }
+
+#[test]
+fn the_live_list_sampler_picks_the_same_moves_as_the_reference_sampler() {
+    // The engine's sampler no longer reads a mask, but it must still walk the candidate
+    // squares in row-major order and consume the RNG identically, so a seeded rollout has
+    // to reproduce the reference implementation move for move.
+    for seed in 0..6u64 {
+        let n = 96;
+        let mut refg = BatchedLinesGame::new(n, seed);
+        let mut inc = IncrementalGame::new(n, seed);
+        let mut rng = Rng::new(seed ^ 0x5171);
+        let d0: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+        let d1: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+
+        let mut steps = 0;
+        while !refg.finished.iter().all(|&f| f) {
+            refg.distribution_step(&d0, &d1);
+            inc.distribution_step(&d0, &d1);
+            assert_eq!(inc.boards, refg.boards, "seed {seed} step {steps}: different move chosen");
+            assert_eq!(inc.scores_f32(), refg.scores, "seed {seed} step {steps}");
+            assert_eq!(inc.finished, refg.finished, "seed {seed} step {steps}");
+            steps += 1;
+            assert!(steps < 200);
+        }
+        inc.check_invariants().unwrap();
+    }
+}
+
+#[test]
+fn the_live_list_survives_collisions_and_stays_row_major() {
+    let n = 48;
+    let mut inc = IncrementalGame::new(n, 21);
+    let mut rng = Rng::new(99);
+    // one shared distribution makes both players collide far more often
+    let dist: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+    let mut steps = 0;
+    while !inc.finished.iter().all(|&f| f) {
+        inc.distribution_step(&dist, &dist);
+        // check_invariants asserts the live list equals the playable squares, in order
+        inc.check_invariants().unwrap();
+        steps += 1;
+        assert!(steps < 200);
+    }
+}

@@ -43,9 +43,12 @@
 //! [`check_invariants`] asserts all of this directly; the tests run it after every move.
 
 use crate::config::{HEIGHT, WIDTH};
+// `legal_masks_kernel` is still reused for `get_legal_masks`, which MCTS needs to mask the
+// policy network. The rollout path no longer calls it, and no longer uses the reference
+// sampler at all — see `sample_live`.
 use crate::game_kernels::{
-    legal_masks_kernel, sample_move_kernel, score_player, NON_PLAYABLE_SQUARE, PLAYABLE_SQUARE,
-    PLAYER_0_MARK, PLAYER_1_MARK, REMOVED_SQUARE,
+    legal_masks_kernel, score_player, NON_PLAYABLE_SQUARE, PLAYABLE_SQUARE, PLAYER_0_MARK,
+    PLAYER_1_MARK, REMOVED_SQUARE,
 };
 use crate::rng::Rng;
 use crate::BatchedLinesGame;
@@ -688,7 +691,101 @@ pub fn check_invariants(cells: &[i8], level: &[u8], score: &[i32]) -> Result<(),
     Ok(())
 }
 
+
+// ------------------------------------------------------------------------- live squares
+
+/// The most squares a game can ever have available: only `(r + c)` even cells are playable.
+pub const MAX_LIVE: usize = HW / 2;
+
+/// Sample one move per active game from `dist`, restricted to squares that are still
+/// playable, plus the first-move half-board rule.
+///
+/// This replaces `game_kernels::sample_move_kernel` for the incremental engine. Same
+/// distribution, same RNG draws in the same order — but instead of walking all 160 board
+/// squares twice against a materialized f32 mask, it walks only the compact list of squares
+/// that are actually still available (80 at the start, 0 at the end, ~40 on average) and
+/// stops the second pass as soon as it has chosen.
+///
+/// The live list is kept in **row-major order**, which matters: the cumulative scan picks
+/// the first cell whose running total crosses the threshold, so the traversal order is part
+/// of the result. Order-preserving compaction keeps this identical to the reference kernel.
+#[allow(clippy::too_many_arguments)]
+fn sample_live(
+    dist: &[f32],
+    live_cells: &[u16],
+    live_len: &[u16],
+    active: &[bool],
+    move_counts: &[i32],
+    n: usize,
+    player: usize,
+    half_width: usize,
+    rng: &mut Rng,
+    r_out: &mut [i64],
+    c_out: &mut [i64],
+) {
+    for g in 0..n {
+        r_out[g] = 0;
+        c_out[g] = 0;
+        if !active[g] {
+            continue;
+        }
+        let base = g * HW;
+        let lbase = g * MAX_LIVE;
+        let len = live_len[g] as usize;
+        let first = move_counts[g] == 0;
+
+        // On the opening move each player is confined to one half of the board. After that
+        // every live square is legal, so the check disappears from the loop entirely.
+        let allowed = |ci: u16| -> bool {
+            let c = ci as usize % WIDTH;
+            if player == 0 { c < half_width } else { c >= half_width }
+        };
+
+        let mut total: f64 = 0.0;
+        if first {
+            for &ci in &live_cells[lbase..lbase + len] {
+                if allowed(ci) {
+                    total += dist[base + ci as usize] as f64;
+                }
+            }
+        } else {
+            for &ci in &live_cells[lbase..lbase + len] {
+                total += dist[base + ci as usize] as f64;
+            }
+        }
+
+        // Same degenerate branch as the reference kernel: an unmasked uniform draw over the
+        // whole board. Kept so the RNG is consumed identically.
+        if total < 1e-8 {
+            let idx = rng.randint(HW as u64) as i64;
+            r_out[g] = idx / WIDTH as i64;
+            c_out[g] = idx % WIDTH as i64;
+            continue;
+        }
+
+        let threshold = rng.random() * total;
+        let mut cum: f64 = 0.0;
+        let mut chosen: usize = 0;
+        for &ci in &live_cells[lbase..lbase + len] {
+            if first && !allowed(ci) {
+                continue;
+            }
+            let v = dist[base + ci as usize] as f64;
+            if v > 0.0 {
+                cum += v;
+                if cum >= threshold {
+                    chosen = ci as usize;
+                    break;
+                }
+            }
+        }
+        r_out[g] = (chosen / WIDTH) as i64;
+        c_out[g] = (chosen % WIDTH) as i64;
+    }
+}
+
 // ------------------------------------------------------------------------ batched game
+
 
 /// A batch of games scored incrementally.
 ///
@@ -708,10 +805,45 @@ pub struct IncrementalGame {
     pub finished: Vec<bool>,
     pub half_width: usize,
     pub rng: Rng,
+    /// Squares still playable, per game, compacted into `[g * MAX_LIVE ..][.. live_len[g]]`
+    /// and kept in row-major order. This is what the sampler walks instead of a mask, and
+    /// it also makes the finished check O(1).
+    live_cells: Vec<u16>,
+    live_len: Vec<u16>,
     scratch: Scratch,
 }
 
 impl IncrementalGame {
+    /// Rebuild one game's live list from its board, preserving row-major order.
+    fn rebuild_live(&mut self, g: usize) {
+        let cells = &self.boards[g * HW..(g + 1) * HW];
+        let lbase = g * MAX_LIVE;
+        let mut w = 0;
+        for i in 0..HW {
+            if cells[i] == PLAYABLE_SQUARE {
+                self.live_cells[lbase + w] = i as u16;
+                w += 1;
+            }
+        }
+        self.live_len[g] = w as u16;
+    }
+
+    /// Drop squares this move consumed. Order-preserving compaction, not swap-removal:
+    /// the sampler's scan order is part of its result, so the list must stay row-major.
+    fn compact_live(&mut self, g: usize) {
+        let cells = &self.boards[g * HW..(g + 1) * HW];
+        let lbase = g * MAX_LIVE;
+        let len = self.live_len[g] as usize;
+        let mut w = 0;
+        for r in 0..len {
+            let ci = self.live_cells[lbase + r];
+            if cells[ci as usize] == PLAYABLE_SQUARE {
+                self.live_cells[lbase + w] = ci;
+                w += 1;
+            }
+        }
+        self.live_len[g] = w as u16;
+    }
     pub fn new(num_games: usize, seed: u64) -> Self {
         let mut boards = vec![NON_PLAYABLE_SQUARE; num_games * HW];
         for g in 0..num_games {
@@ -723,7 +855,7 @@ impl IncrementalGame {
                 }
             }
         }
-        IncrementalGame {
+        let mut g = IncrementalGame {
             n: num_games,
             boards,
             levels: vec![INF; num_games * HW],
@@ -732,8 +864,14 @@ impl IncrementalGame {
             finished: vec![false; num_games],
             half_width: WIDTH / 2,
             rng: Rng::new(seed),
+            live_cells: vec![0; num_games * MAX_LIVE],
+            live_len: vec![0; num_games],
             scratch: Scratch::new(),
+        };
+        for i in 0..num_games {
+            g.rebuild_live(i);
         }
+        g
     }
 
     /// Adopt an arbitrary board state, deriving levels and scores with the one global BFS.
@@ -754,8 +892,13 @@ impl IncrementalGame {
             finished,
             half_width: WIDTH / 2,
             rng: Rng::new(seed),
+            live_cells: vec![0; n * MAX_LIVE],
+            live_len: vec![0; n],
             scratch: Scratch::new(),
         };
+        for i in 0..n {
+            g.rebuild_live(i);
+        }
         for i in 0..n {
             let cells = &g.boards[i * HW..(i + 1) * HW];
             let level = &mut g.levels[i * HW..(i + 1) * HW];
@@ -821,7 +964,10 @@ impl IncrementalGame {
             &mut self.scratch,
         );
         self.move_counts[g] += 1;
-        if !cells.iter().any(|&v| v == PLAYABLE_SQUARE) {
+        self.compact_live(g);
+        // an empty live list is exactly "no playable square left", so the finished check
+        // costs one comparison instead of a board scan
+        if self.live_len[g] == 0 {
             self.finished[g] = true;
         }
     }
@@ -844,22 +990,36 @@ impl IncrementalGame {
                 &mut self.scratch,
             );
             self.move_counts[g] += 1;
-            if !cells.iter().any(|&v| v == PLAYABLE_SQUARE) {
+            self.compact_live(g);
+            if self.live_len[g] == 0 {
                 self.finished[g] = true;
             }
         }
     }
 
+    /// One move for all active games, sampled from `dist_p0`/`dist_p1`.
+    ///
+    /// Unlike the reference, this never materializes the (N, H, W) legal masks: the live
+    /// list already says which squares are available, so the mask kernel — 2.6 MB of writes
+    /// per step at 2048 games — is skipped entirely.
     pub fn distribution_step(&mut self, dist_p0: &[f32], dist_p1: &[f32]) {
         let active = self.active();
         if !active.iter().any(|&a| a) {
             return;
         }
-        let (mask_0, mask_1) = self.raw_masks();
-        let (r0, c0) =
-            sample_move_kernel(dist_p0, &mask_0, &active, self.n, HEIGHT, WIDTH, &mut self.rng);
-        let (r1, c1) =
-            sample_move_kernel(dist_p1, &mask_1, &active, self.n, HEIGHT, WIDTH, &mut self.rng);
+        let n = self.n;
+        let mut r0 = vec![0i64; n];
+        let mut c0 = vec![0i64; n];
+        let mut r1 = vec![0i64; n];
+        let mut c1 = vec![0i64; n];
+        sample_live(
+            dist_p0, &self.live_cells, &self.live_len, &active, &self.move_counts,
+            n, 0, self.half_width, &mut self.rng, &mut r0, &mut c0,
+        );
+        sample_live(
+            dist_p1, &self.live_cells, &self.live_len, &active, &self.move_counts,
+            n, 1, self.half_width, &mut self.rng, &mut r1, &mut c1,
+        );
         self.apply_step(&r0, &c0, &r1, &c1, &active);
     }
 
@@ -868,13 +1028,31 @@ impl IncrementalGame {
         if !active.iter().any(|&a| a) {
             return Ok(());
         }
-        let (mask_0, mask_1) = self.raw_masks();
+        // The reference builds both full masks just to read two entries per game. The same
+        // predicate reads straight off the board: a square is legal if it is still playable
+        // and, on the opening move, in the half this player is confined to.
+        let half = self.half_width;
+        let legal = |cells: &[i8], idx: usize, first: bool, player: usize| -> bool {
+            if cells[idx] != PLAYABLE_SQUARE {
+                return false;
+            }
+            if !first {
+                return true;
+            }
+            let c = idx % WIDTH;
+            if player == 0 { c < half } else { c >= half }
+        };
 
         let mut invalid_indices: Vec<usize> = Vec::new();
         for g in 0..self.n {
-            let a0 = idx_0[g] as usize;
-            let a1 = idx_1[g] as usize;
-            if active[g] && (mask_0[g * HW + a0] != 1.0 || mask_1[g * HW + a1] != 1.0) {
+            if !active[g] {
+                continue;
+            }
+            let cells = &self.boards[g * HW..(g + 1) * HW];
+            let first = self.move_counts[g] == 0;
+            if !legal(cells, idx_0[g] as usize, first, 0)
+                || !legal(cells, idx_1[g] as usize, first, 1)
+            {
                 invalid_indices.push(g);
             }
         }
@@ -904,9 +1082,34 @@ impl IncrementalGame {
         self.scratch.stats = Stats::default();
     }
 
+    /// The live list must be exactly the playable squares, in row-major order.
+    fn check_live(&self, g: usize) -> Result<(), String> {
+        let cells = &self.boards[g * HW..(g + 1) * HW];
+        let want: Vec<u16> =
+            (0..HW).filter(|&i| cells[i] == PLAYABLE_SQUARE).map(|i| i as u16).collect();
+        let lbase = g * MAX_LIVE;
+        let have = &self.live_cells[lbase..lbase + self.live_len[g] as usize];
+        if have != want.as_slice() {
+            return Err(format!(
+                "live list is wrong: {} entries stored, {} playable squares on the board",
+                have.len(),
+                want.len()
+            ));
+        }
+        if self.finished[g] != want.is_empty() {
+            return Err(format!(
+                "finished is {} but {} squares are still playable",
+                self.finished[g],
+                want.len()
+            ));
+        }
+        Ok(())
+    }
+
     /// Run [`check_invariants`] over every game in the batch.
     pub fn check_invariants(&self) -> Result<(), String> {
         for g in 0..self.n {
+            self.check_live(g).map_err(|e| format!("game {g}: {e}"))?;
             check_invariants(
                 &self.boards[g * HW..(g + 1) * HW],
                 &self.levels[g * HW..(g + 1) * HW],
