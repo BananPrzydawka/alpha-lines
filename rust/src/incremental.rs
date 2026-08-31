@@ -147,6 +147,14 @@ pub struct Stats {
     /// cells popped by the two level passes
     pub relax_pops: u64,
     pub repair_pops: u64,
+    /// the highest level written by the *most recent* repair_up call. If severed cycles
+    /// really do climb to the top, this lands near MAX_LEVEL.
+    pub repair_max_level: u8,
+    /// a cell went INF because its chain exceeded MAX_LEVEL — the cap firing, i.e. the
+    /// lockstep climb running to the end
+    pub repair_capped: u64,
+    /// a cell went INF the ordinary way: no surviving neighbour had a finite level
+    pub repair_dead: u64,
     /// cells visited by component walks, and how many walks
     pub component_cells: u64,
     pub component_walks: u64,
@@ -162,6 +170,35 @@ macro_rules! count {
 }
 #[cfg(not(feature = "stats"))]
 macro_rules! count {
+    ($s:expr, $f:ident) => {
+        ()
+    };
+}
+
+/// Records the largest value a counter has seen, for the same reason as `count!`.
+#[cfg(feature = "stats")]
+macro_rules! track_max {
+    ($s:expr, $f:ident, $v:expr) => {
+        if $v > $s.stats.$f {
+            $s.stats.$f = $v
+        }
+    };
+}
+#[cfg(not(feature = "stats"))]
+macro_rules! track_max {
+    ($s:expr, $f:ident, $v:expr) => {
+        ()
+    };
+}
+
+#[cfg(feature = "stats")]
+macro_rules! reset_stat {
+    ($s:expr, $f:ident) => {
+        $s.stats.$f = Default::default()
+    };
+}
+#[cfg(not(feature = "stats"))]
+macro_rules! reset_stat {
     ($s:expr, $f:ident) => {
         ()
     };
@@ -310,6 +347,7 @@ fn relax_down(cells: &[i8], level: &mut [u8], seed: usize, p: i8, s: &mut Scratc
 /// stale low reading is impossible.
 fn repair_up(cells: &[i8], level: &mut [u8], seeds: &[u16], p: i8, s: &mut Scratch) {
     s.queue_reset();
+    reset_stat!(s, repair_max_level);
     for &n in seeds {
         s.push(n as usize, level[n as usize]);
     }
@@ -327,6 +365,23 @@ fn repair_up(cells: &[i8], level: &mut [u8], seeds: &[u16], p: i8, s: &mut Scrat
         let cand = computed_level(cells, level, n, p);
         if cand <= cur {
             continue; // n had another provider all along
+        }
+        if cand == INF {
+            // Distinguish the two ways a cell dies: the cap firing (a finite neighbour still
+            // exists, but every chain through it is longer than any real path can be — the
+            // lockstep climb having run its course) from the ordinary case of no finite
+            // neighbour left at all.
+            let has_finite = DIAG
+                .iter()
+                .filter_map(|&d| step(n, d))
+                .any(|m| cells[m] == p && level[m] != INF);
+            if has_finite {
+                count!(s, repair_capped);
+            } else {
+                count!(s, repair_dead);
+            }
+        } else {
+            track_max!(s, repair_max_level, cand);
         }
         level[n] = cand;
         // dependents are defined by the level n *used to* hold — that is what they pointed at

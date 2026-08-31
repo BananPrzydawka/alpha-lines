@@ -59,6 +59,10 @@ struct Sample {
     ns: f64,
     path: Path,
     repair_pops: u64,
+    /// highest level the repair wrote, and how the dying cells actually died
+    repair_max_level: u8,
+    capped: u64,
+    dead: u64,
 }
 
 fn pct(sorted: &[f64], q: f64) -> f64 {
@@ -195,6 +199,9 @@ fn main() {
                 ns: ns.max(0.0),
                 path,
                 repair_pops: d(a.repair_pops, before.repair_pops),
+                repair_max_level: a.repair_max_level,
+                capped: d(a.repair_capped, before.repair_capped),
+                dead: d(a.repair_dead, before.repair_dead),
             });
         }
     }
@@ -265,5 +272,55 @@ fn main() {
             hi[hi.len() / 2].0,
             hi[hi.len() / 2].1
         );
+    }
+
+    // ---- does the climb really run all the way to the cap? ----
+    let repairs: Vec<&Sample> = samples.iter().filter(|s| s.repair_pops > 0).collect();
+    if !repairs.is_empty() {
+        let capped: u64 = repairs.iter().map(|s| s.capped).sum();
+        let dead: u64 = repairs.iter().map(|s| s.dead).sum();
+        println!("\n=== how far do the levels actually climb? ===");
+        println!(
+            "cells that went INF: {} by the cap firing ({:.1}%), {} by losing every finite \
+             neighbour ({:.1}%)",
+            capped,
+            capped as f64 / (capped + dead).max(1) as f64 * 100.0,
+            dead,
+            dead as f64 / (capped + dead).max(1) as f64 * 100.0
+        );
+
+        let mut lv: Vec<u8> = repairs.iter().map(|s| s.repair_max_level).collect();
+        lv.sort_unstable();
+        println!(
+            "highest level written per repair: min {}  p50 {}  p90 {}  p99 {}  max {}  \
+             (MAX_LEVEL = {})",
+            lv[0], lv[lv.len() / 2], lv[lv.len() * 9 / 10], lv[lv.len() * 99 / 100],
+            lv[lv.len() - 1], alpha_lines_game::incremental::MAX_LEVEL
+        );
+        let mut buckets = [0usize; 9];
+        for &v in &lv {
+            let b = (v as usize / 10).min(8);
+            buckets[b] += 1;
+        }
+        for (b, &c) in buckets.iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            println!(
+                "  levels {:>2}-{:<3} {:>7} repairs {:5.1}% {}",
+                b * 10, b * 10 + 9, c, c as f64 / lv.len() as f64 * 100.0,
+                "#".repeat((c * 50 / lv.len().max(1)).max(1))
+            );
+        }
+
+        // are the slowest moves slow because of real work, or because the OS stole the CPU?
+        let mut worst: Vec<&Sample> = samples.iter().collect();
+        worst.sort_by(|a, b| b.ns.partial_cmp(&a.ns).unwrap());
+        println!("\nthe 10 slowest moves, and whether their cost is accounted for:");
+        println!("  {:>10} {:>12} {:>12} {:>8}", "ns", "repair pops", "ns per pop", "maxlvl");
+        for w in worst.iter().take(10) {
+            let per = if w.repair_pops == 0 { f64::NAN } else { w.ns / w.repair_pops as f64 };
+            println!("  {:>10.0} {:>12} {:>12.1} {:>8}", w.ns, w.repair_pops, per, w.repair_max_level);
+        }
     }
 }
