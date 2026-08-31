@@ -22,6 +22,8 @@ rust/
     bin/profile.rs     batch-size sweep, per stage
     bin/order.rs       isolates batch size from memory access order
     bin/phases.rs      per-function breakdown of a rollout
+    bin/sampler.rs     sampling vs. supplied moves, and sampler variants
+    bin/movedist.rs    per-move cost distribution, split by path
   tests/
     kernels.rs         25 unit tests on the kernel layer
     game.rs            22 tests on the game API + a randomized invariant rollout
@@ -184,6 +186,49 @@ The slow paths measure the affected components before and after and apply the di
 level order so a cell is only re-examined once everything that could still justify it has
 settled.
 
+### The sampler: a live-square list instead of a mask
+
+The engine does not use `game_kernels::sample_move_kernel`. It keeps a compact, row-major
+list of the squares still playable, and samples from that.
+
+The reference sampler walks all 160 board squares **twice** against a materialized f32 mask,
+and does not stop the second pass once it has chosen. Three things are wasted: half the
+board is `(r + c)` odd and can never hold a mark; the mask array is 2.6 MB of writes per step
+at 2048 games purely to encode what the list already knows; and the scan runs past its own
+answer. The live list walks ~40 squares once and breaks.
+
+Measured, at 2048 games, microseconds per completed game (`./target/release/sampler`):
+
+| variant | sample | masks | upkeep | sum | vs v0 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| v0 faithful (mask, 2x160, no break) | 45.5 | 13.6 | 0.0 | 59.0 | 1.00x |
+| v1 + early break | 35.5 | 13.4 | 0.0 | 48.9 | 1.21x |
+| v2 + only the 80 playable squares | 22.5 | 13.3 | 0.0 | 35.8 | 1.65x |
+| **v3 live list, no mask read** | **9.1** | **0.0** | **2.9** | **12.1** | **4.90x** |
+| v4 live list, u16 indices | 8.9 | 0.0 | 2.9 | 11.8 | 5.00x |
+
+Two things this does not change, deliberately:
+
+- **The sampling maths.** Two passes with a single RNG draw is already the right shape for
+  one sample from unnormalized weights. Gumbel-max needs two logs per cell, weighted
+  reservoir needs a `pow`, and sequential replacement needs an RNG draw *per cell*. The win
+  is in shrinking the candidate set, not restructuring the maths. A prefix sum or the alias
+  method would only pay off if the same distribution were sampled many times, which is false
+  in a rollout.
+- **The order.** The list is compacted in place rather than swap-removed, because the
+  cumulative scan picks the first cell to cross the threshold — so traversal order is part of
+  the result. Keeping it row-major means a seeded rollout still chooses the same moves as the
+  reference sampler, which `tests/incremental.rs` asserts move for move.
+
+`action_step` also stopped building masks: a square is legal iff it is still playable and, on
+the opening move, in the right half — which reads straight off the board. And `finished` is
+now `live_len == 0` rather than a board scan.
+
+The v4 row also answers whether the i64 indices matter: **~2%**. On x86-64, 64-bit ALU ops
+run at full rate, and the index arrays are ~1% of the kernel's memory traffic. They are an
+artifact of the faithful port (numpy's `//` yields int64). It would matter for SIMD lane
+width and much more on a GPU.
+
 ### The pathological case
 
 A severed cycle has no external ground, so its cells climb in lockstep — 3,3,4 then 5,5,6 —
@@ -191,15 +236,47 @@ one level per round, until they exceed the longest possible real path and become
 self-terminates without any cycle detection, but it is the worst case for this scheme.
 
 The **level cap is implemented**: `MAX_LEVEL` is the playable-square count (80 here), and any
-candidate above it becomes INF immediately, which bounds the climb at 80 rounds. The
-alternative mitigation — bail out to a local flood fill over the component once a repair
-touches more than some threshold of cells — is **not** implemented.
+candidate above it becomes INF immediately, which bounds the climb. The bailout described
+below is **not** implemented.
 
-**This is the dominant remaining cost.** Under random self-play at 2048 games, `repair_up`
-pops 2.14M cells against `relax_down`'s 137k, a 15.7:1 ratio, and that work is concentrated
-in the 15.7% of removals that take the slow path — about **567 pops per slow removal**,
-which is the lockstep climb and nothing else. Component walks, by contrast, cost only 1.2
-cells per operation. So the bailout is the obvious next optimization.
+Measured directly (`--features stats`, highest level written per repair episode):
+
+```
+min 0   p50 0   p90 80   p99 80   max 80        (MAX_LEVEL = 80)
+
+  levels  0-9      1907 repairs  71.5% ###################################
+  levels 10-19        8 repairs   0.3% #
+  levels 80-89       753 repairs  28.2% ##############
+```
+
+**A hard binary.** 71.5% of repairs settle within ten levels; 28.2% run all the way to the
+cap; 0.3% land in between. There is no middle ground because a severed cycle has no ground at
+all — once it starts climbing, nothing stops it short of the cap. Confirmed from the other
+side: of the cells that reached INF, 38.7% got there by the cap firing rather than by losing
+their last finite neighbour.
+
+The cost is concentrated. Moves slower than 2000 ns are 2.92% of all moves and hold **100% of
+all repair pops**; the top decile by pops does 5110 pops for 21 us. The slowest genuine move
+observed was 74.7 us doing 22,009 pops — more than twice the cost of an entire average game —
+at a steady 3.2-4.0 ns per pop, which is one `computed_level` plus queue bookkeeping.
+
+**The fix, if it is worth doing.** The slow-removal path already walks the component, because
+it needs it for the `old` contribution. That component is a complete answer on its own: every
+cell whose level can change is inside it, and no cell in it can be rescued from outside, since
+a p-mark adjacent to a p-mark is by definition in the same component. So setting the whole
+component to INF and re-running the border BFS within it is correct and costs O(component),
+at most 80 visits, against 22,009 pops.
+
+It should not replace `repair_up` outright — p50 of levels-written is 0, meaning most
+slow-path removals discover immediately that everything had another route and stop after ~2
+pops, where a blanket BFS would be far worse. The shape is a **bailout**: run `repair_up`,
+count pops, and past a threshold abandon it and re-BFS the component. Abandoning mid-flight is
+safe precisely because the BFS overwrites every level in the component. The bimodality means
+the threshold barely matters — anything between the two modes works.
+
+Expected gain, honestly: repair is 2.14M pops x ~3.4 ns, about 17% of total move time.
+Replacing it with a bounded BFS costs ~0.9 ms against 7.3 ms, so roughly **11% off a
+rollout**. Real, but the larger target is blob revival at 40.7% of move time.
 
 Reproduce with `cargo build --release --features stats && ./target/release/profile`.
 
