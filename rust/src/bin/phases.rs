@@ -5,9 +5,11 @@
 //! not:
 //!
 //!   active   building the ~finished mask (allocates an N-element Vec per step)
-//!   masks    legal_masks_kernel        (allocates 2 x N x H x W f32 per step)
-//!   sample   sample_move_kernel x2     (reads the N x H x W distributions)
-//!   apply    apply_and_score_kernel, or the incremental apply_step
+//!   masks    legal_masks_kernel        (reference only; the incremental engine's live
+//!                                       list replaces it, so this column is 0 there)
+//!   sample   the sampler, twice
+//!   apply    apply_and_score_kernel, or the incremental apply_step (which also compacts
+//!            the live list)
 //!
 //! Small batches are averaged over enough independent rollouts to cover ~2048 games, since
 //! one rollout at n=1 is a sample of a single game.
@@ -82,6 +84,8 @@ fn incremental(n: usize, reps: usize, seed: u64, d0: &[f32], d1: &[f32]) -> Phas
     let mut games: Vec<IncrementalGame> =
         (0..reps).map(|k| IncrementalGame::new(n, seed + k as u64)).collect();
     let mut p = Phases::default();
+    let (mut r0, mut c0) = (vec![0i64; n], vec![0i64; n]);
+    let (mut r1, mut c1) = (vec![0i64; n], vec![0i64; n]);
     for g in games.iter_mut() {
         loop {
             let t = Instant::now();
@@ -91,13 +95,11 @@ fn incremental(n: usize, reps: usize, seed: u64, d0: &[f32], d1: &[f32]) -> Phas
                 break;
             }
 
+            // The incremental engine never builds the masks: the live list already knows
+            // which squares are available, so `masks` is structurally zero here.
             let t = Instant::now();
-            let (m0, m1) = g.raw_masks();
-            p.masks += t.elapsed().as_secs_f64();
-
-            let t = Instant::now();
-            let (r0, c0) = sample_move_kernel(d0, &m0, &active, n, HEIGHT, WIDTH, &mut g.rng);
-            let (r1, c1) = sample_move_kernel(d1, &m1, &active, n, HEIGHT, WIDTH, &mut g.rng);
+            g.sample_moves(d0, 0, &active, &mut r0, &mut c0);
+            g.sample_moves(d1, 1, &active, &mut r1, &mut c1);
             p.sample += t.elapsed().as_secs_f64();
 
             let t = Instant::now();

@@ -997,6 +997,24 @@ impl IncrementalGame {
         }
     }
 
+    /// Sample one move per active game for `player`, without applying it.
+    ///
+    /// Exposed so a caller can measure or reuse the sampler on its own;
+    /// [`Self::distribution_step`] is this twice plus [`Self::apply_step`].
+    pub fn sample_moves(
+        &mut self,
+        dist: &[f32],
+        player: usize,
+        active: &[bool],
+        r_out: &mut [i64],
+        c_out: &mut [i64],
+    ) {
+        sample_live(
+            dist, &self.live_cells, &self.live_len, active, &self.move_counts,
+            self.n, player, self.half_width, &mut self.rng, r_out, c_out,
+        );
+    }
+
     /// One move for all active games, sampled from `dist_p0`/`dist_p1`.
     ///
     /// Unlike the reference, this never materializes the (N, H, W) legal masks: the live
@@ -1012,14 +1030,8 @@ impl IncrementalGame {
         let mut c0 = vec![0i64; n];
         let mut r1 = vec![0i64; n];
         let mut c1 = vec![0i64; n];
-        sample_live(
-            dist_p0, &self.live_cells, &self.live_len, &active, &self.move_counts,
-            n, 0, self.half_width, &mut self.rng, &mut r0, &mut c0,
-        );
-        sample_live(
-            dist_p1, &self.live_cells, &self.live_len, &active, &self.move_counts,
-            n, 1, self.half_width, &mut self.rng, &mut r1, &mut c1,
-        );
+        self.sample_moves(dist_p0, 0, &active, &mut r0, &mut c0);
+        self.sample_moves(dist_p1, 1, &active, &mut r1, &mut c1);
         self.apply_step(&r0, &c0, &r1, &c1, &active);
     }
 
