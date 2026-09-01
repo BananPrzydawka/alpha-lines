@@ -30,7 +30,7 @@
 
 use alpha_lines_game::config::{HEIGHT, WIDTH};
 use alpha_lines_game::game_kernels::{score_player, PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK};
-use alpha_lines_game::incremental::{rebuild_levels, Scratch, HW};
+use alpha_lines_game::incremental::{rebuild_levels, Scratch, HW, INF, MAX_LEVEL};
 use alpha_lines_game::rng::Rng;
 use alpha_lines_game::{BatchedLinesGame, IncrementalGame};
 
@@ -438,4 +438,59 @@ fn a_clone_carries_the_whole_state_and_keeps_playing_correctly() {
         assert!(steps < 200, "clone did not terminate");
     }
     assert!(steps > 10, "the clone finished suspiciously fast");
+}
+
+/// The incremental engine now defines its own board shape, square encoding and RNG so that
+/// it depends on nothing else in the crate. The reference port still has its own copies.
+/// Two definitions of the same constant is exactly the kind of thing that drifts, so this
+/// pins them together for as long as both exist — and it is a compile-time check, so it
+/// costs nothing to keep.
+#[test]
+fn the_engine_and_the_reference_still_agree_on_the_board_and_the_encoding() {
+    use alpha_lines_game::incremental as inc;
+
+    const _: () = assert!(inc::HEIGHT == alpha_lines_game::config::HEIGHT);
+    const _: () = assert!(inc::WIDTH == alpha_lines_game::config::WIDTH);
+    const _: () = assert!(inc::NON_PLAYABLE_SQUARE == alpha_lines_game::game_kernels::NON_PLAYABLE_SQUARE);
+    const _: () = assert!(inc::PLAYABLE_SQUARE == alpha_lines_game::game_kernels::PLAYABLE_SQUARE);
+    const _: () = assert!(inc::REMOVED_SQUARE == alpha_lines_game::game_kernels::REMOVED_SQUARE);
+    const _: () = assert!(inc::PLAYER_0_MARK == alpha_lines_game::game_kernels::PLAYER_0_MARK);
+    const _: () = assert!(inc::PLAYER_1_MARK == alpha_lines_game::game_kernels::PLAYER_1_MARK);
+
+    // and the two RNGs must be the same generator, or the samplers would diverge
+    let (mut a, mut b) = (inc::Rng::new(0xabc), Rng::new(0xabc));
+    for k in 0..1000 {
+        assert_eq!(a.next_u64(), b.next_u64(), "rng streams diverged at draw {k}");
+    }
+}
+
+/// `MAX_LEVEL` is a bound derived on paper: a level counts steps through one player's marks,
+/// a shortest path visits each cell once, and no player can ever hold more than a quarter of
+/// the board. This checks the paper against a lot of real games — if the argument were wrong,
+/// levels would reach the cap and cells would be declared unreachable that are not.
+#[test]
+fn no_real_level_ever_comes_close_to_the_cap() {
+    let n = 2048;
+    let seed = 0x1e5e_1u64;
+    let mut rng = Rng::new(seed);
+    let d0: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+    let d1: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+
+    let mut inc = IncrementalGame::new(n, seed);
+    let mut highest = 0u8;
+    while !inc.finished.iter().all(|&f| f) {
+        inc.distribution_step(&d0, &d1);
+        for &l in &inc.levels {
+            if l != INF && l > highest {
+                highest = l;
+            }
+        }
+    }
+    assert!(
+        highest < MAX_LEVEL,
+        "a real level reached {highest}, but the cap is {MAX_LEVEL} — the bound is wrong"
+    );
+    // and the run has to actually reach deep levels, or the check above proves nothing
+    assert!(highest > 5, "highest level was only {highest}; this run is not testing the bound");
+    println!("highest real level over {n} games: {highest} (cap {MAX_LEVEL})");
 }

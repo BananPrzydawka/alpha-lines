@@ -42,29 +42,116 @@
 //!
 //! The tests re-derive all of it from scratch after every move and compare.
 
-use crate::config::{HEIGHT, WIDTH};
-// Only the board encoding is shared with the reference implementation; none of its kernels
-// are, and this module does not know the reference type exists.
-use crate::game_kernels::{
-    NON_PLAYABLE_SQUARE, PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK, REMOVED_SQUARE,
-};
-use crate::rng::Rng;
+// This module has no dependencies on the rest of the crate: the board shape, the square
+// encoding and the RNG are all defined here. They are duplicated in the reference port,
+// which is the thing being replaced; the tests assert the two definitions still agree, so
+// they cannot drift apart while both exist.
+
+/// Board shape. Every square with `(r + c)` even is playable — 80 of the 160.
+pub const HEIGHT: usize = 10;
+pub const WIDTH: usize = 16;
 
 /// Cells per board.
 pub const HW: usize = HEIGHT * WIDTH;
 
+/// Square encoding. A square is one of these five things and nothing else.
+pub const NON_PLAYABLE_SQUARE: i8 = 0;
+pub const PLAYABLE_SQUARE: i8 = 1;
+pub const REMOVED_SQUARE: i8 = 2;
+pub const PLAYER_0_MARK: i8 = 3;
+pub const PLAYER_1_MARK: i8 = 4;
+
 /// "No route to the border." Also acts as the saturating top of the level range.
 pub const INF: u8 = 255;
 
-/// The largest level a real path can have: a shortest path visits distinct playable
-/// squares, and only half the board is playable. Anything above this is unreachable, which
-/// is what stops a severed cycle from climbing forever.
-pub const MAX_LEVEL: u8 = (HW / 2) as u8;
+/// The largest level a real path can have.
+///
+/// A level counts steps through *one player's* marks, and a shortest path visits each cell
+/// at most once, so the bound is that player's mark count. Half the board is playable — 80
+/// squares — and every non-colliding move gives both players exactly one mark, so neither
+/// can ever hold more than half of those. Collisions only take marks away. So a player has
+/// at most `HW / 4` = 40 marks and no real level can exceed 39.
+///
+/// Nothing legitimate is ever capped by this; it is a bound, not a mechanism. It used to be
+/// load-bearing, back when a removal repaired levels by walking them upward and a severed
+/// cycle would climb in lockstep until something stopped it. The slow-removal path now
+/// rebuilds its component with a BFS, which assigns true distances and terminates on its
+/// own, so the cap only guards against a level running away somewhere it cannot.
+pub const MAX_LEVEL: u8 = (HW / 4) as u8;
 
 const _: () = assert!(
-    HW / 2 < INF as usize,
+    HW / 4 < INF as usize,
     "board is too large for a u8 level: MAX_LEVEL would collide with INF"
 );
+
+// ---------------------------------------------------------------------------------- rng
+
+/// Seedable PRNG for the sampler, standing in for numba's hidden `np.random` state.
+///
+/// numba's per-thread Mersenne Twister cannot be reproduced bit-for-bit, so the port keeps
+/// the *structure* of the draws identical — same count, same order, same places — and swaps
+/// the bit source. Nothing the cross-check against Python compares depends on these draws.
+/// xoshiro256++, seeded through SplitMix64.
+#[derive(Clone, Debug)]
+pub struct Rng {
+    s: [u64; 4],
+}
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        let mut z = seed;
+        let mut next = || {
+            z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut x = z;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^ (x >> 31)
+        };
+        Rng { s: [next(), next(), next(), next()] }
+    }
+
+    #[inline]
+    pub fn next_u64(&mut self) -> u64 {
+        let result = self.s[0]
+            .wrapping_add(self.s[3])
+            .rotate_left(23)
+            .wrapping_add(self.s[0]);
+        let t = self.s[1] << 17;
+        self.s[2] ^= self.s[0];
+        self.s[3] ^= self.s[1];
+        self.s[1] ^= self.s[2];
+        self.s[0] ^= self.s[3];
+        self.s[2] ^= t;
+        self.s[3] = self.s[3].rotate_left(45);
+        result
+    }
+
+    /// `np.random.random()`: a double in [0, 1) with 53 bits of entropy.
+    #[inline]
+    pub fn random(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+
+    /// `np.random.randint(0, n)`: a uniform integer in [0, n), debiased (Lemire).
+    #[inline]
+    pub fn randint(&mut self, n: u64) -> u64 {
+        assert!(n > 0, "randint bound must be positive");
+        let mut x = self.next_u64();
+        let mut m = (x as u128) * (n as u128);
+        let mut l = m as u64;
+        if l < n {
+            let threshold = n.wrapping_neg() % n;
+            while l < threshold {
+                x = self.next_u64();
+                m = (x as u128) * (n as u128);
+                l = m as u64;
+            }
+        }
+        (m >> 64) as u64
+    }
+}
+
+// -------------------------------------------------------------------------------- geometry
 
 /// The four diagonal neighbours. On this board these are the *only* neighbours a mark can
 /// have, since orthogonal neighbours are always non-playable parity.
@@ -116,7 +203,10 @@ fn player_index(p: i8) -> usize {
 /// `stamp`/`epoch` is a generation-stamped visited set: bumping `epoch` "clears" it in O(1)
 /// instead of rewriting 160 bytes.
 ///
-/// `buckets` is a monotone bucket queue keyed by level, which is how both level passes get
+/// `buckets` is a monotone bucket queue keyed by level, sized to the level range rather
+/// than to `INF`, since nothing finite is ever queued above `MAX_LEVEL`. That also bounds
+/// how far `pop` can advance the cursor looking for the next non-empty bucket.
+/// It is how the outward relaxation gets
 /// "process in increasing level order" cheaply. `cursor` only ever moves forward, which is
 /// sound because neither pass ever needs to enqueue *below* the level it is currently
 /// working on.
@@ -146,7 +236,7 @@ impl Scratch {
             queue: Vec::with_capacity(HW),
             comp: Vec::with_capacity(HW),
             deps: Vec::with_capacity(4),
-            buckets: (0..=INF as usize).map(|_| Vec::new()).collect(),
+            buckets: (0..=MAX_LEVEL as usize).map(|_| Vec::new()).collect(),
             cursor: 0,
         }
     }
@@ -181,6 +271,7 @@ impl Scratch {
 
     #[inline]
     fn push(&mut self, cell: usize, level: u8) {
+        debug_assert!(level <= MAX_LEVEL, "queued a level above the cap: {level}");
         self.buckets[level as usize].push(cell as u16);
     }
 
