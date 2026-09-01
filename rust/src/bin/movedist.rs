@@ -63,6 +63,8 @@ struct Sample {
     repair_max_level: u8,
     capped: u64,
     dead: u64,
+    /// how many removals on this move took the slow (component) path
+    slow_removals: u64,
 }
 
 fn pct(sorted: &[f64], q: f64) -> f64 {
@@ -124,6 +126,71 @@ fn histogram(title: &str, samples: &[f64], total_all: usize) {
     }
 }
 
+/// Replay a recorded move sequence through the incremental engine, timing every individual
+/// game-move. `bfs` picks the slow-removal repair strategy. The sequence is fixed, so two
+/// runs with different strategies produce sample vectors that line up index for index.
+fn replay(
+    rec: &[(Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>, Vec<bool>)],
+    n: usize,
+    seed: u64,
+    overhead: f64,
+    bfs: bool,
+) -> (Vec<Sample>, IncrementalGame) {
+    let mut inc = IncrementalGame::new(n, seed);
+    inc.set_bfs_repair(bfs);
+    let mut samples: Vec<Sample> = Vec::with_capacity(n * rec.len());
+    for (r0, c0, r1, c1, active) in rec {
+        for g in 0..n {
+            if !active[g] {
+                continue;
+            }
+            let before = inc.stats();
+            let t = Instant::now();
+            inc.apply_game(g, r0[g], c0[g], r1[g], c1[g]);
+            let ns = t.elapsed().as_secs_f64() * 1e9 - overhead;
+            let a = inc.stats();
+
+            let d = |now: u64, was: u64| now - was;
+            let collision = (r0[g], c0[g]) == (r1[g], c1[g]);
+            let path = if a.inserts + a.removes == before.inserts + before.removes {
+                Path::Unknown
+            } else if collision {
+                if d(a.removes_slow, before.removes_slow) > 0 {
+                    Path::CollisionSlow
+                } else {
+                    Path::CollisionCheap
+                }
+            } else if d(a.inserts_slow, before.inserts_slow) > 0 {
+                Path::InsertSlow
+            } else if d(a.inserts_dead, before.inserts_dead) == 2 {
+                Path::InsertDead
+            } else {
+                Path::InsertFast
+            };
+            samples.push(Sample {
+                ns: ns.max(0.0),
+                path,
+                repair_pops: d(a.repair_pops, before.repair_pops),
+                repair_max_level: a.repair_max_level,
+                capped: d(a.repair_capped, before.repair_capped),
+                dead: d(a.repair_dead, before.repair_dead),
+                slow_removals: d(a.removes_slow, before.removes_slow),
+            });
+        }
+    }
+    (samples, inc)
+}
+
+/// median and mean of a slice, in ns.
+fn med_mean(v: &[f64]) -> (f64, f64) {
+    if v.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (pct(&s, 0.5), v.iter().sum::<f64>() / v.len() as f64)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n = arg_usize(&args, "--games", 2048);
@@ -164,47 +231,23 @@ fn main() {
         }
     }
 
-    // replay, timing each individual game-move
-    let mut inc = IncrementalGame::new(n, seed);
-    let mut samples: Vec<Sample> = Vec::with_capacity(n * rec.len());
-    for (r0, c0, r1, c1, active) in &rec {
-        for g in 0..n {
-            if !active[g] {
-                continue;
-            }
-            let before = inc.stats();
-            let t = Instant::now();
-            inc.apply_game(g, r0[g], c0[g], r1[g], c1[g]);
-            let ns = t.elapsed().as_secs_f64() * 1e9 - overhead;
-            let a = inc.stats();
-
-            let d = |now: u64, was: u64| now - was;
-            let collision = (r0[g], c0[g]) == (r1[g], c1[g]);
-            let path = if a.inserts + a.removes == before.inserts + before.removes {
-                Path::Unknown
-            } else if collision {
-                if d(a.removes_slow, before.removes_slow) > 0 {
-                    Path::CollisionSlow
-                } else {
-                    Path::CollisionCheap
-                }
-            } else if d(a.inserts_slow, before.inserts_slow) > 0 {
-                Path::InsertSlow
-            } else if d(a.inserts_dead, before.inserts_dead) == 2 {
-                Path::InsertDead
-            } else {
-                Path::InsertFast
-            };
-            samples.push(Sample {
-                ns: ns.max(0.0),
-                path,
-                repair_pops: d(a.repair_pops, before.repair_pops),
-                repair_max_level: a.repair_max_level,
-                capped: d(a.repair_capped, before.repair_capped),
-                dead: d(a.repair_dead, before.repair_dead),
-            });
-        }
-    }
+    // The same recorded games, replayed once per repair strategy. `--bfs-first` reverses
+    // the order, which is the only way to tell a real difference from whichever run happens
+    // to go second on a warm cache.
+    let bfs_first = args.iter().any(|a| a == "--bfs-first");
+    let (samples, inc_walk, bfs_samples, inc_bfs) = if bfs_first {
+        let (b, ib) = replay(&rec, n, seed, overhead, true);
+        let (w, iw) = replay(&rec, n, seed, overhead, false);
+        (w, iw, b, ib)
+    } else {
+        let (w, iw) = replay(&rec, n, seed, overhead, false);
+        let (b, ib) = replay(&rec, n, seed, overhead, true);
+        (w, iw, b, ib)
+    };
+    assert_eq!(samples.len(), bfs_samples.len(), "the two replays diverged");
+    assert_eq!(inc_walk.boards, inc_bfs.boards, "the two strategies produced different boards");
+    assert_eq!(inc_walk.levels, inc_bfs.levels, "the two strategies produced different levels");
+    assert_eq!(inc_walk.scores, inc_bfs.scores, "the two strategies produced different scores");
 
     let total = samples.len();
     let all: Vec<f64> = samples.iter().map(|s| s.ns).collect();
@@ -313,6 +356,43 @@ fn main() {
             );
         }
 
+        // The climb is bimodal, so the two modes are really two different workloads. Time
+        // them separately: a repair that settles immediately and one that runs to the cap
+        // should not be averaged together.
+        println!("\n=== time distribution of the two climb modes (repair_up) ===");
+        let settled: Vec<f64> = samples
+            .iter()
+            .filter(|s| s.repair_pops > 0 && s.repair_max_level < 20)
+            .map(|s| s.ns)
+            .collect();
+        let climbed: Vec<f64> = samples
+            .iter()
+            .filter(|s| s.repair_pops > 0 && s.repair_max_level >= 80)
+            .map(|s| s.ns)
+            .collect();
+        histogram("repairs that settled within 20 levels", &settled, total);
+        histogram("repairs that ran to the cap (level 80+)", &climbed, total);
+
+        // and the same two sets of moves under the component rebuild
+        let pick = |keep: &dyn Fn(&Sample) -> bool| -> Vec<f64> {
+            samples
+                .iter()
+                .zip(bfs_samples.iter())
+                .filter(|(o, _)| keep(o))
+                .map(|(_, b)| b.ns)
+                .collect()
+        };
+        histogram(
+            "^ the same moves, rebuilt: settled within 20 levels",
+            &pick(&|s: &Sample| s.repair_pops > 0 && s.repair_max_level < 20),
+            total,
+        );
+        histogram(
+            "^ the same moves, rebuilt: ran to the cap",
+            &pick(&|s: &Sample| s.repair_pops > 0 && s.repair_max_level >= 80),
+            total,
+        );
+
         // are the slowest moves slow because of real work, or because the OS stole the CPU?
         let mut worst: Vec<&Sample> = samples.iter().collect();
         worst.sort_by(|a, b| b.ns.partial_cmp(&a.ns).unwrap());
@@ -323,4 +403,65 @@ fn main() {
             println!("  {:>10.0} {:>12} {:>12.1} {:>8}", w.ns, w.repair_pops, per, w.repair_max_level);
         }
     }
+
+    // ---- repair_up vs. rebuilding the component with a BFS ----
+    //
+    // Same games, same moves, same order; the only difference is which repair the slow
+    // removal path runs. Rows are grouped by what the *old* strategy did, because that is
+    // what the choice is being made about: the climb modes only exist in repair_up.
+    println!("\n=== slow-removal repair: walking levels up vs. rebuilding the component ===");
+    println!(
+        "{:<44} {:>8} {:>10} {:>10} {:>10} {:>10} {:>9}",
+        "group (classified by the repair_up run)", "moves", "old med", "old mean", "new med",
+        "new mean", "mean dx"
+    );
+    let row = |label: &str, keep: &dyn Fn(&Sample) -> bool| {
+        let old: Vec<f64> =
+            samples.iter().filter(|s| keep(s)).map(|s| s.ns).collect();
+        let new: Vec<f64> = samples
+            .iter()
+            .zip(bfs_samples.iter())
+            .filter(|(o, _)| keep(o))
+            .map(|(_, b)| b.ns)
+            .collect();
+        if old.is_empty() {
+            return;
+        }
+        let (om, oa) = med_mean(&old);
+        let (nm, na) = med_mean(&new);
+        println!(
+            "{:<44} {:>8} {:>8.0}ns {:>8.0}ns {:>8.0}ns {:>8.0}ns {:>8.2}x",
+            label, old.len(), om, oa, nm, na, oa / na.max(1e-9)
+        );
+    };
+    row("all moves", &|_: &Sample| true);
+    row("moves with a slow removal", &|s: &Sample| s.slow_removals > 0);
+    row("  ... that settled within 20 levels", &|s: &Sample| {
+        s.repair_pops > 0 && s.repair_max_level < 20
+    });
+    row("  ... that ran to the cap (level 80+)", &|s: &Sample| {
+        s.repair_pops > 0 && s.repair_max_level >= 80
+    });
+    row("moves with no repair work at all", &|s: &Sample| s.repair_pops == 0);
+    for p in Path::all() {
+        let lbl = format!("path: {}", p.label());
+        row(&lbl, &|s: &Sample| s.path == p);
+    }
+
+    let old_total: f64 = samples.iter().map(|s| s.ns).sum();
+    let new_total: f64 = bfs_samples.iter().map(|s| s.ns).sum();
+    let old_pops: u64 = samples.iter().map(|s| s.repair_pops).sum();
+    let new_pops: u64 = bfs_samples.iter().map(|s| s.repair_pops).sum();
+    println!(
+        "\ntotal move time: {:.1} ms walking up, {:.1} ms rebuilding ({:+.1}%)",
+        old_total / 1e6,
+        new_total / 1e6,
+        (new_total - old_total) / old_total * 100.0
+    );
+    println!(
+        "repair cells touched: {} walking up, {} rebuilding ({:.1}x fewer)",
+        old_pops,
+        new_pops,
+        old_pops as f64 / new_pops.max(1) as f64
+    );
 }

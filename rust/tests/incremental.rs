@@ -320,9 +320,10 @@ fn pick(mask: &[f32], finished: &[bool], n: usize, rng: &mut Rng) -> Vec<i64> {
 /// Drives both implementations through the same random legal moves and compares state
 /// after every move. Returns how many collisions occurred, so a caller can assert the
 /// removal paths were actually exercised.
-fn differential_rollout(n: usize, seed: u64, check_every_step: bool) -> usize {
+fn differential_rollout(n: usize, seed: u64, check_every_step: bool, bfs: bool) -> usize {
     let mut refg = BatchedLinesGame::new(n, seed);
     let mut inc = IncrementalGame::new(n, seed);
+    inc.set_bfs_repair(bfs);
     let mut rng = Rng::new(seed ^ 0x9e37_79b9);
     let mut collisions = 0usize;
     let mut steps = 0usize;
@@ -359,7 +360,7 @@ fn differential_rollout(n: usize, seed: u64, check_every_step: bool) -> usize {
 fn matches_the_reference_over_random_rollouts() {
     let mut collisions = 0;
     for seed in 0..12u64 {
-        collisions += differential_rollout(128, seed, false);
+        collisions += differential_rollout(128, seed, false, true);
     }
     assert!(collisions > 100, "expected the collision path to be exercised, saw {collisions}");
 }
@@ -368,7 +369,7 @@ fn matches_the_reference_over_random_rollouts() {
 fn holds_its_invariants_after_every_move_of_a_full_rollout() {
     let mut collisions = 0;
     for seed in 100..103u64 {
-        collisions += differential_rollout(24, seed, true);
+        collisions += differential_rollout(24, seed, true, true);
     }
     assert!(collisions > 0, "expected at least one collision, saw {collisions}");
 }
@@ -501,4 +502,54 @@ fn the_live_list_survives_collisions_and_stays_row_major() {
         steps += 1;
         assert!(steps < 200);
     }
+}
+
+/// The BFS repair strategy has to be a drop-in for `repair_up`: same boards, same scores,
+/// and — the part that actually pins the algorithm down — the same levels, cell for cell,
+/// after every move. Anything less would mean one of them is wrong about reachability.
+#[test]
+fn the_bfs_repair_produces_exactly_the_same_state_as_walking_the_levels_up() {
+    for seed in 0..8u64 {
+        let n = 64;
+        let mut walk = IncrementalGame::new(n, seed);
+        let mut bfs = IncrementalGame::new(n, seed);
+        bfs.set_bfs_repair(true);
+        let mut rng = Rng::new(seed ^ 0xbf5);
+        let mut steps = 0usize;
+
+        while !walk.finished.iter().all(|&f| f) {
+            let (m0, m1, _, _) = walk.get_legal_masks();
+            let a = pick(&m0, &walk.finished, n, &mut rng);
+            let mut idx1 = pick(&m1, &walk.finished, n, &mut rng);
+            // steer half the games into collisions, which is what drives slow removals
+            for g in (0..n).step_by(2) {
+                if !walk.finished[g] && m1[g * HW + a[g] as usize] == 1.0 {
+                    idx1[g] = a[g];
+                }
+            }
+
+            walk.action_step(&a, &idx1).unwrap();
+            bfs.action_step(&a, &idx1).unwrap();
+
+            assert_eq!(bfs.boards, walk.boards, "seed {seed} step {steps}: boards");
+            assert_eq!(bfs.levels, walk.levels, "seed {seed} step {steps}: levels");
+            assert_eq!(bfs.scores, walk.scores, "seed {seed} step {steps}: scores");
+            bfs.check_invariants().unwrap();
+
+            steps += 1;
+            assert!(steps < 200);
+        }
+    }
+}
+
+/// The same differential check against the reference implementation with the *old* walk-up
+/// repair, so both strategies stay verified against ground truth and not only against each
+/// other. (The default rollouts above already cover the BFS.)
+#[test]
+fn the_walk_up_repair_matches_the_reference_over_random_rollouts() {
+    let mut collisions = 0;
+    for seed in 0..8u64 {
+        collisions += differential_rollout(96, seed, true, false);
+    }
+    assert!(collisions > 50, "expected the removal path to be exercised, saw {collisions}");
 }

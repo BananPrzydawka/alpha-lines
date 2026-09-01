@@ -158,6 +158,10 @@ pub struct Stats {
     /// cells visited by component walks, and how many walks
     pub component_cells: u64,
     pub component_walks: u64,
+    /// slow removals that rebuilt their component with a BFS instead of `repair_up`,
+    /// and the cells that BFS touched. Only moves when `Scratch::bfs_repair` is set.
+    pub bfs_repairs: u64,
+    pub bfs_cells: u64,
 }
 
 /// Bumps a [`Stats`] counter, but only when the `stats` feature is on, so the default build
@@ -206,9 +210,17 @@ macro_rules! reset_stat {
 
 pub struct Scratch {
     pub stats: Stats,
+    /// Which repair strategy the slow-removal path uses: `true` (the default) throws the
+    /// component's levels away and re-derives them with [`rebuild_component_levels`],
+    /// `false` walks them up with [`repair_up`]. Both produce identical state, cell for
+    /// cell — they differ only in cost, and the rebuild wins because a severed cycle makes
+    /// the walk climb all the way to `MAX_LEVEL` before it admits the region is dead.
+    /// Kept switchable so the two can still be measured against each other.
+    pub bfs_repair: bool,
     stamp: Vec<u32>,
     epoch: u32,
     stack: Vec<u16>,
+    queue: Vec<u16>,
     comp: Vec<u16>,
     deps: Vec<u16>,
     buckets: Vec<Vec<u16>>,
@@ -225,9 +237,11 @@ impl Scratch {
     pub fn new() -> Self {
         Scratch {
             stats: Stats::default(),
+            bfs_repair: true,
             stamp: vec![0; HW],
             epoch: 0,
             stack: Vec::with_capacity(HW),
+            queue: Vec::with_capacity(HW),
             comp: Vec::with_capacity(HW),
             deps: Vec::with_capacity(4),
             buckets: (0..=INF as usize).map(|_| Vec::new()).collect(),
@@ -394,6 +408,77 @@ fn repair_up(cells: &[i8], level: &mut [u8], seeds: &[u16], p: i8, s: &mut Scrat
             }
         }
     }
+}
+
+/// Re-derive the levels of one whole component from scratch, instead of walking them up.
+///
+/// The alternative to [`repair_up`] on the slow-removal path. `comp` must be the component
+/// the deleted cell belonged to, collected *before* the deletion — which the slow path
+/// already has in hand, because it needs it to score the component anyway.
+///
+/// Two facts make this a complete answer rather than a local patch:
+///
+/// * Every level that can change is inside `comp`. A level only changes if its route ran
+///   through the deleted cell, and every such route lies inside the component.
+/// * Nothing outside `comp` can rescue anything inside it. A mark diagonally adjacent to a
+///   mark of the same player is *by definition* in the same component, so `comp` has no
+///   neighbouring marks at all. The BFS therefore cannot leak out, and no external ground
+///   exists that we would be failing to consider.
+///
+/// So: blank the component, seed from whichever of its cells sit on the border, and let a
+/// plain shortest-path BFS fill the rest. Cost is O(|comp|), bounded by the 80 playable
+/// squares, and completely independent of how tangled the levels were before.
+///
+/// The cap that [`computed_level`] and [`relax_down`] carry is not needed here and never
+/// fires: a shortest path visits distinct cells, so no real distance can reach `MAX_LEVEL`
+/// in the first place. Anything left at `INF` is genuinely unreachable.
+fn rebuild_component_levels(cells: &[i8], level: &mut [u8], comp: &[u16], p: i8, s: &mut Scratch) {
+    count!(s, bfs_repairs);
+    let mut q = std::mem::take(&mut s.queue);
+    q.clear();
+
+    // blank the component, then seed from its border cells
+    for &ci in comp {
+        let i = ci as usize;
+        if cells[i] != p {
+            continue; // the cell we just deleted, and anything else no longer a mark
+        }
+        count!(s, bfs_cells);
+        if on_border(i) {
+            level[i] = 0;
+        } else {
+            level[i] = INF;
+        }
+    }
+    // seeding is a second pass on purpose: the first pass is still blanking cells that a
+    // border cell found early would otherwise have been compared against
+    for &ci in comp {
+        let i = ci as usize;
+        if cells[i] == p && level[i] == 0 {
+            q.push(ci);
+        }
+    }
+
+    // A plain FIFO is enough — every step costs exactly one, so cells come off the queue in
+    // nondecreasing level order for free. That is also why no cell is ever queued twice:
+    // by the time it is reached, the level it gets is already the smallest available.
+    let mut head = 0;
+    while head < q.len() {
+        let x = q[head] as usize;
+        head += 1;
+        count!(s, repair_pops);
+        let nl = level[x] + 1;
+        for d in DIAG {
+            if let Some(n) = step(x, d) {
+                if cells[n] == p && level[n] > nl {
+                    level[n] = nl;
+                    track_max!(s, repair_max_level, nl);
+                    q.push(n as u16);
+                }
+            }
+        }
+    }
+    s.queue = q;
 }
 
 /// Rebuild every level from scratch. Used at construction, after an import, and as the
@@ -652,7 +737,12 @@ pub fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s
 
     cells[i] = REMOVED_SQUARE;
     level[i] = INF;
-    repair_up(cells, level, &deps, p, s);
+    if s.bfs_repair {
+        reset_stat!(s, repair_max_level);
+        rebuild_component_levels(cells, level, &comp, p, s);
+    } else {
+        repair_up(cells, level, &deps, p, s);
+    }
 
     // `comp` may now be several disconnected pieces, some alive, some INF. `contribution`
     // handles that on its own: a piece on INF simply contributes nothing, and the removed
@@ -1141,6 +1231,13 @@ impl IncrementalGame {
     }
 
     /// Path counters accumulated since construction.
+    /// Pick the slow-removal repair strategy: `true` (the default) re-derives the whole
+    /// component with a BFS, `false` walks levels up with `repair_up`. The resulting state
+    /// is identical either way, so this is purely a cost knob.
+    pub fn set_bfs_repair(&mut self, on: bool) {
+        self.scratch.bfs_repair = on;
+    }
+
     pub fn stats(&self) -> Stats {
         self.scratch.stats
     }

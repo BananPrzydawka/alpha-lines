@@ -36,6 +36,8 @@ fn main() {
     // Independent rollouts to average over. At small batch sizes a single rollout is a
     // sample of one game, whose cost varies by 12x, so it says nothing on its own.
     let rollout_reps = arg_usize(&args, "--rollout-reps", 1);
+    // slow-removal repair strategy for the incremental engine; state is identical either way
+    let bfs = args.iter().any(|a| a == "--bfs");
 
     let hw = HEIGHT * WIDTH;
     let mut rng = Rng::new(seed);
@@ -66,6 +68,7 @@ fn main() {
     // ---- the same rollouts, scored incrementally ----
     let mut incs: Vec<IncrementalGame> =
         (0..rollout_reps).map(|k| IncrementalGame::new(n, seed + k as u64)).collect();
+    incs.iter_mut().for_each(|i| i.set_bfs_repair(bfs));
     let t0 = Instant::now();
     let mut inc_steps = 0usize;
     for inc in incs.iter_mut() {
@@ -112,6 +115,7 @@ fn main() {
     report("apply_and_score_reference", t.elapsed().as_secs_f64(), recorded.len());
 
     let mut inc_game = IncrementalGame::new(n, seed);
+    inc_game.set_bfs_repair(bfs);
     let t = Instant::now();
     for (r0, c0, r1, c1, active) in &recorded {
         inc_game.apply_step(r0, c0, r1, c1, active);
