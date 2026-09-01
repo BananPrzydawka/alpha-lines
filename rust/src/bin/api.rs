@@ -14,8 +14,35 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use alpha_lines_game::game::{Rng, Scratch, HEIGHT, HW, WIDTH};
+use alpha_lines_game::game::{legal_cell, Rng, Scratch, HEIGHT, HW, WIDTH};
 use alpha_lines_game::Game;
+
+/// A uniformly random legal move for `player`, out of the mask the engine hands over.
+///
+/// The engine deliberately does not offer this — picking moves uniformly is a driver's
+/// business, and the real one will be sampling a policy. It is three operations on the two
+/// mask words: `popcount` for how many moves there are, one bounded draw for which, and a
+/// select for where. `x &= x - 1` clears the lowest set bit, so doing it `k` times leaves the
+/// k-th one at the bottom for `trailing_zeros` to read off.
+fn uniform_move(g: &Game, player: usize, rng: &mut Rng) -> usize {
+    let w = g.legal_moves(player);
+    let count = w[0].count_ones() + w[1].count_ones();
+    assert!(count > 0, "no legal move for player {player}");
+    let mut k = rng.randint(count as u64) as u32;
+    for (wi, &word) in w.iter().enumerate() {
+        let c = word.count_ones();
+        if k < c {
+            let mut x = word;
+            for _ in 0..k {
+                x &= x - 1;
+            }
+            return legal_cell((wi << 6) + x.trailing_zeros() as usize);
+        }
+        k -= c;
+    }
+    unreachable!("select past the end of the legal set")
+}
+
 
 fn arg_usize(args: &[String], key: &str, default: usize) -> usize {
     args.iter()
@@ -56,8 +83,8 @@ fn positions(count: usize, warmup: usize, seed: u64, s: &mut Scratch) -> Vec<Gam
                 if g.finished {
                     break;
                 }
-                let (i0, i1) = (g.random_move(0, &mut rng), g.random_move(1, &mut rng));
-                g.apply(i0, i1, s);
+                let (i0, i1) = (uniform_move(&g, 0, &mut rng), uniform_move(&g, 1, &mut rng));
+                g.action_step(i0, i1, s);
             }
             g
         })
@@ -104,18 +131,10 @@ fn main() {
     let s = Instant::now();
     for _ in 0..reps {
         for g in &mid {
-            black_box(g.legal_bits());
-        }
-    }
-    t.add("legal_bits", s.elapsed().as_secs_f64(), calls, "the playable set, 80 bits");
-
-    let s = Instant::now();
-    for _ in 0..reps {
-        for g in &mid {
             black_box(g.legal_moves(0));
         }
     }
-    t.add("legal_moves", s.elapsed().as_secs_f64(), calls, "same, narrowed to one player");
+    t.add("legal_moves", s.elapsed().as_secs_f64(), calls, "the 80-bit mask for one player");
 
     let s = Instant::now();
     for _ in 0..reps {
@@ -128,34 +147,10 @@ fn main() {
     let s = Instant::now();
     for _ in 0..reps {
         for g in &mid {
-            black_box(g.is_legal(black_box(34), 0));
-        }
-    }
-    t.add("is_legal", s.elapsed().as_secs_f64(), calls, "one square, one bit test");
-
-    let s = Instant::now();
-    for _ in 0..reps {
-        for g in &mid {
-            black_box(g.random_move(0, &mut rng));
-        }
-    }
-    t.add("random_move", s.elapsed().as_secs_f64(), calls, "uniform draw from the bitboard");
-
-    let s = Instant::now();
-    for _ in 0..reps {
-        for g in &mid {
             black_box(g.sample_move(&dist, 0, &mut rng));
         }
     }
     t.add("sample_move", s.elapsed().as_secs_f64(), calls, "weighted draw over 160 floats");
-
-    let s = Instant::now();
-    for _ in 0..reps {
-        for g in &mid {
-            black_box(g.margin());
-        }
-    }
-    t.add("margin", s.elapsed().as_secs_f64(), calls, "the position's value");
 
     // `apply` over whole rollouts: its cost is a function of how full the board is, so the
     // only honest average is over a game, not over one position replayed.
@@ -165,14 +160,14 @@ fn main() {
     for _ in 0..rollouts {
         let mut g = Game::new();
         while !g.finished {
-            let (i0, i1) = (g.random_move(0, &mut rng), g.random_move(1, &mut rng));
-            g.apply(i0, i1, &mut scratch);
+            let (i0, i1) = (uniform_move(&g, 0, &mut rng), uniform_move(&g, 1, &mut rng));
+            g.action_step(i0, i1, &mut scratch);
             moves += 1;
         }
         black_box(&g.scores);
     }
     let played = s.elapsed().as_secs_f64();
-    t.add("apply (+ 2 random_move)", played, moves, "one move, averaged over whole games");
+    t.add("action_step (+ 2 picks)", played, moves, "one move, averaged over whole games");
 
     t.print(format!("Game, {count} mid-game positions, {reps} reps").as_str());
 

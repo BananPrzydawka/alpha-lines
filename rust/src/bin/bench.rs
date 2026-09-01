@@ -2,9 +2,11 @@
 //!
 //! Two samplers are timed, because the choice is worth a factor of 1.5:
 //!
-//! * **From the bitboard.** A uniform draw over the legal set with no distribution at all —
-//!   `popcount`, one bounded draw, one select. This is what a rollout should use.
-//! * **Weighted.** A scan over an `HW`-float distribution, which is what a policy network
+//! * **From the bitboard.** A uniform draw over the mask with no distribution at all —
+//!   `popcount`, one bounded draw, one select, done here in the driver rather than by the
+//!   engine. This is the floor: what a move costs when choosing it is free.
+//! * **Weighted.** `Game::sample_move`: a scan over an `HW`-float distribution, which is
+//!   what a policy network
 //!   hands you. Timed twice: over one distribution reused by every game, which stays in L1,
 //!   and over a fresh slice per game out of a large array, which does not. The gap between
 //!   those two rows is memory traffic, not engine work, and the cold row is the one to quote.
@@ -15,7 +17,7 @@
 //! This engine replaced a batched one — N boards in flat arrays, stepped in lockstep, an
 //! `active` mask saying which were still running. Measured against it on this same workload,
 //! batching flattened out at ~22.5 us/game by 64 games and got no better at 4096; one game at
-//! a time with the same weighted sampler cost the same 22.1 us, and the bitboard sampler beat
+//! a time with the same weighted sampler cost the same 22.1 us, and a uniform pick over the mask beat
 //! every batch size by 1.5x. Batching was amortizing per-step allocation, not vectorizing
 //! anything — the scorer chases pointers around one board at a time no matter how many boards
 //! are in flight.
@@ -32,8 +34,35 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use alpha_lines_game::game::{Rng, Scratch, HW};
+use alpha_lines_game::game::{legal_cell, Rng, Scratch, HW};
 use alpha_lines_game::Game;
+
+/// A uniformly random legal move for `player`, out of the mask the engine hands over.
+///
+/// The engine deliberately does not offer this — picking moves uniformly is a driver's
+/// business, and the real one will be sampling a policy. It is three operations on the two
+/// mask words: `popcount` for how many moves there are, one bounded draw for which, and a
+/// select for where. `x &= x - 1` clears the lowest set bit, so doing it `k` times leaves the
+/// k-th one at the bottom for `trailing_zeros` to read off.
+fn uniform_move(g: &Game, player: usize, rng: &mut Rng) -> usize {
+    let w = g.legal_moves(player);
+    let count = w[0].count_ones() + w[1].count_ones();
+    assert!(count > 0, "no legal move for player {player}");
+    let mut k = rng.randint(count as u64) as u32;
+    for (wi, &word) in w.iter().enumerate() {
+        let c = word.count_ones();
+        if k < c {
+            let mut x = word;
+            for _ in 0..k {
+                x &= x - 1;
+            }
+            return legal_cell((wi << 6) + x.trailing_zeros() as usize);
+        }
+        k -= c;
+    }
+    unreachable!("select past the end of the legal set")
+}
+
 
 fn arg_usize(args: &[String], key: &str, default: usize) -> usize {
     args.iter()
@@ -112,7 +141,7 @@ fn header(title: &str) {
 
 /// Which sampler the rollouts use.
 enum Sampler<'a> {
-    /// A uniform draw straight out of the legality bitboard: popcount, draw, select.
+    /// A uniform draw straight out of the mask: popcount, draw, select.
     Bits,
     /// The weighted scan, over `HW` weights that stay in cache across every game.
     Hot(&'a [f32]),
@@ -134,7 +163,7 @@ fn rollouts(games: usize, seed: u64, sampler: Sampler) -> Sample {
         let mut g = Game::new();
         while !g.finished {
             let (i0, i1) = match sampler {
-                Sampler::Bits => (g.random_move(0, &mut rng), g.random_move(1, &mut rng)),
+                Sampler::Bits => (uniform_move(&g, 0, &mut rng), uniform_move(&g, 1, &mut rng)),
                 Sampler::Hot(d) => {
                     (g.sample_move(d, 0, &mut rng), g.sample_move(d, 1, &mut rng))
                 }
@@ -143,7 +172,7 @@ fn rollouts(games: usize, seed: u64, sampler: Sampler) -> Sample {
                     (g.sample_move(s, 0, &mut rng), g.sample_move(s, 1, &mut rng))
                 }
             };
-            g.apply(i0, i1, &mut scratch);
+            g.action_step(i0, i1, &mut scratch);
         }
         moves += g.move_count as usize;
         black_box(&g.scores);
@@ -179,7 +208,7 @@ fn main() {
         // a different seed per sweep, so no configuration is measured on one lucky run
         let s = seed + sweep as u64 * 7919;
         let measured = [
-            ("uniform from bitboard", rollouts(games, s, Sampler::Bits)),
+            ("uniform over the mask", rollouts(games, s, Sampler::Bits)),
             ("weighted, hot dist", rollouts(games, s, Sampler::Hot(&dist[..HW]))),
             ("weighted, cold dist", rollouts(games, s, Sampler::Cold(&dist))),
         ];
@@ -203,7 +232,7 @@ fn main() {
     println!(
         "\n(a Game is {} bytes, so forking a position is a memcpy. The weighted rows walk a \
          {}-float\n distribution per move; the cold one draws it from {positions} positions' \
-         worth, the hot one reuses\n a single vector. The bitboard sampler reads no \
+         worth, the hot one reuses\n a single vector. The uniform pick reads no \
          distribution at all and is {:.2}x faster\n than the cold weighted scan.)",
         std::mem::size_of::<Game>(),
         HW,

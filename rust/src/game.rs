@@ -756,11 +756,15 @@ fn legal_bit(i: usize) -> (usize, u64) {
 
 /// The board index a bit position stands for; the inverse of `i >> 1` over playable cells.
 ///
+/// Public because it is the decoder for [`Game::legal_moves`]: the mask is 80 bit positions,
+/// and without this it says nothing about which squares they are. Walking a mask is
+/// `while w != 0 { let cell = legal_cell(base + w.trailing_zeros() as usize); w &= w - 1; }`.
+///
 /// It reduces to two instructions. Position `k` is `r * 8 + j`, and the cell it names is
 /// `r * 16 + 2j + (r & 1)` — and `r * 16 + 2j` is exactly `2k`, so all that is left is the
 /// row's parity, which is bit 3 of `k`.
 #[inline]
-fn legal_cell(k: usize) -> usize {
+pub fn legal_cell(k: usize) -> usize {
     (k << 1) | ((k >> 3) & 1)
 }
 
@@ -881,14 +885,14 @@ impl Game {
         self.legal[0] == 0 && self.legal[1] == 0
     }
 
-    /// Every square still playable, ignoring whose turn it is.
-    #[inline]
-    pub fn legal_bits(&self) -> [u64; LEGAL_WORDS] {
-        self.legal
-    }
-
-    /// The squares `player` may actually play right now: the playable set, narrowed to this
-    /// player's half on the opening move. One `AND` per word — see [`LEGAL_LEFT`].
+    /// The squares `player` may play right now, as a bitboard: two words, 80 bits, one per
+    /// playable square, decoded by [`legal_cell`].
+    ///
+    /// This is the playable set narrowed to this player's half on the opening move, which
+    /// costs one `AND` per word — see [`LEGAL_LEFT`]. There is no separate accessor for the
+    /// un-narrowed set, because a caller cannot legally use one: on the opening move the
+    /// halves are the rule, and after it both players see the same set, so `legal_moves(0)`
+    /// and `legal_moves(1)` are the same two words.
     #[inline]
     pub fn legal_moves(&self, player: usize) -> [u64; LEGAL_WORDS] {
         let half = if self.move_count != 0 {
@@ -908,17 +912,6 @@ impl Game {
         w[0].count_ones() + w[1].count_ones()
     }
 
-    /// Is board index `i` a legal move for `player`? A bit test, not a board read.
-    #[inline]
-    pub fn is_legal(&self, i: usize, player: usize) -> bool {
-        if i >= HW || legal_cell(i >> 1) != i {
-            return false; // not a playable-parity square, so it holds no bit of its own
-        }
-        let w = self.legal_moves(player);
-        let k = i >> 1;
-        w[k >> 6] >> (k & 63) & 1 == 1
-    }
-
     /// The board index of the `k`th set bit of `w`, counting from the low end.
     #[inline]
     fn select(w: [u64; LEGAL_WORDS], mut k: u32) -> usize {
@@ -936,15 +929,13 @@ impl Game {
         unreachable!("select past the end of the legal set")
     }
 
-    /// A uniformly random legal move for `player`. Panics if the game is over.
-    ///
-    /// This is the rollout primitive, and it never touches the board: one `popcount`, one
-    /// bounded draw, and a select over 80 bits.
+    /// A uniform draw over a mask. Only the degenerate branch of [`Self::sample_move`] needs
+    /// it: picking moves uniformly is a driver's business, not the engine's, and a driver
+    /// that wants it already has the mask and can `popcount`, draw and select over it.
     #[inline]
-    pub fn random_move(&self, player: usize, rng: &mut Rng) -> usize {
-        let w = self.legal_moves(player);
+    fn uniform(w: [u64; LEGAL_WORDS], rng: &mut Rng) -> usize {
         let count = w[0].count_ones() + w[1].count_ones();
-        assert!(count > 0, "no legal move for player {player}");
+        assert!(count > 0, "no legal move to sample");
         Self::select(w, rng.randint(count as u64) as u32)
     }
 
@@ -974,7 +965,7 @@ impl Game {
             }
         }
         if total < 1e-8 {
-            return self.random_move(player, rng);
+            return Self::uniform(words, rng);
         }
 
         let threshold = rng.random() * total;
@@ -998,7 +989,7 @@ impl Game {
         }
         // only reachable if rounding put the threshold past the whole sum
         if chosen == usize::MAX {
-            return self.random_move(player, rng);
+            return Self::uniform(words, rng);
         }
         chosen
     }
@@ -1010,10 +1001,10 @@ impl Game {
     /// debug builds, because the caller picked them out of [`Self::legal_moves`] and paying
     /// for a re-check on every node of a search is not worth it.
     #[inline]
-    pub fn apply(&mut self, i0: usize, i1: usize, s: &mut Scratch) {
+    pub fn action_step(&mut self, i0: usize, i1: usize, s: &mut Scratch) {
         debug_assert!(!self.finished, "move played on a finished game");
-        debug_assert!(self.is_legal(i0, 0), "illegal move {i0} for player 0");
-        debug_assert!(self.is_legal(i1, 1), "illegal move {i1} for player 1");
+        debug_assert!(self.holds_bit(i0, 0), "illegal move {i0} for player 0");
+        debug_assert!(self.holds_bit(i1, 1), "illegal move {i1} for player 1");
         apply_move(
             &mut self.cells,
             &mut self.levels,
@@ -1027,9 +1018,14 @@ impl Game {
         self.finished = self.no_moves_left();
     }
 
-    /// Player 0's score minus player 1's — the value of the position, from p0's side.
+    /// Does `player`'s mask hold the bit for board index `i`? For the debug assertions in
+    /// [`Self::action_step`] — a caller wanting this reads its own mask.
     #[inline]
-    pub fn margin(&self) -> i32 {
-        self.scores[0] - self.scores[1]
+    fn holds_bit(&self, i: usize, player: usize) -> bool {
+        if i >= HW || legal_cell(i >> 1) != i {
+            return false; // not a playable-parity square, so it holds no bit of its own
+        }
+        let k = i >> 1;
+        self.legal_moves(player)[k >> 6] >> (k & 63) & 1 == 1
     }
 }

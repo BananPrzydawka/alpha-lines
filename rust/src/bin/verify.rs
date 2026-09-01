@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::PathBuf;
 
-use alpha_lines_game::game::{Scratch, HEIGHT, HW, WIDTH};
+use alpha_lines_game::game::{legal_cell, Scratch, HEIGHT, HW, WIDTH, LEGAL_WORDS};
 use alpha_lines_game::Game;
 
 const STATE_MAGIC: &[u8; 4] = b"ALST";
@@ -65,18 +65,31 @@ fn dense_masks(games: &[Game]) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let (mut m0, mut m1) = (vec![0.0f32; n * HW], vec![0.0f32; n * HW]);
     let (mut c0, mut c1) = (vec![0.0f32; n], vec![0.0f32; n]);
     for (g, game) in games.iter().enumerate() {
-        for i in 0..HW {
-            if game.is_legal(i, 0) {
-                m0[g * HW + i] = 1.0;
-                c0[g] += 1.0;
-            }
-            if game.is_legal(i, 1) {
-                m1[g * HW + i] = 1.0;
-                c1[g] += 1.0;
+        for (player, dense, count) in
+            [(0usize, &mut m0, &mut c0), (1usize, &mut m1, &mut c1)]
+        {
+            for (wi, &word) in game.legal_moves(player).iter().enumerate() {
+                let mut w = word;
+                while w != 0 {
+                    let cell = legal_cell((wi << 6) + w.trailing_zeros() as usize);
+                    w &= w - 1;
+                    dense[g * HW + cell] = 1.0;
+                    count[g] += 1.0;
+                }
             }
         }
     }
     (m0, m1, c0, c1)
+}
+
+/// Does `mask` hold the bit for board index `i`? The engine hands out bits and leaves reading
+/// them to the caller; this driver needs it to police a move file it did not produce.
+fn holds(mask: [u64; LEGAL_WORDS], i: i32) -> bool {
+    if i < 0 || i as usize >= HW || legal_cell(i as usize >> 1) != i as usize {
+        return false;
+    }
+    let k = i as usize >> 1;
+    mask[k >> 6] >> (k & 63) & 1 == 1
 }
 
 struct StateWriter {
@@ -184,7 +197,7 @@ fn main() {
             }
             let (i0, i1) = (moves.data[off + g * 2], moves.data[off + g * 2 + 1]);
             for (player, i) in [(0usize, i0), (1usize, i1)] {
-                if i < 0 || !game.is_legal(i as usize, player) {
+                if !holds(game.legal_moves(player), i) {
                     eprintln!("step {step}, game {g}: illegal move {i} for player {player}");
                     std::process::exit(2);
                 }
@@ -196,7 +209,7 @@ fn main() {
             }
             let i0 = moves.data[off + g * 2] as usize;
             let i1 = moves.data[off + g * 2 + 1] as usize;
-            game.apply(i0, i1, &mut scratch);
+            game.action_step(i0, i1, &mut scratch);
         }
         state.push(&games);
     }

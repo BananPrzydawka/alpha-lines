@@ -20,7 +20,8 @@
 //!   `check_levels_and_scores` re-derives every level from scratch and re-scores with the
 //!   oracle's own scorer, so the internal state is pinned too, not just the output.
 //! * **The masks.** The oracle builds them by scanning 160 floats; the engine packs the same
-//!   information into 80 bits. Every square of every game is compared both ways.
+//!   information into 80 bits. Every square of every game is compared both ways, with the
+//!   test unpacking the bits from the documented layout rather than asking the engine to.
 //! * **The rare paths.** Collisions are what drive the slow removal path, but only if there
 //!   is structure for them to cut: forcing one on every move flattens the board and the slow
 //!   path then runs *zero* times, measured. Pure random play is in fact the best exerciser of
@@ -33,14 +34,14 @@
 //!   plays a parent and a clone apart and requires neither to feel the other.
 //!
 //! Meant to be run as `cargo test --release`; a debug build is ~50x slower, but it is worth
-//! running there too — that is where `apply`'s legality `debug_assert`s are live.
+//! running there too — that is where `action_step`'s legality `debug_assert`s are live.
 //! `PARITY_GAMES` overrides the game count.
 
 mod oracle;
 
 use alpha_lines_game::game::{
-    rebuild_levels, Rng, Scratch, HEIGHT, HW, INF, MAX_LEVEL, PLAYABLE_SQUARE, PLAYER_0_MARK,
-    PLAYER_1_MARK, WIDTH,
+    legal_cell, rebuild_levels, Rng, Scratch, HEIGHT, HW, INF, LEGAL_WORDS, MAX_LEVEL,
+    PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK, WIDTH,
 };
 use alpha_lines_game::Game;
 use oracle::{apply_and_score_kernel, legal_masks_kernel, sample_move_kernel, score_player};
@@ -124,7 +125,7 @@ impl Oracle {
 //
 // The engine ships no self-verification: re-deriving levels and re-scoring a board is test
 // code, and test code belongs here. Both checkers work off the public surface — `cells`,
-// `levels`, `scores`, `legal_bits` — plus the oracle's own scorer, which is what makes them
+// `levels`, `scores`, `legal_moves` — plus the oracle's own scorer, which is what makes them
 // evidence rather than the engine agreeing with itself.
 
 /// Every level must equal what a from-scratch BFS would produce, and every running score
@@ -151,11 +152,14 @@ fn check_levels_and_scores(games: &[Game], where_: &str) {
 
 /// Every legality bit must match the board, and `finished` must match whether any bit is
 /// left. This also pins the bit packing itself, since the two sides are built by different
-/// code: `legal_bits` is maintained one cleared bit at a time as moves are played, and the
+/// code: the mask is maintained one cleared bit at a time as moves are played, and the
 /// board is what the moves actually wrote.
 fn check_legality(games: &[Game], where_: &str) {
     for (g, game) in games.iter().enumerate() {
-        let bits = game.legal_bits();
+        // the playable set, whoever is to move: the opening halves are disjoint and cover
+        // everything, and after the opening both players see the same set
+        let (a, b) = (game.legal_moves(0), game.legal_moves(1));
+        let bits = [a[0] | b[0], a[1] | b[1]];
         let mut any = false;
         for i in 0..HW {
             let k = i >> 1;
@@ -167,6 +171,40 @@ fn check_legality(games: &[Game], where_: &str) {
         }
         assert_eq!(game.finished, !any, "{where_}: game {g} finished flag");
     }
+}
+
+/// Does `player`'s mask hold the bit for board index `i`?
+///
+/// The engine offers no such call on purpose — the mask is already bits, and a caller reads
+/// them. So the test does the reading, which is what makes this evidence: the packing is
+/// re-derived here from the documented layout rather than asked for.
+fn legal_at(game: &Game, i: usize, player: usize) -> bool {
+    if i >= HW || legal_cell(i >> 1) != i {
+        return false; // not a playable-parity square, so it holds no bit of its own
+    }
+    let k = i >> 1;
+    game.legal_moves(player)[k >> 6] >> (k & 63) & 1 == 1
+}
+
+/// A uniformly random legal move: `popcount`, one bounded draw, one select over 80 bits.
+/// Also not the engine's job — a driver that wants uniform play has the mask and can do this.
+fn uniform_move(game: &Game, player: usize, rng: &mut Rng) -> usize {
+    let w: [u64; LEGAL_WORDS] = game.legal_moves(player);
+    let count = w[0].count_ones() + w[1].count_ones();
+    assert!(count > 0, "no legal move for player {player}");
+    let mut k = rng.randint(count as u64) as u32;
+    for (wi, &word) in w.iter().enumerate() {
+        let c = word.count_ones();
+        if k < c {
+            let mut x = word;
+            for _ in 0..k {
+                x &= x - 1; // clear the lowest set bit
+            }
+            return legal_cell((wi << 6) + x.trailing_zeros() as usize);
+        }
+        k -= c;
+    }
+    unreachable!("select past the end of the legal set")
 }
 
 /// The boards, laid out the way the oracle lays out its batch, so the two can be compared in
@@ -193,8 +231,8 @@ fn masks_from_bits(games: &[Game]) -> (Vec<f32>, Vec<f32>) {
     let mut m1 = vec![0.0f32; n * HW];
     for (g, game) in games.iter().enumerate() {
         for i in 0..HW {
-            m0[g * HW + i] = f32::from(game.is_legal(i, 0));
-            m1[g * HW + i] = f32::from(game.is_legal(i, 1));
+            m0[g * HW + i] = f32::from(legal_at(game, i, 0));
+            m1[g * HW + i] = f32::from(legal_at(game, i, 1));
         }
     }
     (m0, m1)
@@ -243,7 +281,7 @@ fn sampled_step(games: &mut [Game], d0: &[f32], d1: &[f32], rng: &mut Rng, s: &m
     }
     for (g, game) in games.iter_mut().enumerate() {
         if !game.finished {
-            game.apply(i0[g], i1[g], s);
+            game.action_step(i0[g], i1[g], s);
         }
     }
 }
@@ -302,14 +340,14 @@ fn the_engine_matches_the_oracle_bit_for_bit() {
             if game.finished {
                 continue;
             }
-            assert!(game.is_legal(idx0[g] as usize, 0), "g{g} p0 move at step {steps}");
-            assert!(game.is_legal(idx1[g] as usize, 1), "g{g} p1 move at step {steps}");
+            assert!(legal_at(game, idx0[g] as usize, 0), "g{g} p0 move at step {steps}");
+            assert!(legal_at(game, idx1[g] as usize, 1), "g{g} p1 move at step {steps}");
         }
 
         refg.apply(&idx0, &idx1);
         for (g, game) in games.iter_mut().enumerate() {
             if !game.finished {
-                game.apply(idx0[g] as usize, idx1[g] as usize, &mut scratch);
+                game.action_step(idx0[g] as usize, idx1[g] as usize, &mut scratch);
             }
         }
 
@@ -414,7 +452,7 @@ fn the_weighted_sampler_picks_the_same_moves_as_the_oracle_sampler() {
 /// board and the same score. This one covers its *surface*: for each public call, on each of
 /// a rollout's states, does the engine hand back what the oracle says it should.
 ///
-/// `legal_bits` is the one call returning a different representation rather than different
+/// `legal_moves` is the one call returning a different representation rather than different
 /// data: it packs into 80 bits what the oracle spreads over 160 floats. So it is checked for
 /// logical equivalence against the board itself, and the oracle's dense masks are separately
 /// checked to be exactly that set intersected with the first-move half rule.
@@ -444,25 +482,25 @@ fn every_public_call_agrees_with_the_oracle() {
         for (g, game) in games.iter().enumerate() {
             assert_eq!(game.move_count as i32, refg.move_counts[g], "move_count g{g}");
             assert_eq!(game.finished, refg.finished[g], "finished g{g}");
-            assert_eq!(game.margin(), game.scores[0] - game.scores[1], "margin g{g}");
 
-            // legal_bits / legal_moves / legal_count / is_legal, cell by cell, against the
-            // board and against the oracle's masks
-            let bits = game.legal_bits();
+            // legal_moves and legal_count, cell by cell, against the board and against the
+            // oracle's masks
+            let (a, b) = (game.legal_moves(0), game.legal_moves(1));
+            let bits = [a[0] | b[0], a[1] | b[1]];
             let first = refg.move_counts[g] == 0;
             let (mut n0, mut n1) = (0.0f32, 0.0f32);
             for i in 0..HW {
                 let k = i >> 1;
                 let set = i % 2 == (i / WIDTH) % 2 && bits[k >> 6] >> (k & 63) & 1 == 1;
                 let playable = refg.boards[g * HW + i] == PLAYABLE_SQUARE;
-                assert_eq!(set, playable, "legal_bits g{g} cell {i} at step {steps}");
+                assert_eq!(set, playable, "legal_moves g{g} cell {i} at step {steps}");
                 let c = i % WIDTH;
                 let want_0 = playable && !(first && c >= half);
                 let want_1 = playable && !(first && c < half);
                 assert_eq!(want0[g * HW + i] == 1.0, want_0, "mask0 g{g} cell {i}");
                 assert_eq!(want1[g * HW + i] == 1.0, want_1, "mask1 g{g} cell {i}");
-                assert_eq!(game.is_legal(i, 0), want_0, "is_legal g{g} p0 cell {i}");
-                assert_eq!(game.is_legal(i, 1), want_1, "is_legal g{g} p1 cell {i}");
+                assert_eq!(legal_at(game, i, 0), want_0, "legal_moves g{g} p0 cell {i}");
+                assert_eq!(legal_at(game, i, 1), want_1, "legal_moves g{g} p1 cell {i}");
                 n0 += f32::from(want_0);
                 n1 += f32::from(want_1);
             }
@@ -474,10 +512,10 @@ fn every_public_call_agrees_with_the_oracle() {
             // on the opening move
             if !game.finished {
                 for player in [0usize, 1usize] {
-                    let a = game.random_move(player, &mut draw_rng);
+                    let a = uniform_move(game, player, &mut draw_rng);
                     let b = game.sample_move(&uniform, player, &mut draw_rng);
-                    assert!(game.is_legal(a, player), "random_move g{g} p{player} illegal");
-                    assert!(game.is_legal(b, player), "sample_move g{g} p{player} illegal");
+                    assert!(legal_at(game, a, player), "uniform pick g{g} p{player} illegal");
+                    assert!(legal_at(game, b, player), "sample_move g{g} p{player} illegal");
                 }
             }
         }
@@ -527,8 +565,8 @@ fn a_fork_is_independent_of_the_game_it_came_from() {
     let mut parents: Vec<Game> = (0..n).map(|_| Game::new()).collect();
     for _ in 0..12 {
         for game in parents.iter_mut() {
-            let (i0, i1) = (game.random_move(0, &mut rng), game.random_move(1, &mut rng));
-            game.apply(i0, i1, &mut scratch);
+            let (i0, i1) = (uniform_move(game, 0, &mut rng), uniform_move(game, 1, &mut rng));
+            game.action_step(i0, i1, &mut scratch);
         }
     }
 
@@ -549,8 +587,8 @@ fn a_fork_is_independent_of_the_game_it_came_from() {
                 if game.finished {
                     continue;
                 }
-                let (i0, i1) = (game.random_move(0, &mut rng), game.random_move(1, &mut rng));
-                game.apply(i0, i1, &mut scratch);
+                let (i0, i1) = (uniform_move(game, 0, &mut rng), uniform_move(game, 1, &mut rng));
+                game.action_step(i0, i1, &mut scratch);
             }
         }
         check_levels_and_scores(&parents, &format!("parent, step {steps}"));
@@ -563,7 +601,7 @@ fn a_fork_is_independent_of_the_game_it_came_from() {
     assert!(steps > 10, "the games finished suspiciously fast");
 
     // they were played apart, so they must have ended apart — otherwise this test would pass
-    // just as happily if `apply` did nothing
+    // just as happily if `action_step` did nothing
     assert!(
         (0..n).any(|g| parents[g].cells != forks[g].cells),
         "a parent and its fork played independently ended up identical"
@@ -613,8 +651,8 @@ fn no_real_level_ever_comes_close_to_the_cap() {
     for _ in 0..n {
         let mut game = Game::new();
         while !game.finished {
-            let (i0, i1) = (game.random_move(0, &mut rng), game.random_move(1, &mut rng));
-            game.apply(i0, i1, &mut scratch);
+            let (i0, i1) = (uniform_move(&game, 0, &mut rng), uniform_move(&game, 1, &mut rng));
+            game.action_step(i0, i1, &mut scratch);
             for &l in &game.levels {
                 if l != INF && l > highest {
                     highest = l;
