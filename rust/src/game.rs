@@ -1,54 +1,19 @@
-//! The game: one board, scored incrementally.
+//! The alpha-lines game: one board, scored incrementally.
 //!
-//! [`Game`] is the whole public surface — a position, the moves that are legal in it, and
-//! the two ways to pick one. Everything above it in this file is the scorer it is built on.
+//! Every cell carries a *level*: the number of steps to the nearest border cell, walking
+//! only over that player's own marks. A border mark is level 0, any other mark is
+//! `1 + min(own-player diagonal neighbours)`, and [`INF`] means no route to the border.
 //!
-//! The reference implementation this replaced (`game_kernels::score_player`) rescores a
-//! board from scratch after every move: a flood fill from the border plus two full diagonal
-//! scans. This module maintains the same score incrementally instead, so a move usually
-//! costs a handful of neighbour lookups rather than an O(H*W) rescan.
+//! A run only scores if it can reach the border, and reachability is exactly
+//! `level != INF`. So the score moves only when a cell crosses between INF and finite;
+//! level changes that stay finite are bookkeeping. Levels rather than a reachable bit
+//! because a bit cannot survive a deletion in the middle of a line anchored at both ends.
 //!
-//! # What is stored
+//! Only `(r + c)` even squares are playable, so a mark's only neighbours are its four
+//! diagonals — that is what [`DIAG`] encodes.
 //!
-//! Per cell, alongside the board value, a **level**: the number of steps to the nearest
-//! border cell, walking only over that player's own marks.
-//!
-//! * a mark on the border has level 0
-//! * any other mark has level `1 + min(level of its own-player diagonal neighbours)`
-//! * a mark with no route to the border has level [`INF`]
-//!
-//! Only playable squares (`(r + c)` even) can hold marks, and orthogonal neighbours always
-//! have the opposite parity, so the reference's 8-connected flood fill is exactly
-//! 4-connectivity over the diagonals. That is what [`DIAG`] encodes.
-//!
-//! # Why levels rather than "reachable" bits
-//!
-//! A single reachable bit cannot survive deletion: a line anchored to the border at both
-//! ends, cut in the middle, leaves every surviving cell still reachable, but a bit gives no
-//! way to know that without re-running the flood fill. Storing *which neighbour I depend
-//! on* does not work either — recording alternate routes puts cycles in the dependency
-//! graph, and a cycle is a set of cells that mutually justify each other with nothing
-//! underneath.
-//!
-//! Levels fix this because the provider relation is **derived, not stored**: neighbour `n`
-//! is a valid provider for `x` exactly when `level[n] < level[x]`. Strict inequality makes
-//! cycles impossible by construction — every mark is held up by something strictly closer
-//! to the border, and the chain has to bottom out at the border.
-//!
-//! # The invariant everything rests on
-//!
-//! `level[x] != INF` if and only if `x` has a path to the border. It is uniform across a
-//! connected component, and therefore uniform along any diagonal run (consecutive run cells
-//! are diagonal neighbours). **The score only moves when a cell crosses between INF and
-//! finite.** Level changes that stay finite are pure bookkeeping — they cost work and
-//! change no score. That is the price of never running a global flood fill.
-//!
-//! The tests re-derive all of it from scratch after every move and compare.
-
-// This module has no dependencies on the rest of the crate: the board shape, the square
-// encoding and the RNG are all defined here, so the file can be lifted out whole. They are
-// duplicated in the reference port under `tests/`; the tests assert the two definitions
-// still agree, so they cannot drift apart while both exist.
+//! [`Game`] is the public surface. Everything above it is the scorer it sits on. The module
+//! has no dependencies on the rest of the crate and can be lifted out as a single file.
 
 /// Board shape. Every square with `(r + c)` even is playable — 80 of the 160.
 pub const HEIGHT: usize = 10;
@@ -67,19 +32,8 @@ pub const PLAYER_1_MARK: i8 = 4;
 /// "No route to the border." Also acts as the saturating top of the level range.
 pub const INF: u8 = 255;
 
-/// The largest level a real path can have.
-///
-/// A level counts steps through *one player's* marks, and a shortest path visits each cell
-/// at most once, so the bound is that player's mark count. Half the board is playable — 80
-/// squares — and every non-colliding move gives both players exactly one mark, so neither
-/// can ever hold more than half of those. Collisions only take marks away. So a player has
-/// at most `HW / 4` = 40 marks and no real level can exceed 39.
-///
-/// Nothing legitimate is ever capped by this; it is a bound, not a mechanism. It used to be
-/// load-bearing, back when a removal repaired levels by walking them upward and a severed
-/// cycle would climb in lockstep until something stopped it. The slow-removal path now
-/// rebuilds its component with a BFS, which assigns true distances and terminates on its
-/// own, so the cap only guards against a level running away somewhere it cannot.
+/// The largest level a real path can have: a player holds at most `HW / 4` marks and a
+/// shortest path visits each once. A bound, not a mechanism — nothing legitimate hits it.
 pub const MAX_LEVEL: u8 = (HW / 4) as u8;
 
 const _: () = assert!(
@@ -89,11 +43,6 @@ const _: () = assert!(
 
 // ---------------------------------------------------------------------------------- rng
 
-/// Seedable PRNG for the sampler, standing in for numba's hidden `np.random` state.
-///
-/// numba's per-thread Mersenne Twister cannot be reproduced bit-for-bit, so the port keeps
-/// the *structure* of the draws identical — same count, same order, same places — and swaps
-/// the bit source. Nothing the cross-check against Python compares depends on these draws.
 /// xoshiro256++, seeded through SplitMix64.
 #[derive(Clone, Debug)]
 pub struct Rng {
@@ -156,8 +105,7 @@ impl Rng {
 
 // -------------------------------------------------------------------------------- geometry
 
-/// The four diagonal neighbours. On this board these are the *only* neighbours a mark can
-/// have, since orthogonal neighbours are always non-playable parity.
+/// The four diagonal neighbours: the only neighbours a mark can have.
 const DIAG: [(i64, i64); 4] = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
 
 /// The two diagonal families that score, as forward steps.
@@ -201,18 +149,12 @@ fn player_index(p: i8) -> usize {
 
 // ---------------------------------------------------------------------------- scratch
 
-/// Reusable working memory, so a move allocates nothing.
+/// Working memory for one move, so a move allocates nothing: a generation-stamped visited
+/// set (bump `epoch` to clear it in O(1)), a stack, a component buffer, and a bucket queue
+/// keyed by level for processing cells in increasing level order.
 ///
-/// `stamp`/`epoch` is a generation-stamped visited set: bumping `epoch` "clears" it in O(1)
-/// instead of rewriting 160 bytes.
-///
-/// `buckets` is a monotone bucket queue keyed by level, sized to the level range rather
-/// than to `INF`, since nothing finite is ever queued above `MAX_LEVEL`. That also bounds
-/// how far `pop` can advance the cursor looking for the next non-empty bucket.
-/// It is how the outward relaxation gets
-/// "process in increasing level order" cheaply. `cursor` only ever moves forward, which is
-/// sound because neither pass ever needs to enqueue *below* the level it is currently
-/// working on.
+/// The caller owns this and lends it to every call that needs it, which is what keeps a
+/// [`Game`] plain data and a fork a memcpy. Create one per thread and pass it around.
 pub struct Scratch {
     stamp: Vec<u32>,
     epoch: u32,
@@ -293,10 +235,8 @@ impl Scratch {
 
 // ------------------------------------------------------------------- level maintenance
 
-/// What `i`'s level *should* be, read straight off the invariant.
-///
-/// `i` itself is not consulted, so this is equally valid for a cell that is about to become
-/// a mark and for one that already is.
+/// What `i`'s level should be. `i` itself is not consulted, so this is equally valid for a
+/// cell about to become a mark and for one that already is.
 fn computed_level(cells: &[i8], level: &[u8], i: usize, p: i8) -> u8 {
     if on_border(i) {
         return 0;
@@ -319,10 +259,7 @@ fn computed_level(cells: &[i8], level: &[u8], i: usize, p: i8) -> u8 {
     }
 }
 
-/// Push improvements outward after an insertion: levels only ever *fall* here.
-///
-/// Cells that go from INF to finite are exactly the blob being revived; the caller detects
-/// that case up front and takes the slow scoring path.
+/// Push improvements outward after an insertion; levels only ever fall here.
 fn relax_down(cells: &[i8], level: &mut [u8], seed: usize, p: i8, s: &mut Scratch) {
     s.queue_reset();
     s.push(seed, level[seed]);
@@ -345,28 +282,12 @@ fn relax_down(cells: &[i8], level: &mut [u8], seed: usize, p: i8, s: &mut Scratc
     }
 }
 
-/// Re-derive the levels of one whole component from scratch, instead of walking them up.
+/// Re-derive one whole component's levels: blank it, seed from its border cells, BFS.
 ///
-/// The whole of the slow-removal path's level repair. `comp` must be the component
-/// the deleted cell belonged to, collected *before* the deletion — which the slow path
-/// already has in hand, because it needs it to score the component anyway.
-///
-/// Two facts make this a complete answer rather than a local patch:
-///
-/// * Every level that can change is inside `comp`. A level only changes if its route ran
-///   through the deleted cell, and every such route lies inside the component.
-/// * Nothing outside `comp` can rescue anything inside it. A mark diagonally adjacent to a
-///   mark of the same player is *by definition* in the same component, so `comp` has no
-///   neighbouring marks at all. The BFS therefore cannot leak out, and no external ground
-///   exists that we would be failing to consider.
-///
-/// So: blank the component, seed from whichever of its cells sit on the border, and let a
-/// plain shortest-path BFS fill the rest. Cost is O(|comp|), bounded by the 80 playable
-/// squares, and completely independent of how tangled the levels were before.
-///
-/// The cap that [`computed_level`] and [`relax_down`] carry is not needed here and never
-/// fires: a shortest path visits distinct cells, so no real distance can reach `MAX_LEVEL`
-/// in the first place. Anything left at `INF` is genuinely unreachable.
+/// `comp` must be the component the deleted cell belonged to, collected *before* the
+/// deletion. Every level that can change is inside it, and nothing outside can rescue
+/// anything inside it — a same-player diagonal neighbour would be in the component by
+/// definition — so this is complete, not a local patch. O(|comp|).
 fn rebuild_component_levels(cells: &[i8], level: &mut [u8], comp: &[u16], p: i8, s: &mut Scratch) {
     let mut q = std::mem::take(&mut s.queue);
     q.clear();
@@ -383,8 +304,8 @@ fn rebuild_component_levels(cells: &[i8], level: &mut [u8], comp: &[u16], p: i8,
             level[i] = INF;
         }
     }
-    // seeding is a second pass on purpose: the first pass is still blanking cells that a
-    // border cell found early would otherwise have been compared against
+    // seeding is a second pass: the first is still blanking cells a border cell found
+    // early would have been compared against
     for &ci in comp {
         let i = ci as usize;
         if cells[i] == p && level[i] == 0 {
@@ -392,9 +313,8 @@ fn rebuild_component_levels(cells: &[i8], level: &mut [u8], comp: &[u16], p: i8,
         }
     }
 
-    // A plain FIFO is enough — every step costs exactly one, so cells come off the queue in
-    // nondecreasing level order for free. That is also why no cell is ever queued twice:
-    // by the time it is reached, the level it gets is already the smallest available.
+    // a plain FIFO suffices: every step costs one, so cells come off in nondecreasing
+    // level order, and no cell is ever queued twice
     let mut head = 0;
     while head < q.len() {
         let x = q[head] as usize;
@@ -412,8 +332,8 @@ fn rebuild_component_levels(cells: &[i8], level: &mut [u8], comp: &[u16], p: i8,
     s.queue = q;
 }
 
-/// Rebuild every level from scratch. Used at construction, after an import, and as the
-/// ground truth the incremental passes are checked against. This is the only global BFS.
+/// Rebuild every level from scratch. The only global BFS; used when adopting a board, and
+/// by the tests as ground truth.
 pub fn rebuild_levels(cells: &[i8], level: &mut [u8], s: &mut Scratch) {
     level.iter_mut().for_each(|l| *l = INF);
     for p in [PLAYER_0_MARK, PLAYER_1_MARK] {
@@ -443,10 +363,8 @@ pub fn rebuild_levels(cells: &[i8], level: &mut [u8], s: &mut Scratch) {
 
 // ------------------------------------------------------------------------- component walk
 
-/// Collect every cell reachable from `seed` through diagonal steps on `p`'s marks.
-///
-/// Appends to `out` and honours the current walk epoch, so several seeds can be unioned
-/// into one buffer without double-counting.
+/// Collect every cell reachable from `seed` through `p`'s marks. Appends to `out` and
+/// honours the current walk epoch, so several seeds union into one buffer cleanly.
 fn walk_component(cells: &[i8], seed: usize, p: i8, s: &mut Scratch, out: &mut Vec<u16>) {
     if cells[seed] != p || !s.visit(seed) {
         return;
@@ -468,19 +386,8 @@ fn walk_component(cells: &[i8], seed: usize, p: i8, s: &mut Scratch, out: &mut V
 
 // ------------------------------------------------------------------------------ scoring
 
-/// Total score generated by the given cells.
-///
-/// `cells_of_interest` must be a union of *whole* components. That matters: a run never
-/// leaves its component (consecutive run cells are diagonal neighbours), so every run is
-/// either wholly inside the set or wholly outside it, never half — which is what makes it
-/// valid to score the set in isolation.
-///
-/// Each run is measured exactly once, from its first cell: a cell whose backward neighbour
-/// along that diagonal is also a mark is not a run start and is skipped. Runs shorter than
-/// 2 score nothing; a qualifying run scores its full length, but only if it is reachable.
-/// Reachability is uniform along a run, so testing the start cell is enough. A cell that is
-/// in a qualifying run of *both* families is counted twice — that is intended, and matches
-/// the reference.
+/// Total score generated by the given cells. `cells_of_interest` must be a union of *whole*
+/// components, since a run never leaves its component and so is never split by the set.
 fn contribution(cells: &[i8], level: &[u8], cells_of_interest: &[u16], p: i8) -> i32 {
     cells_of_interest
         .iter()
@@ -488,17 +395,15 @@ fn contribution(cells: &[i8], level: &[u8], cells_of_interest: &[u16], p: i8) ->
         .sum()
 }
 
-/// The same scorer applied to every square, which is the whole board's score for `p`.
-///
-/// Only used when adopting a board the engine did not build itself; the running score is
-/// maintained incrementally everywhere else.
+/// The whole board's score for `p`. Only for adopting a board; otherwise the score is
+/// maintained incrementally.
 fn score_board(cells: &[i8], level: &[u8], p: i8) -> i32 {
     (0..HW).map(|i| runs_starting_at(cells, level, i, p)).sum()
 }
 
 /// Score of the runs that *begin* at `i`, in either family. Zero if `i` holds no mark of
-/// `p`, if the run continues backwards through `i` (so some earlier cell owns it), if the
-/// run is shorter than 2, or if it cannot reach the border.
+/// `p`, if an earlier cell owns the run, if the run is shorter than 2, or if it is
+/// unreachable. A cell in a qualifying run of both families counts twice, as intended.
 fn runs_starting_at(cells: &[i8], level: &[u8], i: usize, p: i8) -> i32 {
     if cells[i] != p {
         return 0; // empty, removed, the other player's, or a cell dropped since collection
@@ -535,14 +440,9 @@ fn run_side(cells: &[i8], i: usize, v: (i64, i64), p: i8) -> i32 {
     }
 }
 
-/// The score change from filling (or emptying) the single square `i`, given that
-/// reachability does not change.
-///
-/// A run of length L scores L if L >= 2, else 0. Filling the gap between runs of length
-/// `la` and `lb` therefore gains `(la + 1 + lb) - [la if la>=2] - [lb if lb>=2]`, which
-/// collapses to `1 + (la == 1) + (lb == 1)` — one point for extending a run at all, plus
-/// one more for each side that was a lone mark, since a lone mark scored nothing before.
-/// Both sides empty means a run of length 1, which scores nothing.
+/// The score change from filling or emptying the single square `i`, given that reachability
+/// does not change. A run of length L scores L if L >= 2, so joining runs of length `la` and
+/// `lb` gains `1 + (la == 1) + (lb == 1)`.
 #[inline]
 fn local_delta(cells: &[i8], i: usize, p: i8) -> i32 {
     let mut d = 0;
@@ -579,9 +479,7 @@ fn insert(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, p: i8
         .any(|n| cells[n] == p && level[n] == INF);
 
     if !attaches_dead {
-        // Fast path, and the common one: a mark dropped into live territory. Reachability
-        // is unchanged everywhere, so the whole score change is local to the two runs
-        // through this square.
+        // fast path: dropped into live territory, so the score change is local
         cells[i] = p;
         level[i] = lvl;
         relax_down(cells, level, i, p, s);
@@ -589,9 +487,8 @@ fn insert(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, p: i8
         return;
     }
 
-    // Slow path: this mark revives a dead blob, so a whole region flips from scoring
-    // nothing to scoring everything. There is no local shortcut — measure before, measure
-    // after, apply the difference.
+    // slow path: this revives a dead blob, so measure before, measure after, apply the
+    // difference
     let mut comp = std::mem::take(&mut s.comp);
     comp.clear();
     s.begin_walk();
@@ -636,8 +533,7 @@ fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s: &m
         return;
     }
 
-    // Only a neighbour sitting exactly one level above could have been routing through
-    // this cell. If there are none, no level anywhere changes and nothing is cut off.
+    // only a neighbour one level above could have been routing through this cell
     let here = level[i];
     let mut deps = std::mem::take(&mut s.deps);
     deps.clear();
@@ -650,8 +546,7 @@ fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s: &m
     }
 
     if deps.is_empty() {
-        // Fast path: same local calculation as insertion, negated. The flanking runs keep
-        // their levels, so they stay reachable and their contributions still count.
+        // fast path: the insertion calculation, negated
         cells[i] = REMOVED_SQUARE;
         level[i] = INF;
         score[player_index(p)] -= local_delta(cells, i, p);
@@ -670,9 +565,7 @@ fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s: &m
     level[i] = INF;
     rebuild_component_levels(cells, level, &comp, p, s);
 
-    // `comp` may now be several disconnected pieces, some alive, some INF. `contribution`
-    // handles that on its own: a piece on INF simply contributes nothing, and the removed
-    // cell is skipped because it no longer holds a mark.
+    // `comp` may now be several pieces, some INF; `contribution` handles that
     let new = contribution(cells, level, &comp, p);
 
     s.comp = comp;
@@ -680,13 +573,9 @@ fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s: &m
     score[player_index(p)] += new - old;
 }
 
-/// Apply one move for one game, mirroring the reference's `apply_and_score_kernel`.
-///
-/// A collision (both players choosing the same square) clears that square and its four
-/// diagonal neighbours. Those five are handled as independent single-cell removals: the
-/// four neighbours are mutually non-adjacent, and the two sharing a diagonal have the empty
-/// centre between them, so they lie in different runs and the order cannot matter. Each
-/// victim is handled under whichever player happens to own it.
+/// Apply one move. A collision — both players on the same square — clears that square and
+/// its four diagonal neighbours, as five independent single-cell removals; they lie in
+/// different runs, so the order cannot matter.
 #[allow(clippy::too_many_arguments)]
 fn apply_move(
     cells: &mut [i8],
@@ -715,61 +604,44 @@ fn apply_move(
     }
 }
 
-// -------------------------------------------------------------------------- validation
-
 // ------------------------------------------------------------------- legality bitboard
 
-/// Which squares are still playable, as a bitboard: two `u64` per game.
+/// `u64`s in a legality mask. The 80 playable squares pack into 80 bits: `i / 2` maps them
+/// onto `0..80` densely and in row-major order, since row `r`'s playable columns are
+/// `2j + (r & 1)`, so `i / 2 == r * 8 + j`. Order matters — the sampler's cumulative scan
+/// walks bits low to high, which is board order.
 ///
-/// Only the 80 squares with `(r + c)` even are ever playable, and `i / 2` maps exactly those
-/// onto `0..80` densely *and in row-major order* — row `r`'s playable columns are
-/// `2j + (r & 1)`, so `i / 2 == r * 8 + j`. The whole legal set of a game is therefore 80
-/// bits, 16 bytes, against the 1280 bytes a pair of f32 masks needs. A 2048-game batch's
-/// legality is 32 KB and lives in L2; the mask form is 2.6 MB and does not.
-///
-/// Row-major order is not incidental: the sampler's cumulative scan picks the first square
-/// whose running total crosses the threshold, so traversal order is part of the result.
-/// Walking bits low to high reproduces the reference kernel's scan exactly.
-///
-/// The set only ever shrinks and every internal board change goes through a move, so this is
-/// maintained rather than recomputed: one bit cleared per square a move consumes.
+/// This is a count of words, not a width; the words are `u64` at every use site.
 pub const LEGAL_WORDS: usize = 2;
 
 const _: () = assert!(HW / 2 == 80, "the legality bitboard assumes 80 playable squares");
+const _: () = assert!(LEGAL_WORDS * 64 >= HW / 2, "the mask cannot hold every playable square");
 
 /// The 80 valid bits — the opening position.
 const LEGAL_ALL: [u64; LEGAL_WORDS] = [!0u64, 0xFFFF];
 
-/// The opening-move half-board rule, precomputed. `c < half_width` is `2j + (r & 1) < 8`,
-/// which is `j < 4` for both row parities — so the rule is the low nibble of every byte and
-/// applying it is one `AND`, not a column test per square.
+/// The opening-move half-board rule, precomputed: `c < 8` is `j < 4` for both row parities,
+/// so the rule is the low nibble of every byte and applying it is one `AND`.
 const LEGAL_LEFT: [u64; LEGAL_WORDS] = [0x0F0F_0F0F_0F0F_0F0F, 0x0F0F];
 const LEGAL_RIGHT: [u64; LEGAL_WORDS] = [0xF0F0_F0F0_F0F0_F0F0, 0xF0F0];
 
 /// Word and bit for a board index. A non-playable index aliases onto its even neighbour,
-/// which is harmless because its bit is never set in the first place.
+/// harmless because that bit is never set.
 #[inline]
 fn legal_bit(i: usize) -> (usize, u64) {
     let k = i >> 1;
     (k >> 6, 1u64 << (k & 63))
 }
 
-/// The board index a bit position stands for; the inverse of `i >> 1` over playable cells.
-///
-/// Public because it is the decoder for [`Game::legal_moves`]: the mask is 80 bit positions,
-/// and without this it says nothing about which squares they are. Walking a mask is
+/// The board index a bit position stands for — the decoder for [`Game::legal_moves`], which
+/// is otherwise 80 opaque bit positions. Walk a mask with
 /// `while w != 0 { let cell = legal_cell(base + w.trailing_zeros() as usize); w &= w - 1; }`.
-///
-/// It reduces to two instructions. Position `k` is `r * 8 + j`, and the cell it names is
-/// `r * 16 + 2j + (r & 1)` — and `r * 16 + 2j` is exactly `2k`, so all that is left is the
-/// row's parity, which is bit 3 of `k`.
 #[inline]
 pub fn legal_cell(k: usize) -> usize {
     (k << 1) | ((k >> 3) & 1)
 }
 
-/// Mark a square as no longer playable. Called for every square a move writes, whether it
-/// took a mark or was blasted away, which is exactly the set that stops being playable.
+/// Mark a square as no longer playable: every square a move writes, marked or blasted.
 #[inline]
 fn clear_legal(legal: &mut [u64], i: usize) {
     let (w, b) = legal_bit(i);
@@ -779,7 +651,7 @@ fn clear_legal(legal: &mut [u64], i: usize) {
 
 // ------------------------------------------------------------------------- single game
 
-/// The opening position, laid out once at compile time so `Game::new` is a memcpy.
+/// The opening position, laid out at compile time so `Game::new` is a memcpy.
 const OPENING: [i8; HW] = {
     let mut a = [NON_PLAYABLE_SQUARE; HW];
     let mut r = 0;
@@ -796,18 +668,12 @@ const OPENING: [i8; HW] = {
     a
 };
 
-/// One game, as a plain value.
+/// One game: ~350 bytes of fixed-size arrays, no indirection, no allocation. Clone it into
+/// a tree node, play it forward, throw it away.
 ///
-/// Every field is a fixed-size array, so a position is ~350 bytes with no indirection and no
-/// allocation: clone it into a tree node, play it forward, throw it away. The [`Scratch`] is
-/// deliberately *not* part of it — that is working memory, not state, and a search holding
-/// thousands of positions wants one workspace, not thousands, so it is lent to every call
-/// that needs it.
-///
-/// The board also carries the derived state the scorer needs, which is what makes a fork a
-/// memcpy rather than a rebuild: `levels` and the running `scores` come across with the
-/// cells, so a clone costs nothing beyond the copy while [`Self::from_cells`] — adopting a
-/// bare board — has to pay for a global BFS and a full rescore.
+/// It carries the scorer's derived state — `levels` and the running `scores` — which is why
+/// a clone is a memcpy while [`Self::from_cells`] has to pay for a BFS and a full rescore.
+/// The [`Scratch`] is not part of it; pass one in.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Game {
     /// The board, row-major, in the encoding at the top of this file.
@@ -816,7 +682,7 @@ pub struct Game {
     pub levels: [u8; HW],
     /// Running score, integer because every score is a sum of run lengths.
     pub scores: [i32; 2],
-    /// Only ever compared against zero, to apply the opening-move half-board rule.
+    /// Only ever compared against zero, for the opening-move half-board rule.
     pub move_count: u32,
     pub finished: bool,
     legal: [u64; LEGAL_WORDS],
@@ -841,15 +707,12 @@ impl Game {
         }
     }
 
-    /// Adopt an arbitrary board. The board *is* the state: levels come from the one global
-    /// BFS, scores from a full rescan, legality from a scan for playable squares.
+    /// Adopt an arbitrary board: levels from the global BFS, scores from a full rescan,
+    /// legality from a scan for playable squares.
     ///
-    /// The two flags are derived rather than supplied. A game is finished exactly when no
-    /// playable square is left, and it is on its opening move exactly when nothing has been
-    /// played — no marks and no blasted squares. So `move_count` comes back as 0 or 1 and
-    /// not as the number of moves that actually made this board, which the board does not
-    /// record; the half-board rule only ever asks which of the two it is. This is the same
-    /// rule the Python applies when it imports a printed board.
+    /// `move_count` comes back as 0 or 1, not the real count — the board records whether a
+    /// move was made, not how many, and the half-board rule only asks which. Same rule the
+    /// Python applies when importing a printed board.
     pub fn from_cells(cells: [i8; HW], s: &mut Scratch) -> Self {
         let mut g = Game {
             cells,
@@ -885,14 +748,9 @@ impl Game {
         self.legal[0] == 0 && self.legal[1] == 0
     }
 
-    /// The squares `player` may play right now, as a bitboard: two words, 80 bits, one per
-    /// playable square, decoded by [`legal_cell`].
-    ///
-    /// This is the playable set narrowed to this player's half on the opening move, which
-    /// costs one `AND` per word — see [`LEGAL_LEFT`]. There is no separate accessor for the
-    /// un-narrowed set, because a caller cannot legally use one: on the opening move the
-    /// halves are the rule, and after it both players see the same set, so `legal_moves(0)`
-    /// and `legal_moves(1)` are the same two words.
+    /// The squares `player` may play, as a mask: 80 bits, decoded by [`legal_cell`]. On the
+    /// opening move this is narrowed to the player's half; after it, both players see the
+    /// same two words, so `legal_moves(0) | legal_moves(1)` is the playable set.
     #[inline]
     pub fn legal_moves(&self, player: usize) -> [u64; LEGAL_WORDS] {
         let half = if self.move_count != 0 {
@@ -905,14 +763,14 @@ impl Game {
         [self.legal[0] & half[0], self.legal[1] & half[1]]
     }
 
-    /// How many moves `player` has. `popcount`, not a board scan.
+    /// How many moves `player` has: two `popcount`s, not a board scan.
     #[inline]
     pub fn legal_count(&self, player: usize) -> u32 {
         let w = self.legal_moves(player);
         w[0].count_ones() + w[1].count_ones()
     }
 
-    /// The board index of the `k`th set bit of `w`, counting from the low end.
+    /// The board index of the `k`th set bit of `w`, from the low end.
     #[inline]
     fn select(w: [u64; LEGAL_WORDS], mut k: u32) -> usize {
         for (wi, &word) in w.iter().enumerate() {
@@ -929,9 +787,7 @@ impl Game {
         unreachable!("select past the end of the legal set")
     }
 
-    /// A uniform draw over a mask. Only the degenerate branch of [`Self::sample_move`] needs
-    /// it: picking moves uniformly is a driver's business, not the engine's, and a driver
-    /// that wants it already has the mask and can `popcount`, draw and select over it.
+    /// A uniform draw over a mask, for the degenerate all-zero-distribution case.
     #[inline]
     fn uniform(w: [u64; LEGAL_WORDS], rng: &mut Rng) -> usize {
         let count = w[0].count_ones() + w[1].count_ones();
@@ -939,19 +795,9 @@ impl Game {
         Self::select(w, rng.randint(count as u64) as u32)
     }
 
-    /// Sample a legal move for `player` from a weight per square, `dist[0..HW]`.
-    ///
-    /// Accumulate the weight of the legal squares, draw a threshold, then walk the set bits
-    /// again until the running sum crosses it. Weights need not be normalized. Set bits are
-    /// walked low to high, which is board order, so this consumes the same draw and makes the
-    /// same choice as the numba `sample_move_kernel` scanning all 160 squares against a
-    /// materialized mask — the tests hold it to that.
-    ///
-    /// One deliberate exception: an all-zero distribution falls back to a uniform draw over
-    /// the *legal* squares, where the numba version draws uniformly over the whole board and
-    /// can land on a square that is not playable at all. Nothing here has to stay
-    /// bit-compatible with that quirk, and a softmax policy never triggers it.
-    pub fn sample_move(&self, dist: &[f32], player: usize, rng: &mut Rng) -> usize {
+    /// Draw one legal move for `player`, weighting each square by `dist`. Weights need not
+    /// be normalized; an all-zero distribution falls back to a uniform draw over the mask.
+    fn sample(&self, dist: &[f32], player: usize, rng: &mut Rng) -> usize {
         debug_assert!(dist.len() >= HW, "distribution must cover the board");
         let words = self.legal_moves(player);
 
@@ -994,12 +840,11 @@ impl Game {
         chosen
     }
 
-    /// Play one move: `i0` for player 0, `i1` for player 1, as board indices.
+    /// Play the moves `i0` and `i1`, as board indices. Equal indices are a collision, which
+    /// clears that square and its four diagonal neighbours.
     ///
-    /// Equal indices are a collision, which clears that square and its four diagonal
-    /// neighbours — see [`apply_move`]. Both moves must be legal; that is checked only in
-    /// debug builds, because the caller picked them out of [`Self::legal_moves`] and paying
-    /// for a re-check on every node of a search is not worth it.
+    /// Both moves must be legal — checked in debug builds only, so pick them out of
+    /// [`Self::legal_moves`].
     #[inline]
     pub fn action_step(&mut self, i0: usize, i1: usize, s: &mut Scratch) {
         debug_assert!(!self.finished, "move played on a finished game");
@@ -1018,8 +863,24 @@ impl Game {
         self.finished = self.no_moves_left();
     }
 
-    /// Does `player`'s mask hold the bit for board index `i`? For the debug assertions in
-    /// [`Self::action_step`] — a caller wanting this reads its own mask.
+    /// Play one move drawn from a weight per square for each player, `dist_0[0..HW]` and
+    /// `dist_1[0..HW]`. The other way in besides [`Self::action_step`]; they differ only in
+    /// where the moves come from.
+    pub fn distribution_step(
+        &mut self,
+        dist_0: &[f32],
+        dist_1: &[f32],
+        rng: &mut Rng,
+        s: &mut Scratch,
+    ) {
+        debug_assert!(!self.finished, "move played on a finished game");
+        let i0 = self.sample(dist_0, 0, rng);
+        let i1 = self.sample(dist_1, 1, rng);
+        self.action_step(i0, i1, s);
+    }
+
+    /// Does `player`'s mask hold the bit for `i`? For the debug assertions only; a caller
+    /// wanting this reads its own mask.
     #[inline]
     fn holds_bit(&self, i: usize, player: usize) -> bool {
         if i >= HW || legal_cell(i >> 1) != i {

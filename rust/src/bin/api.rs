@@ -1,13 +1,8 @@
-//! Per-call cost of every public function on the engine.
+//! Per-call cost of every public call on the engine, averaged over `--reps` invocations on
+//! mid-game positions.
 //!
-//! `bench` answers "how fast is a game"; this answers "how fast is a call", which is the
-//! question that matters to a search driving the engine one node at a time. Every row is one
-//! call, averaged over `--reps` invocations on a mid-game position — not on the opening
-//! position, where the fast paths are unrepresentative.
-//!
-//! `apply` is the exception and is timed differently, over whole rollouts divided by the
-//! moves it took, because its cost changes as the board fills and no single position is a
-//! fair sample of it. Its row is therefore the same number `bench` reports as ns/move.
+//! The two step calls are timed over whole rollouts divided by the moves it took, since
+//! their cost changes as the board fills and no single position is a fair sample.
 //!
 //! Usage: api [--reps R] [--positions P] [--warmup-moves M] [--seed S]
 
@@ -17,13 +12,7 @@ use std::time::Instant;
 use alpha_lines_game::game::{legal_cell, Rng, Scratch, HEIGHT, HW, WIDTH};
 use alpha_lines_game::Game;
 
-/// A uniformly random legal move for `player`, out of the mask the engine hands over.
-///
-/// The engine deliberately does not offer this — picking moves uniformly is a driver's
-/// business, and the real one will be sampling a policy. It is three operations on the two
-/// mask words: `popcount` for how many moves there are, one bounded draw for which, and a
-/// select for where. `x &= x - 1` clears the lowest set bit, so doing it `k` times leaves the
-/// k-th one at the bottom for `trailing_zeros` to read off.
+/// A uniformly random legal move for `player`, out of the engine's mask.
 fn uniform_move(g: &Game, player: usize, rng: &mut Rng) -> usize {
     let w = g.legal_moves(player);
     let count = w[0].count_ones() + w[1].count_ones();
@@ -69,11 +58,8 @@ impl Table {
     }
 }
 
-/// A batch of independent mid-game positions to measure the pure accessors on.
-///
-/// One position would sit in L1 and every row would be a cache hit, which is not the
-/// situation a search is in. `--positions` of them, walked in order, is closer: a tree search
-/// touches a different node every time it descends.
+/// Independent mid-game positions to measure the accessors on. One would sit in L1 and every
+/// row would be a cache hit; a search touches a different node every time it descends.
 fn positions(count: usize, warmup: usize, seed: u64, s: &mut Scratch) -> Vec<Game> {
     let mut rng = Rng::new(seed);
     (0..count)
@@ -144,16 +130,7 @@ fn main() {
     }
     t.add("legal_count", s.elapsed().as_secs_f64(), calls, "how many moves a player has");
 
-    let s = Instant::now();
-    for _ in 0..reps {
-        for g in &mid {
-            black_box(g.sample_move(&dist, 0, &mut rng));
-        }
-    }
-    t.add("sample_move", s.elapsed().as_secs_f64(), calls, "weighted draw over 160 floats");
-
-    // `apply` over whole rollouts: its cost is a function of how full the board is, so the
-    // only honest average is over a game, not over one position replayed.
+    // over whole rollouts: cost depends on how full the board is
     let rollouts = reps.div_ceil(4).max(1);
     let mut moves = 0usize;
     let s = Instant::now();
@@ -167,16 +144,26 @@ fn main() {
         black_box(&g.scores);
     }
     let played = s.elapsed().as_secs_f64();
-    t.add("action_step (+ 2 picks)", played, moves, "one move, averaged over whole games");
+    t.add("action_step (+ 2 picks)", played, moves, "one move, over whole games");
+
+    let mut moves = 0usize;
+    let s = Instant::now();
+    for _ in 0..rollouts {
+        let mut g = Game::new();
+        while !g.finished {
+            g.distribution_step(&dist, &dist, &mut rng, &mut scratch);
+            moves += 1;
+        }
+        black_box(&g.scores);
+    }
+    t.add("distribution_step", s.elapsed().as_secs_f64(), moves, "one move, over whole games");
 
     t.print(format!("Game, {count} mid-game positions, {reps} reps").as_str());
 
     println!(
         "\n(board {HEIGHT} x {WIDTH}; a Game is {} bytes, so the {count} positions above are \
-         {} KB\n and do not fit in L1. Rollout: {moves} moves over {rollouts} games, \
-         {:.1} moves/game.)",
+         {} KB and do not fit in L1.)",
         std::mem::size_of::<Game>(),
         count * std::mem::size_of::<Game>() / 1024,
-        moves as f64 / rollouts as f64,
     );
 }

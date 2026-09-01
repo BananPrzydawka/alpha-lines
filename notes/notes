@@ -30,3 +30,17 @@ fable: 8% -> 13%        5%
 
 
 implement update cap on low probability with gamma
+
+
+
+
+
+each node holds a game and node stats.
+
+nodes are looked up by hashing instead of path.
+
+so we start of with n nodes. each steps untill they reach a leaf, accumulate into one model call.
+
+a node kinda needs to store a whole game becasue we need to be able to copy it to step to a new game. and we kinda need to store all games separately because otherwose how would separate nodes work?
+
+however because game steps are so simple, and because we no longer lookup by path but by state, we could build a completelly standalone hashing method that runs lightning fast and allows for moves directly.

@@ -1,33 +1,14 @@
-//! Time per game: build a [`Game`], play it to the end with random moves, repeat.
+//! Time per game: build a `Game`, play it to the end with random moves, repeat.
 //!
-//! Two samplers are timed, because the choice is worth a factor of 1.5:
+//! Two ways of choosing the move are timed. `distribution_step` scans an HW-float
+//! distribution, which is what a policy network hands you — over one distribution reused by
+//! every game (L1) and over a fresh slice per game (not L1). A uniform pick over the mask,
+//! done here in the driver, is the floor: what a move costs when choosing it is free.
 //!
-//! * **From the bitboard.** A uniform draw over the mask with no distribution at all —
-//!   `popcount`, one bounded draw, one select, done here in the driver rather than by the
-//!   engine. This is the floor: what a move costs when choosing it is free.
-//! * **Weighted.** `Game::sample_move`: a scan over an `HW`-float distribution, which is
-//!   what a policy network
-//!   hands you. Timed twice: over one distribution reused by every game, which stays in L1,
-//!   and over a fresh slice per game out of a large array, which does not. The gap between
-//!   those two rows is memory traffic, not engine work, and the cold row is the one to quote.
+//! Construction is timed separately so the column means something.
 //!
-//! Construction is measured on its own rather than folded in, so the column means something:
-//! a `Game` is built once per game here, and the number says how much of a rollout that is.
-//!
-//! This engine replaced a batched one — N boards in flat arrays, stepped in lockstep, an
-//! `active` mask saying which were still running. Measured against it on this same workload,
-//! batching flattened out at ~22.5 us/game by 64 games and got no better at 4096; one game at
-//! a time with the same weighted sampler cost the same 22.1 us, and a uniform pick over the mask beat
-//! every batch size by 1.5x. Batching was amortizing per-step allocation, not vectorizing
-//! anything — the scorer chases pointers around one board at a time no matter how many boards
-//! are in flight.
-//!
-//! Every configuration is measured several times, interleaved with the others, and the best
-//! time is kept. That is not cherry-picking: on a laptop the clock drifts by 20% over the
-//! couple of seconds a straight-through run takes, which is larger than every difference
-//! being measured here, and it lands entirely on whichever configuration ran last. Sweeping
-//! round-robin puts every configuration under the same conditions, and the minimum is the
-//! sample least polluted by whatever else the machine was doing.
+//! Configurations are measured interleaved and the best sweep is kept, because the clock
+//! drifts by ~20% over a straight-through run and that lands on whichever ran last.
 //!
 //! Usage: bench [--games N] [--positions P] [--sweeps K] [--seed S]
 
@@ -37,13 +18,9 @@ use std::time::Instant;
 use alpha_lines_game::game::{legal_cell, Rng, Scratch, HW};
 use alpha_lines_game::Game;
 
-/// A uniformly random legal move for `player`, out of the mask the engine hands over.
-///
-/// The engine deliberately does not offer this — picking moves uniformly is a driver's
-/// business, and the real one will be sampling a policy. It is three operations on the two
-/// mask words: `popcount` for how many moves there are, one bounded draw for which, and a
-/// select for where. `x &= x - 1` clears the lowest set bit, so doing it `k` times leaves the
-/// k-th one at the bottom for `trailing_zeros` to read off.
+/// A uniformly random legal move for `player`, out of the engine's mask: `popcount` for how
+/// many, one bounded draw for which, and a select for where. `x &= x - 1` clears the lowest
+/// set bit, so doing it `k` times leaves the k-th at the bottom for `trailing_zeros`.
 fn uniform_move(g: &Game, player: usize, rng: &mut Rng) -> usize {
     let w = g.legal_moves(player);
     let count = w[0].count_ones() + w[1].count_ones();
@@ -71,14 +48,14 @@ fn arg_usize(args: &[String], key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// One sweep's measurement of one configuration.
+/// One sweep of one configuration.
 #[derive(Clone, Copy)]
 struct Sample {
     games: usize,
     moves: usize,
-    /// seconds for everything: construction plus playing to the end
+    /// construction plus playing to the end
     total: f64,
-    /// seconds of that spent constructing, measured on its own
+    /// the construction part, timed on its own
     construct: f64,
 }
 
@@ -88,7 +65,7 @@ impl Sample {
     }
 }
 
-/// The best sweep seen for one configuration, plus the totals over all of them.
+/// The best sweep for one configuration, plus totals over all of them.
 struct Row {
     label: String,
     best: Sample,
@@ -139,13 +116,13 @@ fn header(title: &str) {
     );
 }
 
-/// Which sampler the rollouts use.
+/// How a rollout picks its moves.
 enum Sampler<'a> {
-    /// A uniform draw straight out of the mask: popcount, draw, select.
+    /// Uniform over the mask, in the driver.
     Bits,
-    /// The weighted scan, over `HW` weights that stay in cache across every game.
+    /// `distribution_step` over `HW` weights that stay in cache.
     Hot(&'a [f32]),
-    /// The weighted scan, over a fresh slice per game out of a large array.
+    /// `distribution_step` over a fresh slice per game out of a large array.
     Cold(&'a [f32]),
 }
 
@@ -162,17 +139,17 @@ fn rollouts(games: usize, seed: u64, sampler: Sampler) -> Sample {
     for k in 0..games {
         let mut g = Game::new();
         while !g.finished {
-            let (i0, i1) = match sampler {
-                Sampler::Bits => (uniform_move(&g, 0, &mut rng), uniform_move(&g, 1, &mut rng)),
-                Sampler::Hot(d) => {
-                    (g.sample_move(d, 0, &mut rng), g.sample_move(d, 1, &mut rng))
+            match sampler {
+                Sampler::Bits => {
+                    let (i0, i1) = (uniform_move(&g, 0, &mut rng), uniform_move(&g, 1, &mut rng));
+                    g.action_step(i0, i1, &mut scratch);
                 }
+                Sampler::Hot(d) => g.distribution_step(d, d, &mut rng, &mut scratch),
                 Sampler::Cold(d) => {
                     let s = &d[(k % slices) * HW..][..HW];
-                    (g.sample_move(s, 0, &mut rng), g.sample_move(s, 1, &mut rng))
+                    g.distribution_step(s, s, &mut rng, &mut scratch);
                 }
-            };
-            g.action_step(i0, i1, &mut scratch);
+            }
         }
         moves += g.move_count as usize;
         black_box(&g.scores);
@@ -195,17 +172,16 @@ fn main() {
     let sweeps = arg_usize(&args, "--sweeps", 5).max(1);
     let seed = arg_usize(&args, "--seed", 12345) as u64;
 
-    // Uniform: every square carries the same weight, so the weighted sampler's cumulative
-    // scan picks a legal square uniformly at random — the same games the bitboard sampler
-    // plays, reached by doing much more work, which is the point of comparing them.
+    // every square the same weight, so the weighted scan picks uniformly too — the same
+    // games as the driver-side pick, reached by doing much more work
     let dist = vec![1.0f32; positions * HW];
 
-    // get the clocks up before anything is recorded
+    // warm up the clocks
     black_box(rollouts(200, seed, Sampler::Bits).games);
 
     let mut rows: Vec<Row> = Vec::new();
     for sweep in 0..sweeps {
-        // a different seed per sweep, so no configuration is measured on one lucky run
+        // a different seed per sweep
         let s = seed + sweep as u64 * 7919;
         let measured = [
             ("uniform over the mask", rollouts(games, s, Sampler::Bits)),

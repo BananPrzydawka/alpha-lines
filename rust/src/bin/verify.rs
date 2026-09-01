@@ -1,19 +1,10 @@
-//! Cross-check driver: replays a move file produced by the Python side and dumps the
-//! engine's whole observable state, so `rust/xcheck/xcheck.py` can diff it against
-//! `main/game.py` field by field.
+//! Replays a move file from the Python side and dumps the engine's whole observable state,
+//! so `rust/xcheck/xcheck.py` can diff it against `main/game.py` field by field.
 //!
-//! Usage:
-//!   verify --moves <moves.bin> --out-dir <dir> --tag <tag>
+//! Usage: verify --moves <moves.bin> --out-dir <dir> --tag <tag>
 //!
-//! The dump is boards, scores, move counts, terminal flags and legality — everything the
-//! engine owns. The Python's encoding and rendering have no counterpart here, because the
-//! engine does not implement them; they are the caller's job.
-//!
-//! The move file is a batch — N games advanced together — because the Python it is checking
-//! against is. The engine is not: it plays one board at a time, so this holds a `Vec<Game>`
-//! and steps every entry. That is the whole of what "batched" means here now.
-//!
-//! Binary formats are little-endian throughout.
+//! The move file is a batch because the Python is; the engine is not, so this holds a
+//! `Vec<Game>` and steps every entry. Binary formats are little-endian.
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -57,9 +48,8 @@ fn read_moves(path: &PathBuf) -> Moves {
     Moves { n, n_steps, data }
 }
 
-/// Expand the engine's 80-bit legality words into the dense masks the Python produces, so
-/// the two can be compared at all. The engine has no reason to do this itself; a caller that
-/// needs a mask for a policy network builds it once, in the shape that network wants.
+/// Expand the engine's 80-bit masks into the dense ones the Python produces, so the two can
+/// be compared.
 fn dense_masks(games: &[Game]) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let n = games.len();
     let (mut m0, mut m1) = (vec![0.0f32; n * HW], vec![0.0f32; n * HW]);
@@ -82,8 +72,8 @@ fn dense_masks(games: &[Game]) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     (m0, m1, c0, c1)
 }
 
-/// Does `mask` hold the bit for board index `i`? The engine hands out bits and leaves reading
-/// them to the caller; this driver needs it to police a move file it did not produce.
+/// Does `mask` hold the bit for board index `i`? Needed to police a move file this driver
+/// did not produce.
 fn holds(mask: [u64; LEGAL_WORDS], i: i32) -> bool {
     if i < 0 || i as usize >= HW || legal_cell(i as usize >> 1) != i as usize {
         return false;
@@ -187,10 +177,7 @@ fn main() {
 
     for step in 0..moves.n_steps {
         let off = step * moves.n * 2;
-        // The engine only debug-asserts legality — the caller is expected to have picked out
-        // of `legal_moves`. Here the moves come from a file, so they are checked for real:
-        // this driver exists to catch disagreements, and a bad move file must be reported
-        // rather than replayed into undefined behaviour.
+        // the engine only debug-asserts legality, so a move file is checked for real
         for (g, game) in games.iter().enumerate() {
             if game.finished {
                 continue;
@@ -215,8 +202,7 @@ fn main() {
     }
     state.finish();
 
-    // Adopting the final boards from scratch has to land on the same state the engine
-    // reached by playing there, which is what checks `from_cells` against the Python too.
+    // adopting the final boards has to land where playing there landed
     let adopted: Vec<Game> = games
         .iter()
         .map(|g| Game::from_cells(g.cells, &mut scratch))
