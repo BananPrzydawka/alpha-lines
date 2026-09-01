@@ -43,14 +43,13 @@
 //! [`check_invariants`] asserts all of this directly; the tests run it after every move.
 
 use crate::config::{HEIGHT, WIDTH};
-// Two things are still borrowed from the reference kernels, neither of them on the rollout
-// path. `legal_masks_kernel` backs `get_legal_masks`, which MCTS needs to mask the policy
-// network; the rollout no longer calls it, and no longer uses the reference sampler at all
-// (see `sample_live`). `score_player` is used only by `check_invariants`, as an independent
-// oracle — the engine's own scorer would be no evidence about itself.
+// One thing is still borrowed from the reference kernels, and it is not on any hot path:
+// `score_player` is used only by `check_invariants`, as an independent oracle — the engine's
+// own scorer would be no evidence about itself. The mask kernel and the reference sampler
+// are both gone; see the legality bitboard below, which replaces them.
 use crate::game_kernels::{
-    legal_masks_kernel, score_player, NON_PLAYABLE_SQUARE, PLAYABLE_SQUARE, PLAYER_0_MARK,
-    PLAYER_1_MARK, REMOVED_SQUARE,
+    score_player, NON_PLAYABLE_SQUARE, PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK,
+    REMOVED_SQUARE,
 };
 use crate::rng::Rng;
 use crate::BatchedLinesGame;
@@ -775,25 +774,32 @@ pub fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s
 /// four neighbours are mutually non-adjacent, and the two sharing a diagonal have the empty
 /// centre between them, so they lie in different runs and the order cannot matter. Each
 /// victim is handled under whichever player happens to own it.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_move(
     cells: &mut [i8],
     level: &mut [u8],
     score: &mut [i32],
+    legal: &mut [u64],
     (r0, c0): (usize, usize),
     (r1, c1): (usize, usize),
     s: &mut Scratch,
 ) {
     if (r0, c0) == (r1, c1) {
         let centre = r0 * WIDTH + c0;
+        clear_legal(legal, centre);
         remove(cells, level, score, centre, s);
         for d in DIAG {
             if let Some(n) = step(centre, d) {
+                clear_legal(legal, n);
                 remove(cells, level, score, n, s);
             }
         }
     } else {
-        insert(cells, level, score, r0 * WIDTH + c0, PLAYER_0_MARK, s);
-        insert(cells, level, score, r1 * WIDTH + c1, PLAYER_1_MARK, s);
+        let (i0, i1) = (r0 * WIDTH + c0, r1 * WIDTH + c1);
+        clear_legal(legal, i0);
+        clear_legal(legal, i1);
+        insert(cells, level, score, i0, PLAYER_0_MARK, s);
+        insert(cells, level, score, i1, PLAYER_1_MARK, s);
     }
 }
 
@@ -854,30 +860,76 @@ pub fn check_invariants(cells: &[i8], level: &[u8], score: &[i32]) -> Result<(),
 // ------------------------------------------------------------------------- live squares
 
 /// The most squares a game can ever have available: only `(r + c)` even cells are playable.
-pub const MAX_LIVE: usize = HW / 2;
+// ------------------------------------------------------------------- legality bitboard
 
-/// Sample one move per active game from `dist`, restricted to squares that are still
-/// playable, plus the first-move half-board rule.
+/// Which squares are still playable, as a bitboard: two `u64` per game.
+///
+/// Only the 80 squares with `(r + c)` even are ever playable, and `i / 2` maps exactly those
+/// onto `0..80` densely *and in row-major order* — row `r`'s playable columns are
+/// `2j + (r & 1)`, so `i / 2 == r * 8 + j`. The whole legal set of a game is therefore 80
+/// bits, 16 bytes, against the 1280 bytes a pair of f32 masks needs. A 2048-game batch's
+/// legality is 32 KB and lives in L2; the mask form is 2.6 MB and does not.
+///
+/// Row-major order is not incidental: the sampler's cumulative scan picks the first square
+/// whose running total crosses the threshold, so traversal order is part of the result.
+/// Walking bits low to high reproduces the reference kernel's scan exactly.
+///
+/// The set only ever shrinks and every internal board change goes through a move, so this is
+/// maintained rather than recomputed: one bit cleared per square a move consumes.
+pub const LEGAL_WORDS: usize = 2;
+
+const _: () = assert!(HW / 2 == 80, "the legality bitboard assumes 80 playable squares");
+
+/// The 80 valid bits — the opening position.
+const LEGAL_ALL: [u64; LEGAL_WORDS] = [!0u64, 0xFFFF];
+
+/// The opening-move half-board rule, precomputed. `c < half_width` is `2j + (r & 1) < 8`,
+/// which is `j < 4` for both row parities — so the rule is the low nibble of every byte and
+/// applying it is one `AND`, not a column test per square.
+const LEGAL_LEFT: [u64; LEGAL_WORDS] = [0x0F0F_0F0F_0F0F_0F0F, 0x0F0F];
+const LEGAL_RIGHT: [u64; LEGAL_WORDS] = [0xF0F0_F0F0_F0F0_F0F0, 0xF0F0];
+
+/// Word and bit for a board index. A non-playable index aliases onto its even neighbour,
+/// which is harmless because its bit is never set in the first place.
+#[inline]
+fn legal_bit(i: usize) -> (usize, u64) {
+    let k = i >> 1;
+    (k >> 6, 1u64 << (k & 63))
+}
+
+/// The board index a bit position stands for; the inverse of `i >> 1` over playable cells.
+///
+/// It reduces to two instructions. Position `k` is `r * 8 + j`, and the cell it names is
+/// `r * 16 + 2j + (r & 1)` — and `r * 16 + 2j` is exactly `2k`, so all that is left is the
+/// row's parity, which is bit 3 of `k`.
+#[inline]
+fn legal_cell(k: usize) -> usize {
+    (k << 1) | ((k >> 3) & 1)
+}
+
+/// Mark a square as no longer playable. Called for every square a move writes, whether it
+/// took a mark or was blasted away, which is exactly the set that stops being playable.
+#[inline]
+fn clear_legal(legal: &mut [u64], i: usize) {
+    let (w, b) = legal_bit(i);
+    legal[w] &= !b;
+}
+
+/// Sample one move per active game from `dist`, restricted to the still-playable squares
+/// plus the first-move half-board rule.
 ///
 /// This replaces `game_kernels::sample_move_kernel` for the incremental engine. Same
-/// distribution, same RNG draws in the same order — but instead of walking all 160 board
-/// squares twice against a materialized f32 mask, it walks only the compact list of squares
-/// that are actually still available (80 at the start, 0 at the end, ~40 on average) and
-/// stops the second pass as soon as it has chosen.
-///
-/// The live list is kept in **row-major order**, which matters: the cumulative scan picks
-/// the first cell whose running total crosses the threshold, so the traversal order is part
-/// of the result. Order-preserving compaction keeps this identical to the reference kernel.
+/// distribution, same RNG draws in the same order — but instead of walking all 160 squares
+/// twice against a materialized f32 mask, it walks only the set bits, and the half-board
+/// rule is folded into the words before the loop rather than tested per square.
 #[allow(clippy::too_many_arguments)]
-fn sample_live(
+fn sample_bits(
     dist: &[f32],
-    live_cells: &[u16],
-    live_len: &[u16],
+    legal: &[u64],
     active: &[bool],
     move_counts: &[i32],
     n: usize,
     player: usize,
-    half_width: usize,
     rng: &mut Rng,
     r_out: &mut [i64],
     c_out: &mut [i64],
@@ -889,28 +941,34 @@ fn sample_live(
             continue;
         }
         let base = g * HW;
-        let lbase = g * MAX_LIVE;
-        let len = live_len[g] as usize;
-        let first = move_counts[g] == 0;
-
-        // On the opening move each player is confined to one half of the board. After that
-        // every live square is legal, so the check disappears from the loop entirely.
-        let allowed = |ci: u16| -> bool {
-            let c = ci as usize % WIDTH;
-            if player == 0 { c < half_width } else { c >= half_width }
-        };
-
-        let mut total: f64 = 0.0;
-        if first {
-            for &ci in &live_cells[lbase..lbase + len] {
-                if allowed(ci) {
-                    total += dist[base + ci as usize] as f64;
-                }
+        let half = if move_counts[g] == 0 {
+            if player == 0 {
+                LEGAL_LEFT
+            } else {
+                LEGAL_RIGHT
             }
         } else {
-            for &ci in &live_cells[lbase..lbase + len] {
-                total += dist[base + ci as usize] as f64;
-            }
+            LEGAL_ALL
+        };
+        let words = [
+            legal[g * LEGAL_WORDS] & half[0],
+            legal[g * LEGAL_WORDS + 1] & half[1],
+        ];
+
+        // Two words, unrolled: the second holds only 16 bits and is usually empty by the
+        // midgame, so a loop over them would spend its time on the branch, not the work.
+        let mut total: f64 = 0.0;
+        let mut w = words[0];
+        while w != 0 {
+            let k = w.trailing_zeros() as usize;
+            w &= w - 1;
+            total += dist[base + legal_cell(k)] as f64;
+        }
+        let mut w = words[1];
+        while w != 0 {
+            let k = 64 + w.trailing_zeros() as usize;
+            w &= w - 1;
+            total += dist[base + legal_cell(k)] as f64;
         }
 
         // Same degenerate branch as the reference kernel: an unmasked uniform draw over the
@@ -925,16 +983,19 @@ fn sample_live(
         let threshold = rng.random() * total;
         let mut cum: f64 = 0.0;
         let mut chosen: usize = 0;
-        for &ci in &live_cells[lbase..lbase + len] {
-            if first && !allowed(ci) {
-                continue;
-            }
-            let v = dist[base + ci as usize] as f64;
-            if v > 0.0 {
-                cum += v;
-                if cum >= threshold {
-                    chosen = ci as usize;
-                    break;
+        'scan: for (wi, &word) in words.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let k = (wi << 6) + w.trailing_zeros() as usize;
+                w &= w - 1;
+                let cell = legal_cell(k);
+                let v = dist[base + cell] as f64;
+                if v > 0.0 {
+                    cum += v;
+                    if cum >= threshold {
+                        chosen = cell;
+                        break 'scan;
+                    }
                 }
             }
         }
@@ -964,44 +1025,40 @@ pub struct IncrementalGame {
     pub finished: Vec<bool>,
     pub half_width: usize,
     pub rng: Rng,
-    /// Squares still playable, per game, compacted into `[g * MAX_LIVE ..][.. live_len[g]]`
-    /// and kept in row-major order. This is what the sampler walks instead of a mask, and
-    /// it also makes the finished check O(1).
-    live_cells: Vec<u16>,
-    live_len: Vec<u16>,
+    /// Squares still playable, as `[g * LEGAL_WORDS ..][.. LEGAL_WORDS]`. This is what the
+    /// sampler walks instead of a mask, what `get_legal_masks` expands from, and what makes
+    /// the finished check two comparisons instead of a board scan.
+    legal: Vec<u64>,
     scratch: Scratch,
 }
 
 impl IncrementalGame {
-    /// Rebuild one game's live list from its board, preserving row-major order.
-    fn rebuild_live(&mut self, g: usize) {
+    /// Derive one game's legality bitboard from its board. Only needed when adopting a
+    /// position from outside; during play the bitboard is maintained, never rebuilt.
+    fn rebuild_legal(&mut self, g: usize) {
         let cells = &self.boards[g * HW..(g + 1) * HW];
-        let lbase = g * MAX_LIVE;
-        let mut w = 0;
+        let mut w = [0u64; LEGAL_WORDS];
         for i in 0..HW {
             if cells[i] == PLAYABLE_SQUARE {
-                self.live_cells[lbase + w] = i as u16;
-                w += 1;
+                let (wi, b) = legal_bit(i);
+                w[wi] |= b;
             }
         }
-        self.live_len[g] = w as u16;
+        self.legal[g * LEGAL_WORDS..(g + 1) * LEGAL_WORDS].copy_from_slice(&w);
     }
 
-    /// Drop squares this move consumed. Order-preserving compaction, not swap-removal:
-    /// the sampler's scan order is part of its result, so the list must stay row-major.
-    fn compact_live(&mut self, g: usize) {
-        let cells = &self.boards[g * HW..(g + 1) * HW];
-        let lbase = g * MAX_LIVE;
-        let len = self.live_len[g] as usize;
-        let mut w = 0;
-        for r in 0..len {
-            let ci = self.live_cells[lbase + r];
-            if cells[ci as usize] == PLAYABLE_SQUARE {
-                self.live_cells[lbase + w] = ci;
-                w += 1;
-            }
-        }
-        self.live_len[g] = w as u16;
+    /// An empty bitboard is exactly "no playable square left".
+    #[inline]
+    fn no_moves_left(&self, g: usize) -> bool {
+        self.legal[g * LEGAL_WORDS] == 0 && self.legal[g * LEGAL_WORDS + 1] == 0
+    }
+
+    /// This game's legality words. The cheap form of [`Self::get_legal_masks`] for a caller
+    /// that can consume 16 bytes instead of 1280 — count is `count_ones`, a legality check
+    /// is a bit test, and the opening-move restriction is an `AND` with `LEGAL_LEFT` or
+    /// `LEGAL_RIGHT`.
+    pub fn legal_bits(&self, g: usize) -> [u64; LEGAL_WORDS] {
+        [self.legal[g * LEGAL_WORDS], self.legal[g * LEGAL_WORDS + 1]]
     }
     pub fn new(num_games: usize, seed: u64) -> Self {
         let mut boards = vec![NON_PLAYABLE_SQUARE; num_games * HW];
@@ -1023,12 +1080,11 @@ impl IncrementalGame {
             finished: vec![false; num_games],
             half_width: WIDTH / 2,
             rng: Rng::new(seed),
-            live_cells: vec![0; num_games * MAX_LIVE],
-            live_len: vec![0; num_games],
+            legal: vec![0; num_games * LEGAL_WORDS],
             scratch: Scratch::new(),
         };
         for i in 0..num_games {
-            g.rebuild_live(i);
+            g.rebuild_legal(i);
         }
         g
     }
@@ -1051,12 +1107,11 @@ impl IncrementalGame {
             finished,
             half_width: WIDTH / 2,
             rng: Rng::new(seed),
-            live_cells: vec![0; n * MAX_LIVE],
-            live_len: vec![0; n],
+            legal: vec![0; n * LEGAL_WORDS],
             scratch: Scratch::new(),
         };
         for i in 0..n {
-            g.rebuild_live(i);
+            g.rebuild_legal(i);
         }
         for i in 0..n {
             let cells = &g.boards[i * HW..(i + 1) * HW];
@@ -1073,26 +1128,80 @@ impl IncrementalGame {
     }
 
     pub fn raw_masks(&self) -> (Vec<f32>, Vec<f32>) {
-        let (m0, m1, _, _) = legal_masks_kernel(
-            &self.boards,
-            self.n,
-            &self.move_counts,
-            self.half_width,
-            HEIGHT,
-            WIDTH,
-        );
+        let (m0, m1, _, _) = self.get_legal_masks();
         (m0, m1)
     }
 
+    /// The dense (N, H, W) masks the policy network expects, expanded from the bitboard.
+    ///
+    /// Byte-for-byte what `game_kernels::legal_masks_kernel` produces, but built by
+    /// scattering ~40 set bits per game instead of scanning and branching on all 160
+    /// squares, with the counts coming from `count_ones` instead of a serial f64 add in the
+    /// inner loop. After the opening move the two masks are the same set — the half-board
+    /// rule is the only thing that ever distinguished them — so one is built and the other
+    /// is a memcpy.
     pub fn get_legal_masks(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-        legal_masks_kernel(
-            &self.boards,
-            self.n,
-            &self.move_counts,
-            self.half_width,
-            HEIGHT,
-            WIDTH,
-        )
+        let mut m0 = vec![0.0f32; self.n * HW];
+        let mut m1 = vec![0.0f32; self.n * HW];
+        let mut c0 = vec![0.0f32; self.n];
+        let mut c1 = vec![0.0f32; self.n];
+        self.legal_masks_into(&mut m0, &mut m1, &mut c0, &mut c1);
+        (m0, m1, c0, c1)
+    }
+
+    /// [`Self::get_legal_masks`] into caller-owned buffers, so a caller that asks on every
+    /// node does not allocate and free 2.6 MB each time. The buffers may be dirty; every
+    /// byte written here is written unconditionally.
+    pub fn legal_masks_into(
+        &self,
+        mask_0: &mut [f32],
+        mask_1: &mut [f32],
+        count_0: &mut [f32],
+        count_1: &mut [f32],
+    ) {
+        for g in 0..self.n {
+            let base = g * HW;
+            let w = [self.legal[g * LEGAL_WORDS], self.legal[g * LEGAL_WORDS + 1]];
+            mask_0[base..base + HW].fill(0.0);
+
+            if self.move_counts[g] == 0 {
+                mask_1[base..base + HW].fill(0.0);
+                let mut n0 = 0u32;
+                let mut n1 = 0u32;
+                for wi in 0..LEGAL_WORDS {
+                    let mut left = w[wi] & LEGAL_LEFT[wi];
+                    n0 += left.count_ones();
+                    while left != 0 {
+                        let k = (wi << 6) + left.trailing_zeros() as usize;
+                        left &= left - 1;
+                        mask_0[base + legal_cell(k)] = 1.0;
+                    }
+                    let mut right = w[wi] & LEGAL_RIGHT[wi];
+                    n1 += right.count_ones();
+                    while right != 0 {
+                        let k = (wi << 6) + right.trailing_zeros() as usize;
+                        right &= right - 1;
+                        mask_1[base + legal_cell(k)] = 1.0;
+                    }
+                }
+                count_0[g] = n0 as f32;
+                count_1[g] = n1 as f32;
+            } else {
+                let mut n = 0u32;
+                for wi in 0..LEGAL_WORDS {
+                    let mut bits = w[wi];
+                    n += bits.count_ones();
+                    while bits != 0 {
+                        let k = (wi << 6) + bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        mask_0[base + legal_cell(k)] = 1.0;
+                    }
+                }
+                mask_1[base..base + HW].copy_from_slice(&mask_0[base..base + HW]);
+                count_0[g] = n as f32;
+                count_1[g] = n as f32;
+            }
+        }
     }
 
     /// Scores in the reference's representation, for direct comparison.
@@ -1117,16 +1226,14 @@ impl IncrementalGame {
         let cells = &mut self.boards[g * HW..(g + 1) * HW];
         let level = &mut self.levels[g * HW..(g + 1) * HW];
         let score = &mut self.scores[g * 2..g * 2 + 2];
+        let legal = &mut self.legal[g * LEGAL_WORDS..(g + 1) * LEGAL_WORDS];
         apply_move(
-            cells, level, score,
+            cells, level, score, legal,
             (r0 as usize, c0 as usize), (r1 as usize, c1 as usize),
             &mut self.scratch,
         );
         self.move_counts[g] += 1;
-        self.compact_live(g);
-        // an empty live list is exactly "no playable square left", so the finished check
-        // costs one comparison instead of a board scan
-        if self.live_len[g] == 0 {
+        if self.no_moves_left(g) {
             self.finished[g] = true;
         }
     }
@@ -1140,17 +1247,18 @@ impl IncrementalGame {
             let cells = &mut self.boards[g * HW..(g + 1) * HW];
             let level = &mut self.levels[g * HW..(g + 1) * HW];
             let score = &mut self.scores[g * 2..g * 2 + 2];
+            let legal = &mut self.legal[g * LEGAL_WORDS..(g + 1) * LEGAL_WORDS];
             apply_move(
                 cells,
                 level,
                 score,
+                legal,
                 (r0[g] as usize, c0[g] as usize),
                 (r1[g] as usize, c1[g] as usize),
                 &mut self.scratch,
             );
             self.move_counts[g] += 1;
-            self.compact_live(g);
-            if self.live_len[g] == 0 {
+            if self.no_moves_left(g) {
                 self.finished[g] = true;
             }
         }
@@ -1168,9 +1276,9 @@ impl IncrementalGame {
         r_out: &mut [i64],
         c_out: &mut [i64],
     ) {
-        sample_live(
-            dist, &self.live_cells, &self.live_len, active, &self.move_counts,
-            self.n, player, self.half_width, &mut self.rng, r_out, c_out,
+        sample_bits(
+            dist, &self.legal, active, &self.move_counts,
+            self.n, player, &mut self.rng, r_out, c_out,
         );
     }
 
@@ -1261,24 +1369,31 @@ impl IncrementalGame {
     }
 
     /// The live list must be exactly the playable squares, in row-major order.
-    fn check_live(&self, g: usize) -> Result<(), String> {
+    /// The legality bitboard must agree with the board, bit for bit — including the packing
+    /// itself, since a wrong `legal_bit`/`legal_cell` pair would show up here as a mismatch.
+    fn check_legal(&self, g: usize) -> Result<(), String> {
         let cells = &self.boards[g * HW..(g + 1) * HW];
-        let want: Vec<u16> =
-            (0..HW).filter(|&i| cells[i] == PLAYABLE_SQUARE).map(|i| i as u16).collect();
-        let lbase = g * MAX_LIVE;
-        let have = &self.live_cells[lbase..lbase + self.live_len[g] as usize];
-        if have != want.as_slice() {
+        let mut want = [0u64; LEGAL_WORDS];
+        for i in 0..HW {
+            if cells[i] == PLAYABLE_SQUARE {
+                let (wi, b) = legal_bit(i);
+                want[wi] |= b;
+            }
+        }
+        let have = [self.legal[g * LEGAL_WORDS], self.legal[g * LEGAL_WORDS + 1]];
+        if have != want {
             return Err(format!(
-                "live list is wrong: {} entries stored, {} playable squares on the board",
-                have.len(),
-                want.len()
+                "legality bitboard is wrong: have [{:#018x}, {:#06x}], board says \
+                 [{:#018x}, {:#06x}]",
+                have[0], have[1], want[0], want[1]
             ));
         }
-        if self.finished[g] != want.is_empty() {
+        let empty = want == [0, 0];
+        if self.finished[g] != empty {
             return Err(format!(
                 "finished is {} but {} squares are still playable",
                 self.finished[g],
-                want.len()
+                want[0].count_ones() + want[1].count_ones()
             ));
         }
         Ok(())
@@ -1287,7 +1402,7 @@ impl IncrementalGame {
     /// Run [`check_invariants`] over every game in the batch.
     pub fn check_invariants(&self) -> Result<(), String> {
         for g in 0..self.n {
-            self.check_live(g).map_err(|e| format!("game {g}: {e}"))?;
+            self.check_legal(g).map_err(|e| format!("game {g}: {e}"))?;
             check_invariants(
                 &self.boards[g * HW..(g + 1) * HW],
                 &self.levels[g * HW..(g + 1) * HW],

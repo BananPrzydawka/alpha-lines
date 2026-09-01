@@ -174,4 +174,40 @@ fn main() {
         black_box(mid.get_encoded_states(black_box(0)));
     }
     report("get_encoded_states", t.elapsed().as_secs_f64(), reps);
+
+    // ---- the same masks, expanded from the incremental engine's legality bitboard ----
+    let mut mid_inc = IncrementalGame::new(n, seed ^ 0x5eed);
+    mid_inc.set_bfs_repair(bfs);
+    for _ in 0..warmup_moves {
+        mid_inc.distribution_step(&dist_p0, &dist_p1);
+    }
+    assert_eq!(mid_inc.get_legal_masks().0, mask_0, "the two mask paths disagree");
+
+    let t = Instant::now();
+    for _ in 0..reps {
+        black_box(mid_inc.get_legal_masks());
+    }
+    report("legal_masks_from_bitboard", t.elapsed().as_secs_f64(), reps);
+
+    // and again into caller-owned buffers, which is what a per-node caller would do
+    let mut m0 = vec![0.0f32; n * hw];
+    let mut m1 = vec![0.0f32; n * hw];
+    let mut c0 = vec![0.0f32; n];
+    let mut c1 = vec![0.0f32; n];
+    let t = Instant::now();
+    for _ in 0..reps {
+        mid_inc.legal_masks_into(
+            black_box(&mut m0), black_box(&mut m1), black_box(&mut c0), black_box(&mut c1),
+        );
+    }
+    report("legal_masks_into_buffers", t.elapsed().as_secs_f64(), reps);
+
+    // and the bitboard itself, which is what a caller that can take 16 bytes would read
+    let t = Instant::now();
+    for _ in 0..reps {
+        for g in 0..n {
+            black_box(mid_inc.legal_bits(black_box(g)));
+        }
+    }
+    report("legal_bits_only", t.elapsed().as_secs_f64(), reps);
 }
