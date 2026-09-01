@@ -135,16 +135,14 @@ fn main() {
     let (mask_0, _m1, _c0, _c1) =
         legal_masks_kernel(&mid.boards, mid.n, &mid.move_counts, mid.half_width, HEIGHT, WIDTH);
 
+    // Measured as a method call, deliberately the same shape as the incremental engine's
+    // mask stage below. Note that both allocate 2.6 MB per call at n=2048, and that cost
+    // depends on the process's heap and cache state, not only on the code: the same call
+    // measures ~315 ns/game in `api` and ~550 ns here, where 3 MB of recorded moves stay
+    // live throughout. `legal_masks_into` is the allocation-free comparison.
     let t = Instant::now();
     for _ in 0..reps {
-        black_box(legal_masks_kernel(
-            black_box(&mid.boards),
-            mid.n,
-            &mid.move_counts,
-            mid.half_width,
-            HEIGHT,
-            WIDTH,
-        ));
+        black_box(mid.get_legal_masks());
     }
     report("legal_masks_kernel", t.elapsed().as_secs_f64(), reps);
 

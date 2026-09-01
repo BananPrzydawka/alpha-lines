@@ -193,3 +193,133 @@ fn the_bitboard_sampler_picks_the_same_moves_as_the_reference_sampler() {
     }
     assert_eq!(steps, 44, "a full rollout should take 44 steps, took {steps}");
 }
+
+/// Every externally visible function, checked against the reference on many game states.
+///
+/// The two tests above cover the engine's *behaviour* — that playing a game produces the
+/// same board and the same score. This one covers its *surface*: for each public call, on
+/// each of a rollout's states, does the incremental engine hand back what the reference
+/// hands back. That is a different question, and the mask path in particular is now the
+/// engine's own code rather than the shared kernel, so nothing else pins it down.
+///
+/// Where a call returns a different representation rather than different data — `legal_bits`
+/// packs into 80 bits what `get_legal_masks` spreads over 160 floats — it is checked for
+/// logical equivalence against the board itself instead of for byte equality.
+#[test]
+fn every_public_call_agrees_with_the_reference() {
+    use alpha_lines_game::config::WIDTH;
+    use alpha_lines_game::game_kernels::PLAYABLE_SQUARE;
+    use alpha_lines_game::incremental::LEGAL_WORDS;
+
+    let n: usize = 512;
+    let seed = 0xc0de_5eedu64;
+    let half = WIDTH / 2;
+
+    let mut rng = Rng::new(seed);
+    let d0: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+    let d1: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+
+    let mut refg = BatchedLinesGame::new(n, seed);
+    let mut inc = IncrementalGame::new(n, seed);
+    let mut steps = 0usize;
+
+    loop {
+        // --- state the two engines both own outright ---
+        assert_eq!(inc.boards, refg.boards, "boards at step {steps}");
+        assert_eq!(inc.move_counts, refg.move_counts, "move_counts at step {steps}");
+        assert_eq!(inc.finished, refg.finished, "finished at step {steps}");
+        assert_eq!(inc.scores_f32(), refg.scores, "scores_f32 at step {steps}");
+
+        // --- masks: same four vectors, byte for byte ---
+        assert_eq!(inc.get_legal_masks(), refg.get_legal_masks(), "get_legal_masks {steps}");
+        assert_eq!(inc.raw_masks(), refg.raw_masks(), "raw_masks at step {steps}");
+
+        // --- legal_masks_into must fill dirty buffers with exactly that ---
+        let (want0, want1, wantc0, wantc1) = refg.get_legal_masks();
+        let mut m0 = vec![7.0f32; n * HW];
+        let mut m1 = vec![7.0f32; n * HW];
+        let mut c0 = vec![7.0f32; n];
+        let mut c1 = vec![7.0f32; n];
+        inc.legal_masks_into(&mut m0, &mut m1, &mut c0, &mut c1);
+        assert_eq!((m0, m1, c0, c1), (want0.clone(), want1.clone(), wantc0, wantc1),
+                   "legal_masks_into at step {steps}");
+
+        // --- legal_bits: a different representation, so checked for logical equivalence ---
+        for g in 0..n {
+            let bits = inc.legal_bits(g);
+            let first = refg.move_counts[g] == 0;
+            for i in 0..HW {
+                let k = i >> 1;
+                let set = i % 2 == (i / WIDTH) % 2
+                    && bits[k >> 6] >> (k & 63) & 1 == 1;
+                let playable = refg.boards[g * HW + i] == PLAYABLE_SQUARE;
+                assert_eq!(set, playable, "legal_bits g{g} cell {i} at step {steps}");
+                let c = i % WIDTH;
+                let want_0 = playable && !(first && c >= half);
+                let want_1 = playable && !(first && c < half);
+                assert_eq!(want0[g * HW + i] == 1.0, want_0, "mask0 g{g} cell {i}");
+                assert_eq!(want1[g * HW + i] == 1.0, want_1, "mask1 g{g} cell {i}");
+            }
+            assert_eq!(bits.len(), LEGAL_WORDS);
+        }
+
+        // --- everything reached through the reference-shaped view ---
+        let view = inc.to_reference();
+        assert_eq!(view.boards, refg.boards, "to_reference boards at step {steps}");
+        assert_eq!(view.scores, refg.scores, "to_reference scores at step {steps}");
+        assert_eq!(view.move_counts, refg.move_counts, "to_reference counts at step {steps}");
+        assert_eq!(view.finished, refg.finished, "to_reference finished at step {steps}");
+        for player in 0..2 {
+            assert_eq!(view.get_encoded_states(player), refg.get_encoded_states(player),
+                       "get_encoded_states({player}) at step {steps}");
+            assert_eq!(view.format_state(None, player), refg.format_state(None, player),
+                       "format_state({player}) at step {steps}");
+        }
+
+        // --- from_state has to reconstruct levels and scores from the board alone ---
+        let rebuilt = IncrementalGame::from_state(
+            inc.boards.clone(), inc.move_counts.clone(), inc.finished.clone(), seed,
+        );
+        assert_eq!(rebuilt.scores, inc.scores, "from_state scores at step {steps}");
+        assert_eq!(rebuilt.levels, inc.levels, "from_state levels at step {steps}");
+        rebuilt.check_invariants().unwrap();
+
+        if refg.finished.iter().all(|&f| f) {
+            break;
+        }
+        refg.distribution_step(&d0, &d1);
+        inc.distribution_step(&d0, &d1);
+        steps += 1;
+        assert!(steps < 200, "rollout did not terminate");
+    }
+
+    // --- terminal-only calls ---
+    let view = inc.to_reference();
+    assert_eq!(view.get_terminal_outcomes(), refg.get_terminal_outcomes());
+
+    // --- selecting a subset of games must detach the same way from both ---
+    let picked: Vec<usize> = (0..n).step_by(3).collect();
+    let a = refg.clone_states_to_batch(&picked);
+    let b = inc.to_reference().clone_states_to_batch(&picked);
+    assert_eq!((a.boards, a.scores, a.move_counts, a.finished),
+               (b.boards, b.scores, b.move_counts, b.finished), "clone_states_to_batch");
+
+    // --- the printed form has to round-trip identically through both ---
+    let text = refg.format_state(Some(&picked[..4]), 0);
+    let from_ref = BatchedLinesGame::import_prints(&text, 0, seed).unwrap();
+    let reimported = IncrementalGame::from_state(
+        from_ref.boards.clone(), from_ref.move_counts.clone(), from_ref.finished.clone(), seed,
+    );
+    assert_eq!(reimported.boards, from_ref.boards, "import_prints boards");
+    assert_eq!(reimported.scores_f32(), from_ref.scores, "import_prints scores");
+    reimported.check_invariants().unwrap();
+
+    // --- an illegal action must be rejected the same way, with the same message ---
+    let mut a = BatchedLinesGame::new(n, seed);
+    let mut b = IncrementalGame::new(n, seed);
+    let bad = vec![1i64; n]; // (0,1) is not a playable square
+    assert_eq!(a.action_step(&bad, &bad).unwrap_err(), b.action_step(&bad, &bad).unwrap_err());
+    assert_eq!(a.boards, b.boards, "a rejected action_step must leave the batch untouched");
+
+    println!("{n} games, {steps} steps, every public call compared at every step");
+}
