@@ -42,25 +42,11 @@ impl Table {
     }
     fn print(&self, title: &str) {
         println!("\n=== {title} ===");
-        println!(
-            "{:<34} {:>14} {:>14}   {}",
-            "call", "per call", "per game", "scope"
-        );
+        println!("{:<34} {:>14}   {}", "call", "per call", "what one call covers");
         for (name, per_call, unit) in &self.rows {
-            // a call that is already per-game must not be divided by the batch size again
-            let per_game = if unit.contains("one game") {
-                *per_call
-            } else {
-                per_call / self.n as f64
-            };
-            println!(
-                "{:<34} {:>12.1}us {:>12.1}ns   {}",
-                name,
-                per_call * 1e6,
-                per_game * 1e9,
-                unit
-            );
+            println!("{:<34} {:>12.1}us   {}", name, per_call * 1e6, unit);
         }
+        let _ = self.n;
     }
 }
 
@@ -85,9 +71,7 @@ fn main() {
     assert_eq!(mid_inc.boards, mid_ref.boards, "the two engines diverged during warmup");
 
     let mut done_ref = mid_ref.clone_states_to_batch(&(0..n).collect::<Vec<_>>());
-    let mut done_inc = IncrementalGame::from_state(
-        mid_inc.boards.clone(), mid_inc.move_counts.clone(), mid_inc.finished.clone(), 0,
-    );
+    let mut done_inc = IncrementalGame::from_state(mid_inc.boards.clone(), 0);
     while !done_ref.finished.iter().all(|&f| f) {
         done_ref.distribution_step(&d0, &d1);
         done_inc.distribution_step(&d0, &d1);
@@ -103,48 +87,18 @@ fn main() {
     for _ in 0..reps { black_box(IncrementalGame::new(black_box(n), seed)); }
     t.add("new", s.elapsed().as_secs_f64(), reps, "whole batch");
 
-    let (b, m, f) = (mid_inc.boards.clone(), mid_inc.move_counts.clone(), mid_inc.finished.clone());
+    let b = mid_inc.boards.clone();
     let s = Instant::now();
-    for _ in 0..reps {
-        black_box(IncrementalGame::from_state(b.clone(), m.clone(), f.clone(), 0));
-    }
+    for _ in 0..reps { black_box(IncrementalGame::from_state(b.clone(), 0)); }
     t.add("from_state", s.elapsed().as_secs_f64(), reps, "whole batch");
 
     let s = Instant::now();
-    for _ in 0..reps { black_box(mid_inc.get_legal_masks()); }
-    t.add("get_legal_masks", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let mut m0 = vec![0.0f32; n * HW];
-    let mut m1 = vec![0.0f32; n * HW];
-    let mut c0 = vec![0.0f32; n];
-    let mut c1 = vec![0.0f32; n];
-    let s = Instant::now();
-    for _ in 0..reps {
-        mid_inc.legal_masks_into(
-            black_box(&mut m0), black_box(&mut m1), black_box(&mut c0), black_box(&mut c1),
-        );
-    }
-    t.add("legal_masks_into", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let s = Instant::now();
-    for _ in 0..reps { black_box(mid_inc.raw_masks()); }
-    t.add("raw_masks", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let s = Instant::now();
     for _ in 0..reps { for g in 0..n { black_box(mid_inc.legal_bits(black_box(g))); } }
-    t.add("legal_bits (all n games)", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let s = Instant::now();
-    for _ in 0..reps { black_box(mid_inc.scores_f32()); }
-    t.add("scores_f32", s.elapsed().as_secs_f64(), reps, "whole batch");
+    t.add("legal_bits (every game)", s.elapsed().as_secs_f64(), reps, "whole batch");
 
     let s = Instant::now();
     for _ in 0..reps { black_box(mid_inc.to_reference()); }
     t.add("to_reference", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let s = Instant::now();
-    for _ in 0..reps { black_box(mid_inc.stats()); }
-    t.add("stats", s.elapsed().as_secs_f64(), reps, "whole batch");
 
     let s = Instant::now();
     for _ in 0..reps.min(4) { black_box(mid_inc.check_invariants().unwrap()); }
@@ -264,6 +218,6 @@ fn main() {
 
     t.print(format!("BatchedLinesGame (reference), {n} games, {reps} reps").as_str());
 
-    println!("\n(HEIGHT x WIDTH = {HEIGHT} x {WIDTH}; 'per game' divides by the {n} games in the batch)");
-    let _ = (&done_inc, &c0, &c1, &m0, &m1);
+    println!("\n(HEIGHT x WIDTH = {HEIGHT} x {WIDTH}, batch of {n} games)");
+    let _ = &done_inc;
 }

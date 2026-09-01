@@ -283,7 +283,7 @@ fn rollout(v: Variant, n: usize, seed: u64, d0: &[f32], d1: &[f32], cells: &[u16
 
         let (m0, m1) = if v.needs_masks() {
             let t = Instant::now();
-            let m = g.raw_masks();
+            let m = g.to_reference().raw_masks();
             t_masks += t.elapsed().as_secs_f64();
             m
         } else {
@@ -378,7 +378,7 @@ fn main() {
                     break;
                 }
                 let t = Instant::now();
-                let (m0, m1) = g.raw_masks();
+                let (m0, m1) = g.to_reference().raw_masks();
                 dm += t.elapsed().as_secs_f64();
                 let t = Instant::now();
                 let (r0, c0) = sample_move_kernel(&d0, &m0, &active, n, HEIGHT, WIDTH, &mut r);
@@ -399,7 +399,7 @@ fn main() {
             let mut g = IncrementalGame::new(n, seed + k as u64);
             for (r0, c0, r1, c1, active) in &recorded {
                 let t = Instant::now();
-                let (m0, m1) = g.raw_masks();
+                let (m0, m1) = g.to_reference().raw_masks();
                 am += t.elapsed().as_secs_f64();
                 let t = Instant::now();
                 let mut bad = 0usize;

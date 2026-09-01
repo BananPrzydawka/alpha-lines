@@ -14,9 +14,9 @@
 //!   score. `check_invariants` re-derives every level from scratch and re-scores the board
 //!   with the reference's own scorer, so the internal state is pinned too, not just the
 //!   output.
-//! * **Both repair strategies.** `Scratch::bfs_repair` picks between rebuilding a component
-//!   and walking its levels up. Two incremental engines run side by side, one on each, so
-//!   neither is left as untested dead code and they are checked against each other as well.
+//! * **The masks.** The reference builds them by scanning; the incremental engine packs the
+//!   same information into 80 bits. The dense form is compared here through the engine's
+//!   reference view, and the bitboard against the board itself in the API test below.
 //! * **The rare paths.** Collisions are what drive the slow removal path, but only if there
 //!   is structure for them to cut: forcing one on every move flattens the board and the slow
 //!   path then runs *zero* times, measured. Pure random play is in fact the best exerciser of
@@ -62,10 +62,7 @@ fn the_incremental_engine_matches_the_reference_bit_for_bit() {
     let seed = 0xa1f4_1e5u64;
 
     let mut refg = BatchedLinesGame::new(n, seed);
-    let mut bfs = IncrementalGame::new(n, seed);
-    let mut walk = IncrementalGame::new(n, seed);
-    bfs.set_bfs_repair(true);
-    walk.set_bfs_repair(false);
+    let mut inc = IncrementalGame::new(n, seed);
 
     let mut rng = Rng::new(seed ^ 0x9e37_79b9);
     // [random, forced] — the odd-numbered games and the even-numbered ones
@@ -101,30 +98,22 @@ fn the_incremental_engine_matches_the_reference_bit_for_bit() {
         }
 
         refg.action_step(&idx0, &idx1).unwrap();
-        bfs.action_step(&idx0, &idx1).unwrap();
-        walk.action_step(&idx0, &idx1).unwrap();
+        inc.action_step(&idx0, &idx1).unwrap();
 
-        // The masks are the incremental engine's own bitboard expansion, not the reference
-        // kernel, so they need comparing like everything else.
-        assert_eq!(bfs.get_legal_masks(), refg.get_legal_masks(), "masks at step {steps}");
-
-        for (name, inc) in [("bfs", &bfs), ("walk", &walk)] {
-            assert_eq!(inc.boards, refg.boards, "{name}: boards diverged at step {steps}");
-            assert_eq!(inc.scores_f32(), refg.scores, "{name}: scores diverged at step {steps}");
-            assert_eq!(inc.move_counts, refg.move_counts, "{name}: move counts at step {steps}");
-            assert_eq!(inc.finished, refg.finished, "{name}: finished flags at step {steps}");
-        }
-        // the two strategies must agree on the internal state too, not only the output
-        assert_eq!(bfs.levels, walk.levels, "the repair strategies disagree at step {steps}");
-        bfs.check_invariants().unwrap_or_else(|e| panic!("step {steps}: {e}"));
-        walk.check_invariants().unwrap_or_else(|e| panic!("step {steps}: {e}"));
+        let view = inc.to_reference();
+        assert_eq!(view.boards, refg.boards, "boards diverged at step {steps}");
+        assert_eq!(view.scores, refg.scores, "scores diverged at step {steps}");
+        assert_eq!(view.move_counts, refg.move_counts, "move counts at step {steps}");
+        assert_eq!(view.finished, refg.finished, "finished flags at step {steps}");
+        assert_eq!(view.get_legal_masks(), refg.get_legal_masks(), "masks at step {steps}");
+        inc.check_invariants().unwrap_or_else(|e| panic!("step {steps}: {e}"));
 
         steps += 1;
         assert!(steps < 200, "rollout did not terminate");
     }
 
     // the terminal outcome is derived state and gets its own comparison, once, at the end
-    assert_eq!(bfs.to_reference().get_terminal_outcomes(), refg.get_terminal_outcomes());
+    assert_eq!(inc.to_reference().get_terminal_outcomes(), refg.get_terminal_outcomes());
 
     // If either half ever stops reaching the interesting paths, fail loudly rather than
     // silently testing nothing. The random half is held to the collision rate free play
@@ -186,7 +175,7 @@ fn the_bitboard_sampler_picks_the_same_moves_as_the_reference_sampler() {
         refg.distribution_step(&d0, &d1);
         inc.distribution_step(&d0, &d1);
         assert_eq!(inc.boards, refg.boards, "sampler diverged at step {steps}");
-        assert_eq!(inc.scores_f32(), refg.scores, "scores diverged at step {steps}");
+        assert_eq!(inc.to_reference().scores, refg.scores, "scores diverged at step {steps}");
         inc.check_invariants().unwrap_or_else(|e| panic!("step {steps}: {e}"));
         steps += 1;
         assert!(steps < 200, "rollout did not terminate");
@@ -202,9 +191,10 @@ fn the_bitboard_sampler_picks_the_same_moves_as_the_reference_sampler() {
 /// hands back. That is a different question, and the mask path in particular is now the
 /// engine's own code rather than the shared kernel, so nothing else pins it down.
 ///
-/// Where a call returns a different representation rather than different data — `legal_bits`
-/// packs into 80 bits what `get_legal_masks` spreads over 160 floats — it is checked for
-/// logical equivalence against the board itself instead of for byte equality.
+/// `legal_bits` is the one call that returns a different representation rather than different
+/// data: it packs into 80 bits what the reference spreads over 160 floats. So it is checked
+/// for logical equivalence against the board itself, and the reference's dense masks are
+/// separately checked to be exactly that set intersected with the first-move half rule.
 #[test]
 fn every_public_call_agrees_with_the_reference() {
     use alpha_lines_game::config::WIDTH;
@@ -228,21 +218,8 @@ fn every_public_call_agrees_with_the_reference() {
         assert_eq!(inc.boards, refg.boards, "boards at step {steps}");
         assert_eq!(inc.move_counts, refg.move_counts, "move_counts at step {steps}");
         assert_eq!(inc.finished, refg.finished, "finished at step {steps}");
-        assert_eq!(inc.scores_f32(), refg.scores, "scores_f32 at step {steps}");
-
-        // --- masks: same four vectors, byte for byte ---
-        assert_eq!(inc.get_legal_masks(), refg.get_legal_masks(), "get_legal_masks {steps}");
-        assert_eq!(inc.raw_masks(), refg.raw_masks(), "raw_masks at step {steps}");
-
-        // --- legal_masks_into must fill dirty buffers with exactly that ---
-        let (want0, want1, wantc0, wantc1) = refg.get_legal_masks();
-        let mut m0 = vec![7.0f32; n * HW];
-        let mut m1 = vec![7.0f32; n * HW];
-        let mut c0 = vec![7.0f32; n];
-        let mut c1 = vec![7.0f32; n];
-        inc.legal_masks_into(&mut m0, &mut m1, &mut c0, &mut c1);
-        assert_eq!((m0, m1, c0, c1), (want0.clone(), want1.clone(), wantc0, wantc1),
-                   "legal_masks_into at step {steps}");
+        assert_eq!(inc.scores.len(), 2 * n, "one integer score per player per game");
+        let (want0, want1, _, _) = refg.get_legal_masks();
 
         // --- legal_bits: a different representation, so checked for logical equivalence ---
         for g in 0..n {
@@ -265,6 +242,8 @@ fn every_public_call_agrees_with_the_reference() {
 
         // --- everything reached through the reference-shaped view ---
         let view = inc.to_reference();
+        assert_eq!(view.scores, refg.scores, "scores at step {steps}");
+        assert_eq!(view.get_legal_masks(), refg.get_legal_masks(), "masks at step {steps}");
         assert_eq!(view.boards, refg.boards, "to_reference boards at step {steps}");
         assert_eq!(view.scores, refg.scores, "to_reference scores at step {steps}");
         assert_eq!(view.move_counts, refg.move_counts, "to_reference counts at step {steps}");
@@ -277,11 +256,16 @@ fn every_public_call_agrees_with_the_reference() {
         }
 
         // --- from_state has to reconstruct levels and scores from the board alone ---
-        let rebuilt = IncrementalGame::from_state(
-            inc.boards.clone(), inc.move_counts.clone(), inc.finished.clone(), seed,
-        );
+        // it is handed the board and nothing else, so the two flags have to come back too
+        let rebuilt = IncrementalGame::from_state(inc.boards.clone(), seed);
         assert_eq!(rebuilt.scores, inc.scores, "from_state scores at step {steps}");
         assert_eq!(rebuilt.levels, inc.levels, "from_state levels at step {steps}");
+        assert_eq!(rebuilt.finished, inc.finished, "from_state finished at step {steps}");
+        assert_eq!(
+            rebuilt.move_counts.iter().map(|&m| m.min(1)).collect::<Vec<_>>(),
+            inc.move_counts.iter().map(|&m| m.min(1)).collect::<Vec<_>>(),
+            "from_state first-move flag at step {steps}"
+        );
         rebuilt.check_invariants().unwrap();
 
         if refg.finished.iter().all(|&f| f) {
@@ -307,11 +291,11 @@ fn every_public_call_agrees_with_the_reference() {
     // --- the printed form has to round-trip identically through both ---
     let text = refg.format_state(Some(&picked[..4]), 0);
     let from_ref = BatchedLinesGame::import_prints(&text, 0, seed).unwrap();
-    let reimported = IncrementalGame::from_state(
-        from_ref.boards.clone(), from_ref.move_counts.clone(), from_ref.finished.clone(), seed,
-    );
+    let reimported = IncrementalGame::from_state(from_ref.boards.clone(), seed);
     assert_eq!(reimported.boards, from_ref.boards, "import_prints boards");
-    assert_eq!(reimported.scores_f32(), from_ref.scores, "import_prints scores");
+    assert_eq!(reimported.to_reference().scores, from_ref.scores, "import_prints scores");
+    assert_eq!(reimported.move_counts, from_ref.move_counts, "import_prints move_counts");
+    assert_eq!(reimported.finished, from_ref.finished, "import_prints finished");
     reimported.check_invariants().unwrap();
 
     // --- an illegal action must be rejected the same way, with the same message ---

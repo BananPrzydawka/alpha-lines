@@ -36,8 +36,6 @@ fn main() {
     // Independent rollouts to average over. At small batch sizes a single rollout is a
     // sample of one game, whose cost varies by 12x, so it says nothing on its own.
     let rollout_reps = arg_usize(&args, "--rollout-reps", 1);
-    // slow-removal repair strategy for the incremental engine; state is identical either way
-    let bfs = args.iter().any(|a| a == "--bfs");
 
     let hw = HEIGHT * WIDTH;
     let mut rng = Rng::new(seed);
@@ -68,7 +66,6 @@ fn main() {
     // ---- the same rollouts, scored incrementally ----
     let mut incs: Vec<IncrementalGame> =
         (0..rollout_reps).map(|k| IncrementalGame::new(n, seed + k as u64)).collect();
-    incs.iter_mut().for_each(|i| i.set_bfs_repair(bfs));
     let t0 = Instant::now();
     let mut inc_steps = 0usize;
     for inc in incs.iter_mut() {
@@ -115,7 +112,6 @@ fn main() {
     report("apply_and_score_reference", t.elapsed().as_secs_f64(), recorded.len());
 
     let mut inc_game = IncrementalGame::new(n, seed);
-    inc_game.set_bfs_repair(bfs);
     let t = Instant::now();
     for (r0, c0, r1, c1, active) in &recorded {
         inc_game.apply_step(r0, c0, r1, c1, active);
@@ -124,7 +120,7 @@ fn main() {
 
     // the two apply paths must have produced identical results, or the numbers are meaningless
     assert_eq!(inc_game.boards, ref_game.boards, "apply paths diverged");
-    assert_eq!(inc_game.scores_f32(), ref_game.scores, "apply paths scored differently");
+    assert_eq!(inc_game.to_reference().scores, ref_game.scores, "apply paths scored differently");
 
     // ---- micro-benchmarks on a representative mid-game batch ----
     let mut mid = BatchedLinesGame::new(n, seed ^ 0x5eed);
@@ -135,11 +131,10 @@ fn main() {
     let (mask_0, _m1, _c0, _c1) =
         legal_masks_kernel(&mid.boards, mid.n, &mid.move_counts, mid.half_width, HEIGHT, WIDTH);
 
-    // Measured as a method call, deliberately the same shape as the incremental engine's
-    // mask stage below. Note that both allocate 2.6 MB per call at n=2048, and that cost
-    // depends on the process's heap and cache state, not only on the code: the same call
-    // measures ~315 ns/game in `api` and ~550 ns here, where 3 MB of recorded moves stay
-    // live throughout. `legal_masks_into` is the allocation-free comparison.
+    // The reference's mask cost. Note it allocates 2.6 MB per call at n=2048, and that this
+    // depends on the process's heap and cache state as much as on the code: the same call
+    // measures ~315 us in `api` and ~550 us here, where 3 MB of recorded moves stay live
+    // throughout. The incremental engine's `legal_bits` below allocates nothing at all.
     let t = Instant::now();
     for _ in 0..reps {
         black_box(mid.get_legal_masks());
@@ -173,39 +168,16 @@ fn main() {
     }
     report("get_encoded_states", t.elapsed().as_secs_f64(), reps);
 
-    // ---- the same masks, expanded from the incremental engine's legality bitboard ----
+    // ---- the same legality, read as a bitboard ----
     let mut mid_inc = IncrementalGame::new(n, seed ^ 0x5eed);
-    mid_inc.set_bfs_repair(bfs);
     for _ in 0..warmup_moves {
         mid_inc.distribution_step(&dist_p0, &dist_p1);
     }
-    assert_eq!(mid_inc.get_legal_masks().0, mask_0, "the two mask paths disagree");
-
-    let t = Instant::now();
-    for _ in 0..reps {
-        black_box(mid_inc.get_legal_masks());
-    }
-    report("legal_masks_from_bitboard", t.elapsed().as_secs_f64(), reps);
-
-    // and again into caller-owned buffers, which is what a per-node caller would do
-    let mut m0 = vec![0.0f32; n * hw];
-    let mut m1 = vec![0.0f32; n * hw];
-    let mut c0 = vec![0.0f32; n];
-    let mut c1 = vec![0.0f32; n];
-    let t = Instant::now();
-    for _ in 0..reps {
-        mid_inc.legal_masks_into(
-            black_box(&mut m0), black_box(&mut m1), black_box(&mut c0), black_box(&mut c1),
-        );
-    }
-    report("legal_masks_into_buffers", t.elapsed().as_secs_f64(), reps);
-
-    // and the bitboard itself, which is what a caller that can take 16 bytes would read
     let t = Instant::now();
     for _ in 0..reps {
         for g in 0..n {
             black_box(mid_inc.legal_bits(black_box(g)));
         }
     }
-    report("legal_bits_only", t.elapsed().as_secs_f64(), reps);
+    report("legal_bits", t.elapsed().as_secs_f64(), reps);
 }

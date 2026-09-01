@@ -124,100 +124,7 @@ fn player_index(p: i8) -> usize {
 /// "process in increasing level order" cheaply. `cursor` only ever moves forward, which is
 /// sound because neither pass ever needs to enqueue *below* the level it is currently
 /// working on.
-/// Per-path counters, so a profile can say *why* a workload costs what it does rather than
-/// only how much. Incremented once per move, which is far below the noise floor of the
-/// work each move does.
-#[derive(Default, Clone, Copy, Debug)]
-pub struct Stats {
-    pub inserts: u64,
-    /// insert onto a square with no route to the border: nothing scores, nothing changes
-    pub inserts_dead: u64,
-    /// insert into live territory: O(1)
-    pub inserts_fast: u64,
-    /// insert that revives a dead blob: O(component)
-    pub inserts_slow: u64,
-    pub removes: u64,
-    /// the square held no mark
-    pub removes_nonmark: u64,
-    /// the mark was already unreachable, so its component scored nothing
-    pub removes_dead: u64,
-    /// nothing routed through it: O(1)
-    pub removes_fast: u64,
-    /// something may have been cut: O(component)
-    pub removes_slow: u64,
-    /// cells popped by the two level passes
-    pub relax_pops: u64,
-    pub repair_pops: u64,
-    /// the highest level written by the *most recent* repair_up call. If severed cycles
-    /// really do climb to the top, this lands near MAX_LEVEL.
-    pub repair_max_level: u8,
-    /// a cell went INF because its chain exceeded MAX_LEVEL — the cap firing, i.e. the
-    /// lockstep climb running to the end
-    pub repair_capped: u64,
-    /// a cell went INF the ordinary way: no surviving neighbour had a finite level
-    pub repair_dead: u64,
-    /// cells visited by component walks, and how many walks
-    pub component_cells: u64,
-    pub component_walks: u64,
-    /// slow removals that rebuilt their component with a BFS instead of `repair_up`,
-    /// and the cells that BFS touched. Only moves when `Scratch::bfs_repair` is set.
-    pub bfs_repairs: u64,
-    pub bfs_cells: u64,
-}
-
-/// Bumps a [`Stats`] counter, but only when the `stats` feature is on, so the default build
-/// carries no instrumentation overhead at all (measured: counters cost ~6% of a move).
-#[cfg(feature = "stats")]
-macro_rules! count {
-    ($s:expr, $f:ident) => {
-        $s.stats.$f += 1
-    };
-}
-#[cfg(not(feature = "stats"))]
-macro_rules! count {
-    ($s:expr, $f:ident) => {
-        ()
-    };
-}
-
-/// Records the largest value a counter has seen, for the same reason as `count!`.
-#[cfg(feature = "stats")]
-macro_rules! track_max {
-    ($s:expr, $f:ident, $v:expr) => {
-        if $v > $s.stats.$f {
-            $s.stats.$f = $v
-        }
-    };
-}
-#[cfg(not(feature = "stats"))]
-macro_rules! track_max {
-    ($s:expr, $f:ident, $v:expr) => {
-        ()
-    };
-}
-
-#[cfg(feature = "stats")]
-macro_rules! reset_stat {
-    ($s:expr, $f:ident) => {
-        $s.stats.$f = Default::default()
-    };
-}
-#[cfg(not(feature = "stats"))]
-macro_rules! reset_stat {
-    ($s:expr, $f:ident) => {
-        ()
-    };
-}
-
 pub struct Scratch {
-    pub stats: Stats,
-    /// Which repair strategy the slow-removal path uses: `true` (the default) throws the
-    /// component's levels away and re-derives them with [`rebuild_component_levels`],
-    /// `false` walks them up with [`repair_up`]. Both produce identical state, cell for
-    /// cell — they differ only in cost, and the rebuild wins because a severed cycle makes
-    /// the walk climb all the way to `MAX_LEVEL` before it admits the region is dead.
-    /// Kept switchable so the two can still be measured against each other.
-    pub bfs_repair: bool,
     stamp: Vec<u32>,
     epoch: u32,
     stack: Vec<u16>,
@@ -237,8 +144,6 @@ impl Default for Scratch {
 impl Scratch {
     pub fn new() -> Self {
         Scratch {
-            stats: Stats::default(),
-            bfs_repair: true,
             stamp: vec![0; HW],
             epoch: 0,
             stack: Vec::with_capacity(HW),
@@ -332,7 +237,6 @@ fn relax_down(cells: &[i8], level: &mut [u8], seed: usize, p: i8, s: &mut Scratc
     s.queue_reset();
     s.push(seed, level[seed]);
     while let Some((x, bucket)) = s.pop() {
-        count!(s, relax_pops);
         if level[x] != bucket {
             continue; // stale entry: x was lowered again after this push
         }
@@ -351,69 +255,9 @@ fn relax_down(cells: &[i8], level: &mut [u8], seed: usize, p: i8, s: &mut Scratc
     }
 }
 
-/// Repair levels upward after a removal: levels only ever *rise* here.
-///
-/// `seeds` are the cells that might have been routing through the deleted cell. Each is
-/// re-derived from its surviving neighbours; if it comes out unchanged it had another route
-/// and nothing behind it can be affected, so the walk stops there.
-///
-/// Processing in increasing level order is what makes that early stop sound: by the time a
-/// cell is examined, every provider that could still justify it has already settled, so a
-/// stale low reading is impossible.
-fn repair_up(cells: &[i8], level: &mut [u8], seeds: &[u16], p: i8, s: &mut Scratch) {
-    s.queue_reset();
-    reset_stat!(s, repair_max_level);
-    for &n in seeds {
-        s.push(n as usize, level[n as usize]);
-    }
-    while let Some((n, bucket)) = s.pop() {
-        count!(s, repair_pops);
-        let cur = level[n];
-        if cur == INF {
-            continue; // already dead; levels only rise, so it stays dead
-        }
-        if cur != bucket {
-            // level rose after this entry was queued; handle it at its real level
-            s.push(n, cur);
-            continue;
-        }
-        let cand = computed_level(cells, level, n, p);
-        if cand <= cur {
-            continue; // n had another provider all along
-        }
-        if cand == INF {
-            // Distinguish the two ways a cell dies: the cap firing (a finite neighbour still
-            // exists, but every chain through it is longer than any real path can be — the
-            // lockstep climb having run its course) from the ordinary case of no finite
-            // neighbour left at all.
-            let has_finite = DIAG
-                .iter()
-                .filter_map(|&d| step(n, d))
-                .any(|m| cells[m] == p && level[m] != INF);
-            if has_finite {
-                count!(s, repair_capped);
-            } else {
-                count!(s, repair_dead);
-            }
-        } else {
-            track_max!(s, repair_max_level, cand);
-        }
-        level[n] = cand;
-        // dependents are defined by the level n *used to* hold — that is what they pointed at
-        let target = cur + 1;
-        for d in DIAG {
-            if let Some(m) = step(n, d) {
-                if cells[m] == p && level[m] == target {
-                    s.push(m, target);
-                }
-            }
-        }
-    }
-}
-
 /// Re-derive the levels of one whole component from scratch, instead of walking them up.
 ///
-/// The alternative to [`repair_up`] on the slow-removal path. `comp` must be the component
+/// The whole of the slow-removal path's level repair. `comp` must be the component
 /// the deleted cell belonged to, collected *before* the deletion — which the slow path
 /// already has in hand, because it needs it to score the component anyway.
 ///
@@ -434,7 +278,6 @@ fn repair_up(cells: &[i8], level: &mut [u8], seeds: &[u16], p: i8, s: &mut Scrat
 /// fires: a shortest path visits distinct cells, so no real distance can reach `MAX_LEVEL`
 /// in the first place. Anything left at `INF` is genuinely unreachable.
 fn rebuild_component_levels(cells: &[i8], level: &mut [u8], comp: &[u16], p: i8, s: &mut Scratch) {
-    count!(s, bfs_repairs);
     let mut q = std::mem::take(&mut s.queue);
     q.clear();
 
@@ -444,7 +287,6 @@ fn rebuild_component_levels(cells: &[i8], level: &mut [u8], comp: &[u16], p: i8,
         if cells[i] != p {
             continue; // the cell we just deleted, and anything else no longer a mark
         }
-        count!(s, bfs_cells);
         if on_border(i) {
             level[i] = 0;
         } else {
@@ -467,13 +309,11 @@ fn rebuild_component_levels(cells: &[i8], level: &mut [u8], comp: &[u16], p: i8,
     while head < q.len() {
         let x = q[head] as usize;
         head += 1;
-        count!(s, repair_pops);
         let nl = level[x] + 1;
         for d in DIAG {
             if let Some(n) = step(x, d) {
                 if cells[n] == p && level[n] > nl {
                     level[n] = nl;
-                    track_max!(s, repair_max_level, nl);
                     q.push(n as u16);
                 }
             }
@@ -521,18 +361,15 @@ fn walk_component(cells: &[i8], seed: usize, p: i8, s: &mut Scratch, out: &mut V
     if cells[seed] != p || !s.visit(seed) {
         return;
     }
-    count!(s, component_walks);
     s.stack.clear();
     s.stack.push(seed as u16);
     out.push(seed as u16);
-    count!(s, component_cells);
     while let Some(x) = s.stack.pop() {
         for d in DIAG {
             if let Some(n) = step(x as usize, d) {
                 if cells[n] == p && s.visit(n) {
                     s.stack.push(n as u16);
                     out.push(n as u16);
-                    count!(s, component_cells);
                 }
             }
         }
@@ -636,11 +473,9 @@ fn local_delta(cells: &[i8], i: usize, p: i8) -> i32 {
 pub fn insert(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, p: i8, s: &mut Scratch) {
     debug_assert_eq!(cells[i], PLAYABLE_SQUARE, "insert onto a non-playable square");
 
-    count!(s, inserts);
     let lvl = computed_level(cells, level, i, p);
 
     if lvl == INF {
-        count!(s, inserts_dead);
         // every mark it touches was already unreachable, so nothing scored before and
         // nothing scores now
         cells[i] = p;
@@ -654,7 +489,6 @@ pub fn insert(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, p
         .any(|n| cells[n] == p && level[n] == INF);
 
     if !attaches_dead {
-        count!(s, inserts_fast);
         // Fast path, and the common one: a mark dropped into live territory. Reachability
         // is unchanged everywhere, so the whole score change is local to the two runs
         // through this square.
@@ -665,7 +499,6 @@ pub fn insert(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, p
         return;
     }
 
-    count!(s, inserts_slow);
     // Slow path: this mark revives a dead blob, so a whole region flips from scoring
     // nothing to scoring everything. There is no local shortcut — measure before, measure
     // after, apply the difference.
@@ -700,16 +533,13 @@ pub fn insert(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, p
 /// Clear square `i`, updating levels and the running score. Handles empty and already
 /// removed squares as no-ops beyond the state write.
 pub fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s: &mut Scratch) {
-    count!(s, removes);
     let p = cells[i];
     if p != PLAYER_0_MARK && p != PLAYER_1_MARK {
-        count!(s, removes_nonmark);
         cells[i] = REMOVED_SQUARE;
         return;
     }
 
     if level[i] == INF {
-        count!(s, removes_dead);
         // its component scored nothing, so losing a cell changes nothing
         cells[i] = REMOVED_SQUARE;
         level[i] = INF;
@@ -730,7 +560,6 @@ pub fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s
     }
 
     if deps.is_empty() {
-        count!(s, removes_fast);
         // Fast path: same local calculation as insertion, negated. The flanking runs keep
         // their levels, so they stay reachable and their contributions still count.
         cells[i] = REMOVED_SQUARE;
@@ -740,7 +569,6 @@ pub fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s
         return;
     }
 
-    count!(s, removes_slow);
     // Slow path: the structure may have been cut. Measure while it is still whole.
     let mut comp = std::mem::take(&mut s.comp);
     comp.clear();
@@ -750,12 +578,7 @@ pub fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s
 
     cells[i] = REMOVED_SQUARE;
     level[i] = INF;
-    if s.bfs_repair {
-        reset_stat!(s, repair_max_level);
-        rebuild_component_levels(cells, level, &comp, p, s);
-    } else {
-        repair_up(cells, level, &deps, p, s);
-    }
+    rebuild_component_levels(cells, level, &comp, p, s);
 
     // `comp` may now be several disconnected pieces, some alive, some INF. `contribution`
     // handles that on its own: a piece on INF simply contributes nothing, and the removed
@@ -1089,15 +912,27 @@ impl IncrementalGame {
         g
     }
 
-    /// Adopt an arbitrary board state, deriving levels and scores with the one global BFS.
-    /// This is the equivalent of the reference's construction-time `score_batch`.
-    pub fn from_state(
-        boards: Vec<i8>,
-        move_counts: Vec<i32>,
-        finished: Vec<bool>,
-        seed: u64,
-    ) -> Self {
-        let n = move_counts.len();
+    /// Adopt arbitrary boards. The board *is* the state, so nothing else is asked for.
+    ///
+    /// Levels come from the one global BFS, scores from a full rescan, legality from a scan
+    /// for playable squares. The two flags the engine also carries are derived rather than
+    /// supplied: a game is finished exactly when no playable square is left, and it is on
+    /// its opening move exactly when nothing has been played — no marks and no blasted
+    /// squares. `move_counts` is only ever compared against zero, never counted with, so
+    /// 0-or-1 carries everything that depends on it; this is the same rule the reference
+    /// applies when it imports a printed board.
+    pub fn from_state(boards: Vec<i8>, seed: u64) -> Self {
+        let n = boards.len() / HW;
+        let mut move_counts = vec![0i32; n];
+        let mut finished = vec![false; n];
+        for i in 0..n {
+            let cells = &boards[i * HW..(i + 1) * HW];
+            let played = cells
+                .iter()
+                .any(|&v| v != PLAYABLE_SQUARE && v != NON_PLAYABLE_SQUARE);
+            move_counts[i] = i32::from(played);
+            finished[i] = !cells.iter().any(|&v| v == PLAYABLE_SQUARE);
+        }
         let mut g = IncrementalGame {
             n,
             boards,
@@ -1127,94 +962,14 @@ impl IncrementalGame {
         self.finished.iter().map(|f| !f).collect()
     }
 
-    pub fn raw_masks(&self) -> (Vec<f32>, Vec<f32>) {
-        let (m0, m1, _, _) = self.get_legal_masks();
-        (m0, m1)
-    }
-
-    /// The dense (N, H, W) masks the policy network expects, expanded from the bitboard.
-    ///
-    /// Byte-for-byte what `game_kernels::legal_masks_kernel` produces, but built by
-    /// scattering ~40 set bits per game instead of scanning and branching on all 160
-    /// squares, with the counts coming from `count_ones` instead of a serial f64 add in the
-    /// inner loop. After the opening move the two masks are the same set — the half-board
-    /// rule is the only thing that ever distinguished them — so one is built and the other
-    /// is a memcpy.
-    pub fn get_legal_masks(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-        let mut m0 = vec![0.0f32; self.n * HW];
-        let mut m1 = vec![0.0f32; self.n * HW];
-        let mut c0 = vec![0.0f32; self.n];
-        let mut c1 = vec![0.0f32; self.n];
-        self.legal_masks_into(&mut m0, &mut m1, &mut c0, &mut c1);
-        (m0, m1, c0, c1)
-    }
-
-    /// [`Self::get_legal_masks`] into caller-owned buffers, so a caller that asks on every
-    /// node does not allocate and free 2.6 MB each time. The buffers may be dirty; every
-    /// byte written here is written unconditionally.
-    pub fn legal_masks_into(
-        &self,
-        mask_0: &mut [f32],
-        mask_1: &mut [f32],
-        count_0: &mut [f32],
-        count_1: &mut [f32],
-    ) {
-        for g in 0..self.n {
-            let base = g * HW;
-            let w = [self.legal[g * LEGAL_WORDS], self.legal[g * LEGAL_WORDS + 1]];
-            mask_0[base..base + HW].fill(0.0);
-
-            if self.move_counts[g] == 0 {
-                mask_1[base..base + HW].fill(0.0);
-                let mut n0 = 0u32;
-                let mut n1 = 0u32;
-                for wi in 0..LEGAL_WORDS {
-                    let mut left = w[wi] & LEGAL_LEFT[wi];
-                    n0 += left.count_ones();
-                    while left != 0 {
-                        let k = (wi << 6) + left.trailing_zeros() as usize;
-                        left &= left - 1;
-                        mask_0[base + legal_cell(k)] = 1.0;
-                    }
-                    let mut right = w[wi] & LEGAL_RIGHT[wi];
-                    n1 += right.count_ones();
-                    while right != 0 {
-                        let k = (wi << 6) + right.trailing_zeros() as usize;
-                        right &= right - 1;
-                        mask_1[base + legal_cell(k)] = 1.0;
-                    }
-                }
-                count_0[g] = n0 as f32;
-                count_1[g] = n1 as f32;
-            } else {
-                let mut n = 0u32;
-                for wi in 0..LEGAL_WORDS {
-                    let mut bits = w[wi];
-                    n += bits.count_ones();
-                    while bits != 0 {
-                        let k = (wi << 6) + bits.trailing_zeros() as usize;
-                        bits &= bits - 1;
-                        mask_0[base + legal_cell(k)] = 1.0;
-                    }
-                }
-                mask_1[base..base + HW].copy_from_slice(&mask_0[base..base + HW]);
-                count_0[g] = n as f32;
-                count_1[g] = n as f32;
-            }
-        }
-    }
-
-    /// Scores in the reference's representation, for direct comparison.
-    pub fn scores_f32(&self) -> Vec<f32> {
-        self.scores.iter().map(|&s| s as f32).collect()
-    }
-
     /// A reference-shaped copy of this state, so the already-verified encoding, rendering
     /// and terminal-outcome code can be reused. Not for the hot path — it copies.
     pub fn to_reference(&self) -> BatchedLinesGame {
         let mut r = BatchedLinesGame::new(self.n, 0);
         r.boards.copy_from_slice(&self.boards);
-        r.scores.copy_from_slice(&self.scores_f32());
+        for (dst, &src) in r.scores.iter_mut().zip(self.scores.iter()) {
+            *dst = src as f32;
+        }
         r.move_counts.copy_from_slice(&self.move_counts);
         r.finished.copy_from_slice(&self.finished);
         r
@@ -1352,25 +1107,15 @@ impl IncrementalGame {
         Ok(())
     }
 
-    /// Path counters accumulated since construction.
-    /// Pick the slow-removal repair strategy: `true` (the default) re-derives the whole
-    /// component with a BFS, `false` walks levels up with `repair_up`. The resulting state
-    /// is identical either way, so this is purely a cost knob.
-    pub fn set_bfs_repair(&mut self, on: bool) {
-        self.scratch.bfs_repair = on;
-    }
-
-    pub fn stats(&self) -> Stats {
-        self.scratch.stats
-    }
-
-    pub fn reset_stats(&mut self) {
-        self.scratch.stats = Stats::default();
-    }
-
-    /// The live list must be exactly the playable squares, in row-major order.
-    /// The legality bitboard must agree with the board, bit for bit — including the packing
-    /// itself, since a wrong `legal_bit`/`legal_cell` pair would show up here as a mismatch.
+    /// Verify one game's legality bitboard against its board.
+    ///
+    /// Scans the board the slow way, builds the bitboard a fresh `from_state` would have
+    /// built, and requires the maintained one to equal it — so any square that stopped being
+    /// playable without its bit being cleared, or vice versa, is caught here. The same scan
+    /// also settles whether the game is over, which pins the `finished` flag. A wrong
+    /// `legal_bit`/`legal_cell` packing shows up as a mismatch too, since the two sides are
+    /// built by different code. Returns a description of the disagreement, not a bool, so a
+    /// failing test says which game and what shape the damage has.
     fn check_legal(&self, g: usize) -> Result<(), String> {
         let cells = &self.boards[g * HW..(g + 1) * HW];
         let mut want = [0u64; LEGAL_WORDS];

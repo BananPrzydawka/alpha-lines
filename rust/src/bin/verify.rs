@@ -217,7 +217,7 @@ fn main() {
         // For the incremental scorer, re-derive levels and scores from the imported board
         // alone, so `from_state` is verified against the Python too.
         let g = if incremental {
-            IncrementalGame::from_state(g.boards, g.move_counts, g.finished, 0).to_reference()
+            IncrementalGame::from_state(g.boards, 0).to_reference()
         } else {
             g
         };
