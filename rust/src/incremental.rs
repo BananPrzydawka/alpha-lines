@@ -40,19 +40,15 @@
 //! finite.** Level changes that stay finite are pure bookkeeping — they cost work and
 //! change no score. That is the price of never running a global flood fill.
 //!
-//! [`check_invariants`] asserts all of this directly; the tests run it after every move.
+//! The tests re-derive all of it from scratch after every move and compare.
 
 use crate::config::{HEIGHT, WIDTH};
-// One thing is still borrowed from the reference kernels, and it is not on any hot path:
-// `score_player` is used only by `check_invariants`, as an independent oracle — the engine's
-// own scorer would be no evidence about itself. The mask kernel and the reference sampler
-// are both gone; see the legality bitboard below, which replaces them.
+// Only the board encoding is shared with the reference implementation; none of its kernels
+// are, and this module does not know the reference type exists.
 use crate::game_kernels::{
-    score_player, NON_PLAYABLE_SQUARE, PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK,
-    REMOVED_SQUARE,
+    NON_PLAYABLE_SQUARE, PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK, REMOVED_SQUARE,
 };
 use crate::rng::Rng;
-use crate::BatchedLinesGame;
 
 /// Cells per board.
 pub const HW: usize = HEIGHT * WIDTH;
@@ -628,61 +624,6 @@ pub fn apply_move(
 
 // -------------------------------------------------------------------------- validation
 
-/// Check the level invariant and the running score for one board against ground truth.
-/// Not used in the hot path; the tests call it after every move.
-pub fn check_invariants(cells: &[i8], level: &[u8], score: &[i32]) -> Result<(), String> {
-    for i in 0..HW {
-        let p = cells[i];
-        if p != PLAYER_0_MARK && p != PLAYER_1_MARK {
-            continue;
-        }
-        let want = computed_level(cells, level, i, p);
-        if level[i] != want {
-            return Err(format!(
-                "level invariant broken at cell {} (r{} c{}): stored {}, derived {}",
-                i,
-                i / WIDTH,
-                i % WIDTH,
-                level[i],
-                want
-            ));
-        }
-    }
-
-    // levels must agree with a from-scratch BFS, not merely be locally consistent
-    let mut fresh = vec![INF; HW];
-    let mut s = Scratch::new();
-    rebuild_levels(cells, &mut fresh, &mut s);
-    for i in 0..HW {
-        let p = cells[i];
-        if (p == PLAYER_0_MARK || p == PLAYER_1_MARK) && fresh[i] != level[i] {
-            return Err(format!(
-                "level at cell {} (r{} c{}) is {}, from-scratch BFS says {}",
-                i,
-                i / WIDTH,
-                i % WIDTH,
-                level[i],
-                fresh[i]
-            ));
-        }
-    }
-
-    for (k, mark) in [PLAYER_0_MARK, PLAYER_1_MARK].into_iter().enumerate() {
-        let want = score_player(cells, 0, mark, HEIGHT, WIDTH) as i32;
-        if score[k] != want {
-            return Err(format!(
-                "score for player {} is {}, reference scorer says {}",
-                k, score[k], want
-            ));
-        }
-    }
-    Ok(())
-}
-
-
-// ------------------------------------------------------------------------- live squares
-
-/// The most squares a game can ever have available: only `(r + c)` even cells are playable.
 // ------------------------------------------------------------------- legality bitboard
 
 /// Which squares are still playable, as a bitboard: two `u64` per game.
@@ -962,39 +903,10 @@ impl IncrementalGame {
         self.finished.iter().map(|f| !f).collect()
     }
 
-    /// A reference-shaped copy of this state, so the already-verified encoding, rendering
-    /// and terminal-outcome code can be reused. Not for the hot path — it copies.
-    pub fn to_reference(&self) -> BatchedLinesGame {
-        let mut r = BatchedLinesGame::new(self.n, 0);
-        r.boards.copy_from_slice(&self.boards);
-        for (dst, &src) in r.scores.iter_mut().zip(self.scores.iter()) {
-            *dst = src as f32;
-        }
-        r.move_counts.copy_from_slice(&self.move_counts);
-        r.finished.copy_from_slice(&self.finished);
-        r
-    }
-
-    /// Apply one move to one game. Same work as [`Self::apply_step`] does per game, exposed
-    /// so a profile can drive the batch in game-major order instead of step-major.
-    pub fn apply_game(&mut self, g: usize, r0: i64, c0: i64, r1: i64, c1: i64) {
-        let cells = &mut self.boards[g * HW..(g + 1) * HW];
-        let level = &mut self.levels[g * HW..(g + 1) * HW];
-        let score = &mut self.scores[g * 2..g * 2 + 2];
-        let legal = &mut self.legal[g * LEGAL_WORDS..(g + 1) * LEGAL_WORDS];
-        apply_move(
-            cells, level, score, legal,
-            (r0 as usize, c0 as usize), (r1 as usize, c1 as usize),
-            &mut self.scratch,
-        );
-        self.move_counts[g] += 1;
-        if self.no_moves_left(g) {
-            self.finished[g] = true;
-        }
-    }
-
-    /// The incremental counterpart of `apply_and_score_kernel`.
-    pub fn apply_step(&mut self, r0: &[i64], c0: &[i64], r1: &[i64], c1: &[i64], active: &[bool]) {
+    /// Apply one sampled move per active game. Private: [`Self::distribution_step`] and
+    /// [`Self::action_step`] are the two ways in, and they differ only in where the moves
+    /// come from.
+    fn apply_step(&mut self, r0: &[i64], c0: &[i64], r1: &[i64], c1: &[i64], active: &[bool]) {
         for g in 0..self.n {
             if !active[g] {
                 continue;
@@ -1017,6 +929,30 @@ impl IncrementalGame {
                 self.finished[g] = true;
             }
         }
+    }
+
+    /// Copy the named games into a fresh batch.
+    ///
+    /// Every derived quantity is copied rather than recomputed — levels and the legality
+    /// bitboard come across verbatim — so a clone costs a memcpy per game instead of the
+    /// global BFS and full rescore [`Self::from_state`] would pay for the same boards.
+    /// Naming a game twice is allowed and yields two independent copies.
+    ///
+    /// The clone draws a fresh RNG from the parent's stream, so a seeded parent still
+    /// determines everything its clones go on to do.
+    pub fn clone_states_to_batch(&mut self, indices: &[usize]) -> Self {
+        let mut t = IncrementalGame::new(indices.len(), self.rng.next_u64());
+        for (d, &g) in indices.iter().enumerate() {
+            t.boards[d * HW..(d + 1) * HW].copy_from_slice(&self.boards[g * HW..(g + 1) * HW]);
+            t.levels[d * HW..(d + 1) * HW].copy_from_slice(&self.levels[g * HW..(g + 1) * HW]);
+            t.legal[d * LEGAL_WORDS..(d + 1) * LEGAL_WORDS]
+                .copy_from_slice(&self.legal[g * LEGAL_WORDS..(g + 1) * LEGAL_WORDS]);
+            t.scores[d * 2] = self.scores[g * 2];
+            t.scores[d * 2 + 1] = self.scores[g * 2 + 1];
+            t.move_counts[d] = self.move_counts[g];
+            t.finished[d] = self.finished[g];
+        }
+        t
     }
 
     /// Sample one move per active game for `player`, without applying it.
@@ -1104,57 +1040,6 @@ impl IncrementalGame {
         let r1: Vec<i64> = idx_1.iter().map(|&i| i / w).collect();
         let c1: Vec<i64> = idx_1.iter().map(|&i| i % w).collect();
         self.apply_step(&r0, &c0, &r1, &c1, &active);
-        Ok(())
-    }
-
-    /// Verify one game's legality bitboard against its board.
-    ///
-    /// Scans the board the slow way, builds the bitboard a fresh `from_state` would have
-    /// built, and requires the maintained one to equal it — so any square that stopped being
-    /// playable without its bit being cleared, or vice versa, is caught here. The same scan
-    /// also settles whether the game is over, which pins the `finished` flag. A wrong
-    /// `legal_bit`/`legal_cell` packing shows up as a mismatch too, since the two sides are
-    /// built by different code. Returns a description of the disagreement, not a bool, so a
-    /// failing test says which game and what shape the damage has.
-    fn check_legal(&self, g: usize) -> Result<(), String> {
-        let cells = &self.boards[g * HW..(g + 1) * HW];
-        let mut want = [0u64; LEGAL_WORDS];
-        for i in 0..HW {
-            if cells[i] == PLAYABLE_SQUARE {
-                let (wi, b) = legal_bit(i);
-                want[wi] |= b;
-            }
-        }
-        let have = [self.legal[g * LEGAL_WORDS], self.legal[g * LEGAL_WORDS + 1]];
-        if have != want {
-            return Err(format!(
-                "legality bitboard is wrong: have [{:#018x}, {:#06x}], board says \
-                 [{:#018x}, {:#06x}]",
-                have[0], have[1], want[0], want[1]
-            ));
-        }
-        let empty = want == [0, 0];
-        if self.finished[g] != empty {
-            return Err(format!(
-                "finished is {} but {} squares are still playable",
-                self.finished[g],
-                want[0].count_ones() + want[1].count_ones()
-            ));
-        }
-        Ok(())
-    }
-
-    /// Run [`check_invariants`] over every game in the batch.
-    pub fn check_invariants(&self) -> Result<(), String> {
-        for g in 0..self.n {
-            self.check_legal(g).map_err(|e| format!("game {g}: {e}"))?;
-            check_invariants(
-                &self.boards[g * HW..(g + 1) * HW],
-                &self.levels[g * HW..(g + 1) * HW],
-                &self.scores[g * 2..g * 2 + 2],
-            )
-            .map_err(|e| format!("game {g}: {e}"))?;
-        }
         Ok(())
     }
 }

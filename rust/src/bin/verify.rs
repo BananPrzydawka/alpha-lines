@@ -144,6 +144,19 @@ fn arg(args: &[String], key: &str) -> Option<String> {
     })
 }
 
+/// The incremental engine does not know the reference type exists, so the conversion this
+/// tool needs to reuse the reference's dumping and rendering lives here.
+fn as_reference(inc: &IncrementalGame) -> BatchedLinesGame {
+    let mut r = BatchedLinesGame::new(inc.n, 0);
+    r.boards.copy_from_slice(&inc.boards);
+    for (dst, &src) in r.scores.iter_mut().zip(inc.scores.iter()) {
+        *dst = src as f32;
+    }
+    r.move_counts.copy_from_slice(&inc.move_counts);
+    r.finished.copy_from_slice(&inc.finished);
+    r
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let moves_path = PathBuf::from(arg(&args, "--moves").expect("--moves is required"));
@@ -217,7 +230,7 @@ fn main() {
         // For the incremental scorer, re-derive levels and scores from the imported board
         // alone, so `from_state` is verified against the Python too.
         let g = if incremental {
-            IncrementalGame::from_state(g.boards, 0).to_reference()
+            as_reference(&IncrementalGame::from_state(g.boards, 0))
         } else {
             g
         };
@@ -254,7 +267,7 @@ impl Driver {
     fn snapshot(&self) -> BatchedLinesGame {
         match self {
             Driver::Reference(g) => g.clone(),
-            Driver::Incremental(g) => g.to_reference(),
+            Driver::Incremental(g) => as_reference(g),
         }
     }
 }

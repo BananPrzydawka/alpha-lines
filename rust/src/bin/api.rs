@@ -97,12 +97,8 @@ fn main() {
     t.add("legal_bits (every game)", s.elapsed().as_secs_f64(), reps, "whole batch");
 
     let s = Instant::now();
-    for _ in 0..reps { black_box(mid_inc.to_reference()); }
-    t.add("to_reference", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let s = Instant::now();
-    for _ in 0..reps.min(4) { black_box(mid_inc.check_invariants().unwrap()); }
-    t.add("check_invariants", s.elapsed().as_secs_f64(), reps.min(4), "whole batch");
+    for _ in 0..reps { black_box(mid_inc.clone_states_to_batch(black_box(&idx))); }
+    t.add("clone_states_to_batch (n/2)", s.elapsed().as_secs_f64(), reps, "half the batch");
 
     // mutating calls: one rollout each, averaged over the calls it took
     let mut g = IncrementalGame::new(n, seed);
@@ -111,49 +107,28 @@ fn main() {
     while !g.finished.iter().all(|&f| f) { g.distribution_step(&d0, &d1); steps += 1; }
     t.add("distribution_step", s.elapsed().as_secs_f64(), steps, "one move, all games");
 
-    // record a legal sequence so action_step / apply_step / sample_moves can be timed alone
-    let mut rec: Vec<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>, Vec<bool>)> = Vec::new();
+    // a recorded legal sequence, so the sampler and the action path can be timed apart
+    let mut rec: Vec<(Vec<i64>, Vec<i64>, Vec<bool>)> = Vec::new();
     {
-        let mut r = BatchedLinesGame::new(n, seed);
         let mut probe = IncrementalGame::new(n, seed);
-        while !r.finished.iter().all(|&f| f) {
-            let active: Vec<bool> = r.finished.iter().map(|&x| !x).collect();
+        while !probe.finished.iter().all(|&f| f) {
+            let active: Vec<bool> = probe.finished.iter().map(|&x| !x).collect();
             let (mut r0, mut c0v) = (vec![0i64; n], vec![0i64; n]);
             let (mut r1, mut c1v) = (vec![0i64; n], vec![0i64; n]);
             probe.sample_moves(&d0, 0, &active, &mut r0, &mut c0v);
             probe.sample_moves(&d1, 1, &active, &mut r1, &mut c1v);
-            probe.apply_step(&r0, &c0v, &r1, &c1v, &active);
             let i0: Vec<i64> = (0..n).map(|k| r0[k] * WIDTH as i64 + c0v[k]).collect();
             let i1: Vec<i64> = (0..n).map(|k| r1[k] * WIDTH as i64 + c1v[k]).collect();
-            r.action_step(&i0, &i1).unwrap();
-            rec.push((r0, c0v, r1, c1v, active));
+            probe.action_step(&i0, &i1).unwrap();
+            rec.push((i0, i1, active));
         }
     }
-
-    let mut g = IncrementalGame::new(n, seed);
-    let mut calls = 0usize;
-    let s = Instant::now();
-    for (r0, c0v, r1, c1v, active) in &rec {
-        g.apply_step(r0, c0v, r1, c1v, active);
-        calls += 1;
-    }
-    t.add("apply_step", s.elapsed().as_secs_f64(), calls, "one move, all games");
-
-    let mut g = IncrementalGame::new(n, seed);
-    let mut gm = 0usize;
-    let s = Instant::now();
-    for (r0, c0v, r1, c1v, active) in &rec {
-        for k in 0..n {
-            if active[k] { g.apply_game(k, r0[k], c0v[k], r1[k], c1v[k]); gm += 1; }
-        }
-    }
-    t.add("apply_game", s.elapsed().as_secs_f64(), gm, "one move, one game");
 
     let mut g = IncrementalGame::new(n, seed);
     let (mut ro, mut co) = (vec![0i64; n], vec![0i64; n]);
     let mut calls = 0usize;
     let s = Instant::now();
-    for (_, _, _, _, active) in &rec {
+    for (_, _, active) in &rec {
         g.sample_moves(&d0, 0, active, &mut ro, &mut co);
         calls += 1;
     }
@@ -162,13 +137,11 @@ fn main() {
     let mut g = IncrementalGame::new(n, seed);
     let mut calls = 0usize;
     let s = Instant::now();
-    for (r0, c0v, r1, c1v, _) in &rec {
-        let i0: Vec<i64> = (0..n).map(|k| r0[k] * WIDTH as i64 + c0v[k]).collect();
-        let i1: Vec<i64> = (0..n).map(|k| r1[k] * WIDTH as i64 + c1v[k]).collect();
-        g.action_step(&i0, &i1).unwrap();
+    for (i0, i1, _) in &rec {
+        g.action_step(i0, i1).unwrap();
         calls += 1;
     }
-    t.add("action_step (+index build)", s.elapsed().as_secs_f64(), calls, "one move, all games");
+    t.add("action_step", s.elapsed().as_secs_f64(), calls, "one move, all games");
 
     t.print(format!("IncrementalGame, {n} games, {reps} reps").as_str());
 

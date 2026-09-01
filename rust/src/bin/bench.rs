@@ -111,16 +111,29 @@ fn main() {
     }
     report("apply_and_score_reference", t.elapsed().as_secs_f64(), recorded.len());
 
+    // The incremental side goes through `action_step`, its public entry point, which also
+    // converts (row, col) to a flat index and range-checks it. That overhead is included on
+    // purpose: applying a move is not something a caller can do any other way.
     let mut inc_game = IncrementalGame::new(n, seed);
+    let flat: Vec<(Vec<i64>, Vec<i64>)> = recorded
+        .iter()
+        .map(|(r0, c0, r1, c1, _)| {
+            (
+                (0..n).map(|g| r0[g] * WIDTH as i64 + c0[g]).collect(),
+                (0..n).map(|g| r1[g] * WIDTH as i64 + c1[g]).collect(),
+            )
+        })
+        .collect();
     let t = Instant::now();
-    for (r0, c0, r1, c1, active) in &recorded {
-        inc_game.apply_step(r0, c0, r1, c1, active);
+    for (i0, i1) in &flat {
+        inc_game.action_step(i0, i1).unwrap();
     }
-    report("apply_and_score_incremental", t.elapsed().as_secs_f64(), recorded.len());
+    report("apply_and_score_incremental", t.elapsed().as_secs_f64(), flat.len());
 
     // the two apply paths must have produced identical results, or the numbers are meaningless
     assert_eq!(inc_game.boards, ref_game.boards, "apply paths diverged");
-    assert_eq!(inc_game.to_reference().scores, ref_game.scores, "apply paths scored differently");
+    let inc_scores: Vec<f32> = inc_game.scores.iter().map(|&s| s as f32).collect();
+    assert_eq!(inc_scores, ref_game.scores, "apply paths scored differently");
 
     // ---- micro-benchmarks on a representative mid-game batch ----
     let mut mid = BatchedLinesGame::new(n, seed ^ 0x5eed);

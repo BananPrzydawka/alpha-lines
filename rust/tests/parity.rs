@@ -11,7 +11,7 @@
 //!
 //! * **Levels.** They are internal to the incremental engine, so the reference has nothing
 //!   to compare against and a corrupt level can sit there until it eventually poisons a
-//!   score. `check_invariants` re-derives every level from scratch and re-scores the board
+//!   score. `check_levels_and_scores` re-derives every level from scratch and re-scores
 //!   with the reference's own scorer, so the internal state is pinned too, not just the
 //!   output.
 //! * **The masks.** The reference builds them by scanning; the incremental engine packs the
@@ -28,9 +28,75 @@
 //! Meant to be run as `cargo test --release`; a debug build is ~50x slower. `PARITY_GAMES`
 //! overrides the batch size.
 
-use alpha_lines_game::incremental::HW;
+use alpha_lines_game::config::{HEIGHT, WIDTH};
+use alpha_lines_game::game_kernels::{score_player, PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK};
+use alpha_lines_game::incremental::{rebuild_levels, Scratch, HW};
 use alpha_lines_game::rng::Rng;
 use alpha_lines_game::{BatchedLinesGame, IncrementalGame};
+
+// ---------------------------------------------------------------- checks the engine does not carry
+//
+// The incremental engine ships no self-verification: re-deriving levels and re-scoring a
+// board is test code, and test code belongs here. Both checkers work off the public surface
+// — `boards`, `levels`, `scores`, `legal_bits` — plus the reference's own scorer, which is
+// what makes them evidence rather than the engine agreeing with itself.
+
+/// Every level must equal what a from-scratch BFS would produce, and every running score
+/// must equal what the reference scorer says about the same board.
+fn check_levels_and_scores(inc: &IncrementalGame, where_: &str) {
+    let mut scratch = Scratch::new();
+    let mut fresh = vec![0u8; HW];
+    for g in 0..inc.n {
+        let cells = &inc.boards[g * HW..(g + 1) * HW];
+        rebuild_levels(cells, &mut fresh, &mut scratch);
+        assert_eq!(
+            &inc.levels[g * HW..(g + 1) * HW],
+            &fresh[..],
+            "{where_}: game {g} levels drifted from a from-scratch rebuild"
+        );
+        for (k, mark) in [PLAYER_0_MARK, PLAYER_1_MARK].into_iter().enumerate() {
+            let want = score_player(cells, 0, mark, HEIGHT, WIDTH) as i32;
+            assert_eq!(
+                inc.scores[g * 2 + k], want,
+                "{where_}: game {g} player {k} running score is wrong"
+            );
+        }
+    }
+}
+
+/// Every legality bit must match the board, and `finished` must match whether any bit is
+/// left. This also pins the bit packing itself, since the two sides are built by different
+/// code.
+fn check_legality(inc: &IncrementalGame, where_: &str) {
+    for g in 0..inc.n {
+        let cells = &inc.boards[g * HW..(g + 1) * HW];
+        let bits = inc.legal_bits(g);
+        let mut any = false;
+        for i in 0..HW {
+            let k = i >> 1;
+            let playable = cells[i] == PLAYABLE_SQUARE;
+            let parity = i % 2 == (i / WIDTH) % 2;
+            let set = parity && bits[k >> 6] >> (k & 63) & 1 == 1;
+            assert_eq!(set, playable, "{where_}: game {g} cell {i} legality bit");
+            any |= playable;
+        }
+        assert_eq!(inc.finished[g], !any, "{where_}: game {g} finished flag");
+    }
+}
+
+/// The incremental engine deliberately knows nothing about the reference type, so the
+/// conversion the comparison needs lives here, in the code doing the comparing.
+fn as_reference(inc: &IncrementalGame) -> BatchedLinesGame {
+    let mut r = BatchedLinesGame::new(inc.n, 0);
+    r.boards.copy_from_slice(&inc.boards);
+    for (dst, &src) in r.scores.iter_mut().zip(inc.scores.iter()) {
+        *dst = src as f32;
+    }
+    r.move_counts.copy_from_slice(&inc.move_counts);
+    r.finished.copy_from_slice(&inc.finished);
+    r
+}
+
 
 /// One uniformly random legal index per game; 0 for finished games, which `action_step`
 /// range-checks but never applies.
@@ -100,20 +166,21 @@ fn the_incremental_engine_matches_the_reference_bit_for_bit() {
         refg.action_step(&idx0, &idx1).unwrap();
         inc.action_step(&idx0, &idx1).unwrap();
 
-        let view = inc.to_reference();
+        let view = as_reference(&inc);
         assert_eq!(view.boards, refg.boards, "boards diverged at step {steps}");
         assert_eq!(view.scores, refg.scores, "scores diverged at step {steps}");
         assert_eq!(view.move_counts, refg.move_counts, "move counts at step {steps}");
         assert_eq!(view.finished, refg.finished, "finished flags at step {steps}");
         assert_eq!(view.get_legal_masks(), refg.get_legal_masks(), "masks at step {steps}");
-        inc.check_invariants().unwrap_or_else(|e| panic!("step {steps}: {e}"));
+        check_levels_and_scores(&inc, &format!("step {steps}"));
+        check_legality(&inc, &format!("step {steps}"));
 
         steps += 1;
         assert!(steps < 200, "rollout did not terminate");
     }
 
     // the terminal outcome is derived state and gets its own comparison, once, at the end
-    assert_eq!(inc.to_reference().get_terminal_outcomes(), refg.get_terminal_outcomes());
+    assert_eq!(as_reference(&inc).get_terminal_outcomes(), refg.get_terminal_outcomes());
 
     // If either half ever stops reaching the interesting paths, fail loudly rather than
     // silently testing nothing. The random half is held to the collision rate free play
@@ -175,8 +242,9 @@ fn the_bitboard_sampler_picks_the_same_moves_as_the_reference_sampler() {
         refg.distribution_step(&d0, &d1);
         inc.distribution_step(&d0, &d1);
         assert_eq!(inc.boards, refg.boards, "sampler diverged at step {steps}");
-        assert_eq!(inc.to_reference().scores, refg.scores, "scores diverged at step {steps}");
-        inc.check_invariants().unwrap_or_else(|e| panic!("step {steps}: {e}"));
+        assert_eq!(as_reference(&inc).scores, refg.scores, "scores diverged at step {steps}");
+        check_levels_and_scores(&inc, &format!("step {steps}"));
+        check_legality(&inc, &format!("step {steps}"));
         steps += 1;
         assert!(steps < 200, "rollout did not terminate");
     }
@@ -241,7 +309,7 @@ fn every_public_call_agrees_with_the_reference() {
         }
 
         // --- everything reached through the reference-shaped view ---
-        let view = inc.to_reference();
+        let view = as_reference(&inc);
         assert_eq!(view.scores, refg.scores, "scores at step {steps}");
         assert_eq!(view.get_legal_masks(), refg.get_legal_masks(), "masks at step {steps}");
         assert_eq!(view.boards, refg.boards, "to_reference boards at step {steps}");
@@ -266,7 +334,7 @@ fn every_public_call_agrees_with_the_reference() {
             inc.move_counts.iter().map(|&m| m.min(1)).collect::<Vec<_>>(),
             "from_state first-move flag at step {steps}"
         );
-        rebuilt.check_invariants().unwrap();
+        check_levels_and_scores(&rebuilt, "from_state");
 
         if refg.finished.iter().all(|&f| f) {
             break;
@@ -278,13 +346,13 @@ fn every_public_call_agrees_with_the_reference() {
     }
 
     // --- terminal-only calls ---
-    let view = inc.to_reference();
+    let view = as_reference(&inc);
     assert_eq!(view.get_terminal_outcomes(), refg.get_terminal_outcomes());
 
     // --- selecting a subset of games must detach the same way from both ---
     let picked: Vec<usize> = (0..n).step_by(3).collect();
     let a = refg.clone_states_to_batch(&picked);
-    let b = inc.to_reference().clone_states_to_batch(&picked);
+    let b = as_reference(&inc).clone_states_to_batch(&picked);
     assert_eq!((a.boards, a.scores, a.move_counts, a.finished),
                (b.boards, b.scores, b.move_counts, b.finished), "clone_states_to_batch");
 
@@ -293,10 +361,11 @@ fn every_public_call_agrees_with_the_reference() {
     let from_ref = BatchedLinesGame::import_prints(&text, 0, seed).unwrap();
     let reimported = IncrementalGame::from_state(from_ref.boards.clone(), seed);
     assert_eq!(reimported.boards, from_ref.boards, "import_prints boards");
-    assert_eq!(reimported.to_reference().scores, from_ref.scores, "import_prints scores");
+    assert_eq!(as_reference(&reimported).scores, from_ref.scores, "import_prints scores");
     assert_eq!(reimported.move_counts, from_ref.move_counts, "import_prints move_counts");
     assert_eq!(reimported.finished, from_ref.finished, "import_prints finished");
-    reimported.check_invariants().unwrap();
+    check_levels_and_scores(&reimported, "import_prints");
+    check_legality(&reimported, "import_prints");
 
     // --- an illegal action must be rejected the same way, with the same message ---
     let mut a = BatchedLinesGame::new(n, seed);
@@ -306,4 +375,67 @@ fn every_public_call_agrees_with_the_reference() {
     assert_eq!(a.boards, b.boards, "a rejected action_step must leave the batch untouched");
 
     println!("{n} games, {steps} steps, every public call compared at every step");
+}
+
+/// `clone_states_to_batch` copies derived state — levels and the legality bitboard — rather
+/// than recomputing it. That is the whole reason it is cheap, and also the whole reason it
+/// can be wrong in a way `from_state` cannot: a copy that drops or shifts a field produces a
+/// batch that looks fine until it is played. So the clone is checked three ways: against a
+/// from-scratch rebuild of the same boards, against its parent field by field, and by being
+/// played forward to make sure it behaves like the games it came from.
+#[test]
+fn a_clone_carries_the_whole_state_and_keeps_playing_correctly() {
+    let n = 256;
+    let seed = 0xc10e_5eedu64;
+    let mut rng = Rng::new(seed);
+    let d0: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+    let d1: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+
+    let mut inc = IncrementalGame::new(n, seed);
+    for _ in 0..12 {
+        inc.distribution_step(&d0, &d1);
+    }
+
+    // naming a game twice must give two independent copies, so the list is deliberately
+    // out of order and has a repeat in it
+    let picked: Vec<usize> = (0..n).step_by(5).chain([3, 3, 1, 0]).collect();
+    let clone = inc.clone_states_to_batch(&picked);
+    assert_eq!(clone.n, picked.len());
+
+    check_levels_and_scores(&clone, "clone");
+    check_legality(&clone, "clone");
+
+    // every field must equal the game it was copied from
+    for (d, &g) in picked.iter().enumerate() {
+        assert_eq!(&clone.boards[d * HW..(d + 1) * HW], &inc.boards[g * HW..(g + 1) * HW],
+                   "clone board {d} <- {g}");
+        assert_eq!(&clone.levels[d * HW..(d + 1) * HW], &inc.levels[g * HW..(g + 1) * HW],
+                   "clone levels {d} <- {g}");
+        assert_eq!(clone.legal_bits(d), inc.legal_bits(g), "clone legality {d} <- {g}");
+        assert_eq!(&clone.scores[d * 2..d * 2 + 2], &inc.scores[g * 2..g * 2 + 2],
+                   "clone scores {d} <- {g}");
+        assert_eq!(clone.move_counts[d], inc.move_counts[g], "clone move_count {d} <- {g}");
+        assert_eq!(clone.finished[d], inc.finished[g], "clone finished {d} <- {g}");
+    }
+
+    // and it must be indistinguishable from adopting the same boards the slow way
+    let rebuilt = IncrementalGame::from_state(clone.boards.clone(), seed);
+    assert_eq!(clone.levels, rebuilt.levels, "clone levels differ from a from-scratch rebuild");
+    assert_eq!(clone.scores, rebuilt.scores, "clone scores differ from a from-scratch rebuild");
+    assert_eq!(clone.finished, rebuilt.finished, "clone finished differs");
+
+    // finally: play it out, and require it to stay correct the whole way
+    let mut clone = clone;
+    let cn = clone.n;
+    let e0: Vec<f32> = (0..cn * HW).map(|_| rng.random() as f32).collect();
+    let e1: Vec<f32> = (0..cn * HW).map(|_| rng.random() as f32).collect();
+    let mut steps = 0;
+    while !clone.finished.iter().all(|&f| f) {
+        clone.distribution_step(&e0, &e1);
+        check_levels_and_scores(&clone, &format!("clone, step {steps}"));
+        check_legality(&clone, &format!("clone, step {steps}"));
+        steps += 1;
+        assert!(steps < 200, "clone did not terminate");
+    }
+    assert!(steps > 10, "the clone finished suspiciously fast");
 }

@@ -95,16 +95,23 @@ fn incremental(n: usize, reps: usize, seed: u64, d0: &[f32], d1: &[f32]) -> Phas
                 break;
             }
 
-            // The incremental engine never builds the masks: the live list already knows
-            // which squares are available, so `masks` is structurally zero here.
+            // The incremental engine never builds the masks: the legality bitboard already
+            // says which squares are available, so `masks` is structurally zero here.
+            //
+            // The apply stage is not timed directly, because applying a move is not part of
+            // the engine's public surface — `distribution_step` is. So the whole step is
+            // timed and the sampler, which *is* public, is timed inside it; the difference is
+            // the apply. `sample_moves` does not consume the RNG the same way twice, so it is
+            // called for its cost and the step is then driven normally.
             let t = Instant::now();
             g.sample_moves(d0, 0, &active, &mut r0, &mut c0);
             g.sample_moves(d1, 1, &active, &mut r1, &mut c1);
-            p.sample += t.elapsed().as_secs_f64();
+            let sampled = t.elapsed().as_secs_f64();
+            p.sample += sampled;
 
             let t = Instant::now();
-            g.apply_step(&r0, &c0, &r1, &c1, &active);
-            p.apply += t.elapsed().as_secs_f64();
+            g.distribution_step(d0, d1);
+            p.apply += (t.elapsed().as_secs_f64() - sampled).max(0.0);
             p.steps += 1;
         }
     }
