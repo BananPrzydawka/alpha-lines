@@ -100,18 +100,9 @@ class StateWriter:
         w(np.ascontiguousarray(mask_1, dtype="<f4").tobytes())
         w(np.ascontiguousarray(count_0, dtype="<f4").tobytes())
         w(np.ascontiguousarray(count_1, dtype="<f4").tobytes())
-        w(np.ascontiguousarray(game.get_encoded_states(0), dtype="<f4").tobytes())
-        w(np.ascontiguousarray(game.get_encoded_states(1), dtype="<f4").tobytes())
         self.records += 1
 
-    def finish(self, outcomes):
-        if outcomes is None:
-            self.f.write(b"\x00")
-        else:
-            p0, p1 = outcomes
-            self.f.write(b"\x01")
-            self.f.write(np.ascontiguousarray(p0, dtype="<i8").tobytes())
-            self.f.write(np.ascontiguousarray(p1, dtype="<i8").tobytes())
+    def finish(self):
         self.f.seek(20)
         self.f.write(struct.pack("<I", self.records))
         self.f.close()
@@ -126,8 +117,6 @@ FIELDS = [
     ("mask_1", "<f4", lambda n: n * HW),
     ("count_0", "<f4", lambda n: n),
     ("count_1", "<f4", lambda n: n),
-    ("encoding_p0", "<f4", lambda n: n * 7 * HW),
-    ("encoding_p1", "<f4", lambda n: n * 7 * HW),
 ]
 
 
@@ -146,17 +135,8 @@ def read_state(path):
             rec[name] = np.frombuffer(raw, dtype=dtype, count=count, offset=off)
             off += nbytes
         out.append(rec)
-    has_outcomes = raw[off]
-    off += 1
-    outcomes = None
-    if has_outcomes:
-        p0 = np.frombuffer(raw, dtype="<i8", count=n, offset=off)
-        off += n * 8
-        p1 = np.frombuffer(raw, dtype="<i8", count=n, offset=off)
-        off += n * 8
-        outcomes = (p0, p1)
     assert off == len(raw), f"{path}: {len(raw) - off} trailing bytes"
-    return n, out, outcomes
+    return n, out
 
 
 # ------------------------------------------------------------------------------- comparison
@@ -166,8 +146,8 @@ class Mismatch(Exception):
 
 
 def compare_states(label, a, b, n):
-    n_a, recs_a, out_a = a
-    n_b, recs_b, out_b = b
+    n_a, recs_a = a
+    n_b, recs_b = b
     if n_a != n_b:
         raise Mismatch(f"{label}: batch size {n_a} vs {n_b}")
     if len(recs_a) != len(recs_b):
@@ -188,30 +168,7 @@ def compare_states(label, a, b, n):
                     f"py={va[i]!r} rs={vb[i]!r}"
                 )
 
-    if (out_a is None) != (out_b is None):
-        raise Mismatch(f"{label}: terminal outcomes present={out_a is not None} vs {out_b is not None}")
-    if out_a is not None:
-        for who, (va, vb) in enumerate(zip(out_a, out_b)):
-            bad = np.flatnonzero(va != vb)
-            if bad.size:
-                i = int(bad[0])
-                raise Mismatch(
-                    f"{label} terminal outcome p{who}: {bad.size} differ; "
-                    f"first at game {i}: py={va[i]} rs={vb[i]}"
-                )
     return len(recs_a)
-
-
-def compare_text(label, path_a, path_b):
-    a = pathlib.Path(path_a).read_text()
-    b = pathlib.Path(path_b).read_text()
-    if a == b:
-        return a.count("\n")
-    la, lb = a.splitlines(), b.splitlines()
-    for i, (x, y) in enumerate(zip(la, lb)):
-        if x != y:
-            raise Mismatch(f"{label}: first difference at line {i + 1}\n  py: {x!r}\n  rs: {y!r}")
-    raise Mismatch(f"{label}: line count {len(la)} vs {len(lb)}")
 
 
 # ------------------------------------------------------------------------------ python side
@@ -221,39 +178,20 @@ def python_replay(moves, out_dir, tag="py"):
     game = batched_lines_game(num_games=n_games)
 
     state = StateWriter(out_dir / f"state_{tag}.bin", n_games)
-    prints_all = []
-
     state.push(game)
-    prints_all.append("=== STEP 0 ===\n" + capture_print(game, 0))
-    prints_step0_p0 = capture_print(game, 0)
-    prints_step0_p1 = capture_print(game, 1)
-
     for step in range(n_steps):
         game.action_step(moves[step, :, 0].astype(np.int64), moves[step, :, 1].astype(np.int64))
         state.push(game)
-        prints_all.append(f"=== STEP {step + 1} ===\n" + capture_print(game, 0))
+    state.finish()
 
-    prints_final_p0 = capture_print(game, 0)
-    prints_final_p1 = capture_print(game, 1)
-
-    outcomes = game.get_terminal_outcomes() if game.finished.all() else None
-    state.finish(outcomes)
-
-    (out_dir / f"prints_all_{tag}.txt").write_text("".join(prints_all))
-    (out_dir / f"prints_step0_p0_{tag}.txt").write_text(prints_step0_p0)
-    (out_dir / f"prints_step0_p1_{tag}.txt").write_text(prints_step0_p1)
-    (out_dir / f"prints_final_p0_{tag}.txt").write_text(prints_final_p0)
-    (out_dir / f"prints_final_p1_{tag}.txt").write_text(prints_final_p1)
-
-    reimport = StateWriter(out_dir / f"reimport_{tag}.bin", n_games)
-    for text, player in (
-        (prints_step0_p0, 0),
-        (prints_step0_p1, 1),
-        (prints_final_p0, 0),
-        (prints_final_p1, 1),
-    ):
-        reimport.push(batched_lines_game.import_prints(text, player))
-    reimport.finish(None)
+    # The Rust side adopts the final boards from scratch and must land on the same state.
+    # The Python equivalent is rendering the final position and importing it back, which is
+    # the only route it has to "here is a board, work out its score".
+    text = capture_print(game, 0)
+    adopted = batched_lines_game.import_prints(text, 0)
+    re = StateWriter(out_dir / f"reimport_{tag}.bin", n_games)
+    re.push(adopted)
+    re.finish()
 
 
 def capture_print(game, player):
@@ -285,7 +223,7 @@ def main():
     tmp = args.out_dir or tempfile.mkdtemp(prefix="alpha-lines-xcheck-")
     out_dir = pathlib.Path(tmp)
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"dump directory: {out_dir}  (rust impl: {args.impl})")
+    print(f"dump directory: {out_dir}")
 
     t = time.perf_counter()
     moves = generate_moves(args.games, args.seed)
@@ -301,7 +239,7 @@ def main():
     t = time.perf_counter()
     res = subprocess.run(
         [str(binary), "--moves", str(out_dir / "moves.bin"), "--out-dir", str(out_dir),
-         "--tag", "rs", "--impl", args.impl],
+         "--tag", "rs"],
         capture_output=True, text=True,
     )
     if res.returncode != 0:
@@ -317,15 +255,10 @@ def main():
                       f"({len(FIELDS)} fields x {args.games} games each)")
 
         steps = compare_states(
-            "reimport", read_state(out_dir / "reimport_py.bin"), read_state(out_dir / "reimport_rs.bin"),
-            args.games,
+            "reimport", read_state(out_dir / "reimport_py.bin"),
+            read_state(out_dir / "reimport_rs.bin"), args.games,
         )
-        checks.append(f"import_prints round-trip identical over {steps} rendered states")
-
-        for name in ("prints_all", "prints_step0_p0", "prints_step0_p1",
-                     "prints_final_p0", "prints_final_p1"):
-            lines = compare_text(name, out_dir / f"{name}_py.txt", out_dir / f"{name}_rs.txt")
-            checks.append(f"{name}: {lines} lines of print_state output identical")
+        checks.append(f"adopting the final board from scratch matches over {steps} states")
     except Mismatch as e:
         print("\nFAIL")
         print(e)
@@ -334,7 +267,7 @@ def main():
     print()
     for c in checks:
         print(f"  ok  {c}")
-    print(f"\nPASS: rust {args.impl} implementation matches main/game.py exactly")
+    print("\nPASS: the rust engine matches main/game.py exactly")
 
     if not args.keep and args.out_dir is None:
         import shutil

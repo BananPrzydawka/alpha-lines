@@ -1,4 +1,12 @@
-//! Port of `main/game_kernels.py`.
+//! The oracle: a port of `main/game_kernels.py`, used only by the tests.
+//!
+//! This is the reference the incremental engine is checked against. It lives in `tests/`
+//! rather than `src/` because it is not part of the product — the engine ships alone — but
+//! it is not throwaway either: it is verified byte-for-byte against the Python by
+//! `xcheck/xcheck.py`, which is what makes agreeing with it evidence of anything.
+//!
+//! It shares no code with the engine, deliberately, down to carrying its own copy of the
+//! RNG. Two implementations that agree are only interesting if they are actually two.
 //!
 //! Same algorithms, same iteration order, same quirks — no improvements. The numba kernels
 //! are compiled with `parallel=game_kernels_parralel`, which is `False` in `main/config.py`,
@@ -10,7 +18,67 @@
 //!   scores   (N, 2)    f32     -> `scores[g * 2 + player]`
 //!   dist     (N, H, W) f32     -> same as masks
 
-use crate::rng::Rng;
+// Kept self-contained: the oracle must not share code with the thing it is checking.
+/// xoshiro256++, seeded through SplitMix64.
+#[derive(Clone, Debug)]
+pub struct Rng {
+    s: [u64; 4],
+}
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        let mut z = seed;
+        let mut next = || {
+            z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut x = z;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^ (x >> 31)
+        };
+        Rng { s: [next(), next(), next(), next()] }
+    }
+
+    #[inline]
+    pub fn next_u64(&mut self) -> u64 {
+        let result = self.s[0]
+            .wrapping_add(self.s[3])
+            .rotate_left(23)
+            .wrapping_add(self.s[0]);
+        let t = self.s[1] << 17;
+        self.s[2] ^= self.s[0];
+        self.s[3] ^= self.s[1];
+        self.s[1] ^= self.s[2];
+        self.s[0] ^= self.s[3];
+        self.s[2] ^= t;
+        self.s[3] = self.s[3].rotate_left(45);
+        result
+    }
+
+    /// `np.random.random()`: a double in [0, 1) with 53 bits of entropy.
+    #[inline]
+    pub fn random(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+
+    /// `np.random.randint(0, n)`: a uniform integer in [0, n), debiased (Lemire).
+    #[inline]
+    pub fn randint(&mut self, n: u64) -> u64 {
+        assert!(n > 0, "randint bound must be positive");
+        let mut x = self.next_u64();
+        let mut m = (x as u128) * (n as u128);
+        let mut l = m as u64;
+        if l < n {
+            let threshold = n.wrapping_neg() % n;
+            while l < threshold {
+                x = self.next_u64();
+                m = (x as u128) * (n as u128);
+                l = m as u64;
+            }
+        }
+        (m >> 64) as u64
+    }
+}
+
 
 pub const NON_PLAYABLE_SQUARE: i8 = 0;
 pub const PLAYABLE_SQUARE: i8 = 1;

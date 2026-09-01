@@ -1,4 +1,4 @@
-//! Per-call cost of every public function on both engines.
+//! Per-call cost of every public function on the engine.
 //!
 //! The rollout benchmarks answer "how fast is a game"; this answers "how fast is a call",
 //! which is the question that matters to whatever drives the engine from outside. Pure
@@ -18,10 +18,8 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use alpha_lines_game::config::{HEIGHT, WIDTH};
-use alpha_lines_game::incremental::HW;
-use alpha_lines_game::rng::Rng;
-use alpha_lines_game::{BatchedLinesGame, IncrementalGame};
+use alpha_lines_game::incremental::{Rng, HEIGHT, HW, WIDTH};
+use alpha_lines_game::IncrementalGame;
 
 fn arg_usize(args: &[String], key: &str, default: usize) -> usize {
     args.iter()
@@ -61,24 +59,13 @@ fn main() {
     let d0: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
     let d1: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
 
-    // A mid-game batch for the pure accessors, and a played-out one for the terminal call.
-    let mut mid_ref = BatchedLinesGame::new(n, seed);
+    // A mid-game batch: the pure accessors are timed on a board that has been played into,
+    // not on the opening position, where the fast paths are unrepresentative.
     let mut mid_inc = IncrementalGame::new(n, seed);
     for _ in 0..warmup {
-        mid_ref.distribution_step(&d0, &d1);
         mid_inc.distribution_step(&d0, &d1);
     }
-    assert_eq!(mid_inc.boards, mid_ref.boards, "the two engines diverged during warmup");
-
-    let mut done_ref = mid_ref.clone_states_to_batch(&(0..n).collect::<Vec<_>>());
-    let mut done_inc = IncrementalGame::from_state(mid_inc.boards.clone(), 0);
-    while !done_ref.finished.iter().all(|&f| f) {
-        done_ref.distribution_step(&d0, &d1);
-        done_inc.distribution_step(&d0, &d1);
-    }
-
     let idx: Vec<usize> = (0..n).step_by(2).collect();
-    let printed = mid_ref.format_state(Some(&idx[..4.min(idx.len())]), 0);
 
     // ---------------------------------------------------------------- incremental engine
     let mut t = Table { n, rows: Vec::new() };
@@ -168,52 +155,6 @@ fn main() {
 
     t.print(format!("IncrementalGame, {n} games, {reps} reps").as_str());
 
-    // ------------------------------------------------------------------ reference engine
-    let mut t = Table { n, rows: Vec::new() };
-
-    let s = Instant::now();
-    for _ in 0..reps { black_box(BatchedLinesGame::new(black_box(n), seed)); }
-    t.add("new", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let s = Instant::now();
-    for _ in 0..reps { black_box(mid_ref.get_legal_masks()); }
-    t.add("get_legal_masks", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let s = Instant::now();
-    for _ in 0..reps { black_box(mid_ref.raw_masks()); }
-    t.add("raw_masks", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-
-    let s = Instant::now();
-    for _ in 0..reps { black_box(mid_ref.get_encoded_states(black_box(0))); }
-    t.add("get_encoded_states", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let s = Instant::now();
-    for _ in 0..reps { black_box(done_ref.get_terminal_outcomes()); }
-    t.add("get_terminal_outcomes", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let s = Instant::now();
-    for _ in 0..reps { black_box(mid_ref.clone_states_to_batch(black_box(&idx))); }
-    t.add("clone_states_to_batch (n/2)", s.elapsed().as_secs_f64(), reps, "half the batch");
-
-    let s = Instant::now();
-    for _ in 0..reps { black_box(mid_ref.format_state(Some(black_box(&idx)), 0)); }
-    t.add("format_state (n/2 games)", s.elapsed().as_secs_f64(), reps, "half the batch");
-
-    let s = Instant::now();
-    for _ in 0..reps {
-        black_box(BatchedLinesGame::import_prints(black_box(&printed), 0, 0).unwrap());
-    }
-    t.add("import_prints (4 games)", s.elapsed().as_secs_f64(), reps, "4 games");
-
-    let mut g = BatchedLinesGame::new(n, seed);
-    let mut steps = 0usize;
-    let s = Instant::now();
-    while !g.finished.iter().all(|&f| f) { g.distribution_step(&d0, &d1); steps += 1; }
-    t.add("distribution_step", s.elapsed().as_secs_f64(), steps, "one move, all games");
-
-    t.print(format!("BatchedLinesGame (reference), {n} games, {reps} reps").as_str());
 
     println!("\n(HEIGHT x WIDTH = {HEIGHT} x {WIDTH}, batch of {n} games)");
-    let _ = &done_inc;
 }

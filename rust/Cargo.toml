@@ -2,10 +2,10 @@
 name = "alpha_lines_game"
 version = "0.1.0"
 edition = "2021"
-description = "Reference Rust port of the alpha-lines batched game (main/game.py + main/game_kernels.py)"
+description = "Incremental scorer for the alpha-lines batched game"
 
-# Deliberately zero dependencies: this crate is the reference implementation and must
-# build and run identically anywhere, without a crates.io fetch.
+# Deliberately zero dependencies: the engine is one self-contained file and must build and
+# run identically anywhere, without a crates.io fetch.
 [dependencies]
 
 [profile.release]

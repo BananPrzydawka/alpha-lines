@@ -1,15 +1,13 @@
-//! Reference Rust port of the alpha-lines batched game.
+//! The alpha-lines batched game engine.
 //!
-//! A straight translation of `main/game.py` and `main/game_kernels.py` with no algorithmic
-//! changes, intended as the baseline that future optimized implementations are measured
-//! against for both correctness and speed.
+//! One implementation: a level-based incremental scorer that maintains each board's score
+//! as moves are applied, instead of rescoring from scratch. See [`incremental`] for how the
+//! levels work and why they cannot form a cycle.
+//!
+//! The module has no internal dependencies — board shape, square encoding and RNG are all
+//! defined in it — so it can be lifted out of this crate as a single file. The port of the
+//! original numba kernels it was checked against lives in `tests/oracle`, not here.
 
-pub mod config;
-pub mod game;
-pub mod game_kernels;
 pub mod incremental;
-pub mod rng;
 
-pub use config::{BOARD_SIZE, HEIGHT, WIDTH};
-pub use game::BatchedLinesGame;
-pub use incremental::IncrementalGame;
+pub use incremental::{IncrementalGame, HEIGHT, HW, WIDTH};

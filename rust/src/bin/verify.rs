@@ -1,21 +1,22 @@
-//! Cross-check driver: replays a move file produced by the Python side and dumps every
-//! observable piece of state, so `rust/xcheck/xcheck.py` can diff the two implementations
-//! field by field.
+//! Cross-check driver: replays a move file produced by the Python side and dumps the
+//! engine's whole observable state, so `rust/xcheck/xcheck.py` can diff it against
+//! `main/game.py` field by field.
 //!
 //! Usage:
-//!   verify --moves <moves.bin> --out-dir <dir> --tag <tag> [--impl reference|incremental]
+//!   verify --moves <moves.bin> --out-dir <dir> --tag <tag>
 //!
-//! `--impl incremental` runs the same replay through the level-based incremental scorer,
-//! so it is checked against the Python directly and not only against the reference port.
+//! The dump is boards, scores, move counts, terminal flags and legality — everything the
+//! engine owns. The Python's encoding and rendering have no counterpart here, because the
+//! engine does not implement them; they are the caller's job.
 //!
-//! Binary formats (little-endian throughout) are documented in `rust/xcheck/README.md`.
+//! Binary formats are little-endian throughout.
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::PathBuf;
 
-use alpha_lines_game::config::{HEIGHT, WIDTH};
-use alpha_lines_game::{BatchedLinesGame, IncrementalGame};
+use alpha_lines_game::incremental::{HEIGHT, HW, WIDTH};
+use alpha_lines_game::IncrementalGame;
 
 const STATE_MAGIC: &[u8; 4] = b"ALST";
 const MOVES_MAGIC: &[u8; 4] = b"ALMV";
@@ -52,6 +53,35 @@ fn read_moves(path: &PathBuf) -> Moves {
     Moves { n, n_steps, data }
 }
 
+/// Expand the engine's 80-bit legality words into the dense masks the Python produces, so
+/// the two can be compared at all. The engine has no reason to do this itself; a caller that
+/// needs a mask for a policy network builds it once, in the shape that network wants.
+fn dense_masks(inc: &IncrementalGame) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let half = WIDTH / 2;
+    let (mut m0, mut m1) = (vec![0.0f32; inc.n * HW], vec![0.0f32; inc.n * HW]);
+    let (mut c0, mut c1) = (vec![0.0f32; inc.n], vec![0.0f32; inc.n]);
+    for g in 0..inc.n {
+        let bits = inc.legal_bits(g);
+        let first = inc.move_counts[g] == 0;
+        for i in 0..HW {
+            let k = i >> 1;
+            if i % 2 != (i / WIDTH) % 2 || bits[k >> 6] >> (k & 63) & 1 == 0 {
+                continue;
+            }
+            let c = i % WIDTH;
+            if !(first && c >= half) {
+                m0[g * HW + i] = 1.0;
+                c0[g] += 1.0;
+            }
+            if !(first && c < half) {
+                m1[g * HW + i] = 1.0;
+                c1[g] += 1.0;
+            }
+        }
+    }
+    (m0, m1, c0, c1)
+}
+
 struct StateWriter {
     w: BufWriter<File>,
     records: u32,
@@ -69,14 +99,13 @@ impl StateWriter {
         StateWriter { w, records: 0, path, n }
     }
 
-    fn push(&mut self, game: &BatchedLinesGame) {
+    fn push(&mut self, game: &IncrementalGame) {
         assert_eq!(game.n, self.n, "record batch size mismatch");
-        let (m0, m1, c0, c1) = game.get_legal_masks();
-        let e0 = game.get_encoded_states(0);
-        let e1 = game.get_encoded_states(1);
+        let (m0, m1, c0, c1) = dense_masks(game);
+        let scores: Vec<f32> = game.scores.iter().map(|&s| s as f32).collect();
 
         write_i8(&mut self.w, &game.boards);
-        write_f32(&mut self.w, &game.scores);
+        write_f32(&mut self.w, &scores);
         write_i32(&mut self.w, &game.move_counts);
         let fin: Vec<u8> = game.finished.iter().map(|&f| f as u8).collect();
         self.w.write_all(&fin).unwrap();
@@ -84,21 +113,10 @@ impl StateWriter {
         write_f32(&mut self.w, &m1);
         write_f32(&mut self.w, &c0);
         write_f32(&mut self.w, &c1);
-        write_f32(&mut self.w, &e0);
-        write_f32(&mut self.w, &e1);
         self.records += 1;
     }
 
-    /// Optional trailer: `1u8` + the two terminal-outcome arrays, or `0u8`.
-    fn finish(mut self, outcomes: Option<(Vec<i64>, Vec<i64>)>) {
-        match outcomes {
-            Some((p0, p1)) => {
-                self.w.write_all(&[1u8]).unwrap();
-                write_i64(&mut self.w, &p0);
-                write_i64(&mut self.w, &p1);
-            }
-            None => self.w.write_all(&[0u8]).unwrap(),
-        }
+    fn finish(mut self) {
         self.w.flush().unwrap();
         drop(self.w);
         // patch the record count into the header
@@ -128,33 +146,12 @@ fn write_i32<W: Write>(w: &mut W, v: &[i32]) {
     }
     w.write_all(&buf).unwrap();
 }
-fn write_i64<W: Write>(w: &mut W, v: &[i64]) {
-    let mut buf = Vec::with_capacity(v.len() * 8);
-    for x in v {
-        buf.extend_from_slice(&x.to_le_bytes());
-    }
-    w.write_all(&buf).unwrap();
-}
-
 fn arg(args: &[String], key: &str) -> Option<String> {
     args.iter().position(|a| a == key).map(|i| {
         args.get(i + 1)
             .unwrap_or_else(|| panic!("{key} needs a value"))
             .clone()
     })
-}
-
-/// The incremental engine does not know the reference type exists, so the conversion this
-/// tool needs to reuse the reference's dumping and rendering lives here.
-fn as_reference(inc: &IncrementalGame) -> BatchedLinesGame {
-    let mut r = BatchedLinesGame::new(inc.n, 0);
-    r.boards.copy_from_slice(&inc.boards);
-    for (dst, &src) in r.scores.iter_mut().zip(inc.scores.iter()) {
-        *dst = src as f32;
-    }
-    r.move_counts.copy_from_slice(&inc.move_counts);
-    r.finished.copy_from_slice(&inc.finished);
-    r
 }
 
 fn main() {
@@ -164,110 +161,31 @@ fn main() {
     let tag = arg(&args, "--tag").unwrap_or_else(|| "rs".to_string());
     std::fs::create_dir_all(&out_dir).expect("create out dir");
 
-    let implementation = arg(&args, "--impl").unwrap_or_else(|| "reference".to_string());
-    let incremental = match implementation.as_str() {
-        "reference" => false,
-        "incremental" => true,
-        other => panic!("unknown --impl {other:?}; expected reference or incremental"),
-    };
-
     let moves = read_moves(&moves_path);
-    // Both paths dump through the reference-shaped state, so the encoding, rendering and
-    // terminal-outcome code under test is identical and only the scorer differs.
-    let mut driver = Driver::new(incremental, moves.n);
-    let mut game = driver.snapshot();
-
+    let mut game = IncrementalGame::new(moves.n, 0);
     let mut state = StateWriter::create(out_dir.join(format!("state_{tag}.bin")), moves.n);
-    let mut prints_all = String::new();
 
     // record 0 is the initial state, before any move
     state.push(&game);
-    prints_all.push_str(&format!("=== STEP 0 ===\n"));
-    prints_all.push_str(&game.format_state(None, 0));
-    let prints_step0_p0 = game.format_state(None, 0);
-    let prints_step0_p1 = game.format_state(None, 1);
 
     for step in 0..moves.n_steps {
         let off = step * moves.n * 2;
         let idx_0: Vec<i64> = (0..moves.n).map(|g| moves.data[off + g * 2] as i64).collect();
         let idx_1: Vec<i64> = (0..moves.n).map(|g| moves.data[off + g * 2 + 1] as i64).collect();
-        if let Err(e) = driver.action_step(&idx_0, &idx_1) {
+        if let Err(e) = game.action_step(&idx_0, &idx_1) {
             eprintln!("action_step failed at step {step}: {e}");
             std::process::exit(2);
         }
-        game = driver.snapshot();
         state.push(&game);
-        prints_all.push_str(&format!("=== STEP {} ===\n", step + 1));
-        prints_all.push_str(&game.format_state(None, 0));
     }
+    state.finish();
 
-    let prints_final_p0 = game.format_state(None, 0);
-    let prints_final_p1 = game.format_state(None, 1);
+    // Adopting the final boards from scratch has to land on the same state the engine
+    // reached by playing there, which is what checks `from_state` against the Python too.
+    let adopted = IncrementalGame::from_state(game.boards.clone(), 0);
+    let mut re = StateWriter::create(out_dir.join(format!("reimport_{tag}.bin")), moves.n);
+    re.push(&adopted);
+    re.finish();
 
-    let outcomes = if game.finished.iter().all(|&f| f) {
-        Some(game.get_terminal_outcomes())
-    } else {
-        None
-    };
-    state.finish(outcomes);
-
-    std::fs::write(out_dir.join(format!("prints_all_{tag}.txt")), &prints_all).unwrap();
-    std::fs::write(out_dir.join(format!("prints_step0_p0_{tag}.txt")), &prints_step0_p0).unwrap();
-    std::fs::write(out_dir.join(format!("prints_step0_p1_{tag}.txt")), &prints_step0_p1).unwrap();
-    std::fs::write(out_dir.join(format!("prints_final_p0_{tag}.txt")), &prints_final_p0).unwrap();
-    std::fs::write(out_dir.join(format!("prints_final_p1_{tag}.txt")), &prints_final_p1).unwrap();
-
-    // round-trip: import_prints on each of the four rendered texts
-    let mut reimport = StateWriter::create(out_dir.join(format!("reimport_{tag}.bin")), moves.n);
-    for (text, player) in [
-        (&prints_step0_p0, 0usize),
-        (&prints_step0_p1, 1usize),
-        (&prints_final_p0, 0usize),
-        (&prints_final_p1, 1usize),
-    ] {
-        let g = BatchedLinesGame::import_prints(text, player, 0)
-            .unwrap_or_else(|e| panic!("import_prints(player={player}) failed: {e}"));
-        // For the incremental scorer, re-derive levels and scores from the imported board
-        // alone, so `from_state` is verified against the Python too.
-        let g = if incremental {
-            as_reference(&IncrementalGame::from_state(g.boards, 0))
-        } else {
-            g
-        };
-        reimport.push(&g);
-    }
-    reimport.finish(None);
-
-    println!("rust replay ok ({}): {} games, {} steps", implementation, moves.n, moves.n_steps);
-}
-
-/// Runs the replay through whichever scorer was selected, exposing a single shape to the
-/// dumping code above.
-enum Driver {
-    Reference(BatchedLinesGame),
-    Incremental(IncrementalGame),
-}
-
-impl Driver {
-    fn new(incremental: bool, n: usize) -> Self {
-        if incremental {
-            Driver::Incremental(IncrementalGame::new(n, 0))
-        } else {
-            Driver::Reference(BatchedLinesGame::new(n, 0))
-        }
-    }
-
-    fn action_step(&mut self, idx_0: &[i64], idx_1: &[i64]) -> Result<(), String> {
-        match self {
-            Driver::Reference(g) => g.action_step(idx_0, idx_1),
-            Driver::Incremental(g) => g.action_step(idx_0, idx_1),
-        }
-    }
-
-    fn snapshot(&self) -> BatchedLinesGame {
-        match self {
-            Driver::Reference(g) => g.clone(),
-            Driver::Incremental(g) => as_reference(g),
-        }
-    }
+    println!("rust replay ok: {} games, {} steps", moves.n, moves.n_steps);
 }
