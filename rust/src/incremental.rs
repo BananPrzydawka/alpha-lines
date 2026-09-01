@@ -43,9 +43,11 @@
 //! [`check_invariants`] asserts all of this directly; the tests run it after every move.
 
 use crate::config::{HEIGHT, WIDTH};
-// `legal_masks_kernel` is still reused for `get_legal_masks`, which MCTS needs to mask the
-// policy network. The rollout path no longer calls it, and no longer uses the reference
-// sampler at all — see `sample_live`.
+// Two things are still borrowed from the reference kernels, neither of them on the rollout
+// path. `legal_masks_kernel` backs `get_legal_masks`, which MCTS needs to mask the policy
+// network; the rollout no longer calls it, and no longer uses the reference sampler at all
+// (see `sample_live`). `score_player` is used only by `check_invariants`, as an independent
+// oracle — the engine's own scorer would be no evidence about itself.
 use crate::game_kernels::{
     legal_masks_kernel, score_player, NON_PLAYABLE_SQUARE, PLAYABLE_SQUARE, PLAYER_0_MARK,
     PLAYER_1_MARK, REMOVED_SQUARE,
@@ -554,37 +556,49 @@ fn walk_component(cells: &[i8], seed: usize, p: i8, s: &mut Scratch, out: &mut V
 /// in a qualifying run of *both* families is counted twice — that is intended, and matches
 /// the reference.
 fn contribution(cells: &[i8], level: &[u8], cells_of_interest: &[u16], p: i8) -> i32 {
+    cells_of_interest
+        .iter()
+        .map(|&ci| runs_starting_at(cells, level, ci as usize, p))
+        .sum()
+}
+
+/// The same scorer applied to every square, which is the whole board's score for `p`.
+///
+/// Only used when adopting a board the engine did not build itself; the running score is
+/// maintained incrementally everywhere else.
+fn score_board(cells: &[i8], level: &[u8], p: i8) -> i32 {
+    (0..HW).map(|i| runs_starting_at(cells, level, i, p)).sum()
+}
+
+/// Score of the runs that *begin* at `i`, in either family. Zero if `i` holds no mark of
+/// `p`, if the run continues backwards through `i` (so some earlier cell owns it), if the
+/// run is shorter than 2, or if it cannot reach the border.
+fn runs_starting_at(cells: &[i8], level: &[u8], i: usize, p: i8) -> i32 {
+    if cells[i] != p {
+        return 0; // empty, removed, the other player's, or a cell dropped since collection
+    }
     let mut total = 0i32;
-    for &ci in cells_of_interest {
-        let i = ci as usize;
-        if cells[i] != p {
-            continue; // the cell was removed since the component was collected
+    for v in FAMILIES {
+        let back = (-v.0, -v.1);
+        if mark_at(cells, i, back, p) {
+            continue; // not the first cell of this run
         }
-        for v in FAMILIES {
-            let back = (-v.0, -v.1);
-            if mark_at(cells, i, back, p) {
-                continue; // not the first cell of this run
+        let mut run_len = 1i32;
+        let mut cur = i;
+        while let Some(n) = step(cur, v) {
+            if cells[n] != p {
+                break;
             }
-            let mut run_len = 1i32;
-            let mut cur = i;
-            while let Some(n) = step(cur, v) {
-                if cells[n] != p {
-                    break;
-                }
-                run_len += 1;
-                cur = n;
-            }
-            if run_len >= 2 && level[i] != INF {
-                total += run_len;
-            }
+            run_len += 1;
+            cur = n;
+        }
+        if run_len >= 2 && level[i] != INF {
+            total += run_len;
         }
     }
     total
 }
 
-/// Run length on one side of a cell, clamped to `{0, 1, 2}` where 2 means "two or more".
-/// The local delta below never needs to distinguish beyond that, so this is two lookups.
-#[inline]
 fn run_side(cells: &[i8], i: usize, v: (i64, i64), p: i8) -> i32 {
     match step(i, v) {
         Some(a) if cells[a] == p => match step(a, v) {
@@ -1048,8 +1062,8 @@ impl IncrementalGame {
             let cells = &g.boards[i * HW..(i + 1) * HW];
             let level = &mut g.levels[i * HW..(i + 1) * HW];
             rebuild_levels(cells, level, &mut g.scratch);
-            g.scores[i * 2] = score_player(cells, 0, PLAYER_0_MARK, HEIGHT, WIDTH) as i32;
-            g.scores[i * 2 + 1] = score_player(cells, 0, PLAYER_1_MARK, HEIGHT, WIDTH) as i32;
+            g.scores[i * 2] = score_board(cells, level, PLAYER_0_MARK);
+            g.scores[i * 2 + 1] = score_board(cells, level, PLAYER_1_MARK);
         }
         g
     }
