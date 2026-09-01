@@ -96,6 +96,29 @@ fn main() {
     for _ in 0..reps { for g in 0..n { black_box(mid_inc.legal_bits(black_box(g))); } }
     t.add("legal_bits (every game)", s.elapsed().as_secs_f64(), reps, "whole batch");
 
+    // A yardstick: copying the whole batch state, with no work done on it. Everything above
+    // and below has to move at least this much, so it says whether a call is anywhere near
+    // being limited by memory rather than by what it computes.
+    let state_bytes = mid_inc.boards.len() + mid_inc.levels.len() + n * 16 + n * 8 + n * 4 + n;
+    let mut sink_b = mid_inc.boards.clone();
+    let mut sink_l = mid_inc.levels.clone();
+    let s = Instant::now();
+    for _ in 0..reps {
+        sink_b.copy_from_slice(black_box(&mid_inc.boards));
+        sink_l.copy_from_slice(black_box(&mid_inc.levels));
+        black_box(&sink_b);
+        black_box(&sink_l);
+    }
+    let copy = s.elapsed().as_secs_f64() / reps as f64;
+    t.add("memcpy boards+levels (yardstick)", s.elapsed().as_secs_f64(), reps, "whole batch");
+    println!(
+        "(batch state is {} KB; copying the {} KB of boards+levels takes {:.1}us, ~{:.1} GB/s)",
+        state_bytes / 1024,
+        (mid_inc.boards.len() + mid_inc.levels.len()) / 1024,
+        copy * 1e6,
+        (mid_inc.boards.len() + mid_inc.levels.len()) as f64 * 2.0 / copy / 1e9,
+    );
+
     let s = Instant::now();
     for _ in 0..reps { black_box(mid_inc.clone_states_to_batch(black_box(&idx))); }
     t.add("clone_states_to_batch (n/2)", s.elapsed().as_secs_f64(), reps, "half the batch");
