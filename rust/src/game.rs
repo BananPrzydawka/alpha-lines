@@ -1,9 +1,12 @@
-//! Incremental, level-based scoring.
+//! The game: one board, scored incrementally.
 //!
-//! The reference implementation (`game_kernels::score_player`) rescores a board from
-//! scratch after every move: a flood fill from the border plus two full diagonal scans.
-//! This module maintains the same score incrementally instead, so a move usually costs a
-//! handful of neighbour lookups rather than an O(H*W) rescan.
+//! [`Game`] is the whole public surface — a position, the moves that are legal in it, and
+//! the two ways to pick one. Everything above it in this file is the scorer it is built on.
+//!
+//! The reference implementation this replaced (`game_kernels::score_player`) rescores a
+//! board from scratch after every move: a flood fill from the border plus two full diagonal
+//! scans. This module maintains the same score incrementally instead, so a move usually
+//! costs a handful of neighbour lookups rather than an O(H*W) rescan.
 //!
 //! # What is stored
 //!
@@ -43,9 +46,9 @@
 //! The tests re-derive all of it from scratch after every move and compare.
 
 // This module has no dependencies on the rest of the crate: the board shape, the square
-// encoding and the RNG are all defined here. They are duplicated in the reference port,
-// which is the thing being replaced; the tests assert the two definitions still agree, so
-// they cannot drift apart while both exist.
+// encoding and the RNG are all defined here, so the file can be lifted out whole. They are
+// duplicated in the reference port under `tests/`; the tests assert the two definitions
+// still agree, so they cannot drift apart while both exist.
 
 /// Board shape. Every square with `(r + c)` even is playable — 80 of the 160.
 pub const HEIGHT: usize = 10;
@@ -557,7 +560,7 @@ fn local_delta(cells: &[i8], i: usize, p: i8) -> i32 {
 // ---------------------------------------------------------------------------- insertion
 
 /// Place `p`'s mark on the empty square `i`, updating levels and the running score.
-pub fn insert(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, p: i8, s: &mut Scratch) {
+fn insert(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, p: i8, s: &mut Scratch) {
     debug_assert_eq!(cells[i], PLAYABLE_SQUARE, "insert onto a non-playable square");
 
     let lvl = computed_level(cells, level, i, p);
@@ -619,7 +622,7 @@ pub fn insert(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, p
 
 /// Clear square `i`, updating levels and the running score. Handles empty and already
 /// removed squares as no-ops beyond the state write.
-pub fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s: &mut Scratch) {
+fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s: &mut Scratch) {
     let p = cells[i];
     if p != PLAYER_0_MARK && p != PLAYER_1_MARK {
         cells[i] = REMOVED_SQUARE;
@@ -685,17 +688,17 @@ pub fn remove(cells: &mut [i8], level: &mut [u8], score: &mut [i32], i: usize, s
 /// centre between them, so they lie in different runs and the order cannot matter. Each
 /// victim is handled under whichever player happens to own it.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_move(
+fn apply_move(
     cells: &mut [i8],
     level: &mut [u8],
     score: &mut [i32],
     legal: &mut [u64],
-    (r0, c0): (usize, usize),
-    (r1, c1): (usize, usize),
+    i0: usize,
+    i1: usize,
     s: &mut Scratch,
 ) {
-    if (r0, c0) == (r1, c1) {
-        let centre = r0 * WIDTH + c0;
+    if i0 == i1 {
+        let centre = i0;
         clear_legal(legal, centre);
         remove(cells, level, score, centre, s);
         for d in DIAG {
@@ -705,7 +708,6 @@ pub fn apply_move(
             }
         }
     } else {
-        let (i0, i1) = (r0 * WIDTH + c0, r1 * WIDTH + c1);
         clear_legal(legal, i0);
         clear_legal(legal, i1);
         insert(cells, level, score, i0, PLAYER_0_MARK, s);
@@ -770,81 +772,221 @@ fn clear_legal(legal: &mut [u64], i: usize) {
     legal[w] &= !b;
 }
 
-/// Sample one move per active game from `dist`, restricted to the still-playable squares
-/// plus the first-move half-board rule.
-///
-/// This replaces `game_kernels::sample_move_kernel` for the incremental engine. Same
-/// distribution, same RNG draws in the same order — but instead of walking all 160 squares
-/// twice against a materialized f32 mask, it walks only the set bits, and the half-board
-/// rule is folded into the words before the loop rather than tested per square.
-#[allow(clippy::too_many_arguments)]
-fn sample_bits(
-    dist: &[f32],
-    legal: &[u64],
-    active: &[bool],
-    move_counts: &[i32],
-    n: usize,
-    player: usize,
-    rng: &mut Rng,
-    r_out: &mut [i64],
-    c_out: &mut [i64],
-) {
-    for g in 0..n {
-        r_out[g] = 0;
-        c_out[g] = 0;
-        if !active[g] {
-            continue;
-        }
-        let base = g * HW;
-        let half = if move_counts[g] == 0 {
-            if player == 0 {
-                LEGAL_LEFT
-            } else {
-                LEGAL_RIGHT
+
+// ------------------------------------------------------------------------- single game
+
+/// The opening position, laid out once at compile time so `Game::new` is a memcpy.
+const OPENING: [i8; HW] = {
+    let mut a = [NON_PLAYABLE_SQUARE; HW];
+    let mut r = 0;
+    while r < HEIGHT {
+        let mut c = 0;
+        while c < WIDTH {
+            if (r + c) % 2 == 0 {
+                a[r * WIDTH + c] = PLAYABLE_SQUARE;
             }
-        } else {
-            LEGAL_ALL
+            c += 1;
+        }
+        r += 1;
+    }
+    a
+};
+
+/// One game, as a plain value.
+///
+/// Every field is a fixed-size array, so a position is ~350 bytes with no indirection and no
+/// allocation: clone it into a tree node, play it forward, throw it away. The [`Scratch`] is
+/// deliberately *not* part of it — that is working memory, not state, and a search holding
+/// thousands of positions wants one workspace, not thousands, so it is lent to every call
+/// that needs it.
+///
+/// The board also carries the derived state the scorer needs, which is what makes a fork a
+/// memcpy rather than a rebuild: `levels` and the running `scores` come across with the
+/// cells, so a clone costs nothing beyond the copy while [`Self::from_cells`] — adopting a
+/// bare board — has to pay for a global BFS and a full rescore.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Game {
+    /// The board, row-major, in the encoding at the top of this file.
+    pub cells: [i8; HW],
+    /// Steps to the border through own marks, parallel to `cells`. See the module docs.
+    pub levels: [u8; HW],
+    /// Running score, integer because every score is a sum of run lengths.
+    pub scores: [i32; 2],
+    /// Only ever compared against zero, to apply the opening-move half-board rule.
+    pub move_count: u32,
+    pub finished: bool,
+    legal: [u64; LEGAL_WORDS],
+}
+
+impl Default for Game {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Game {
+    /// The opening position: 80 playable squares, nothing played.
+    pub fn new() -> Self {
+        Game {
+            cells: OPENING,
+            levels: [INF; HW],
+            scores: [0; 2],
+            move_count: 0,
+            finished: false,
+            legal: LEGAL_ALL,
+        }
+    }
+
+    /// Adopt an arbitrary board. The board *is* the state: levels come from the one global
+    /// BFS, scores from a full rescan, legality from a scan for playable squares.
+    ///
+    /// The two flags are derived rather than supplied. A game is finished exactly when no
+    /// playable square is left, and it is on its opening move exactly when nothing has been
+    /// played — no marks and no blasted squares. So `move_count` comes back as 0 or 1 and
+    /// not as the number of moves that actually made this board, which the board does not
+    /// record; the half-board rule only ever asks which of the two it is. This is the same
+    /// rule the Python applies when it imports a printed board.
+    pub fn from_cells(cells: [i8; HW], s: &mut Scratch) -> Self {
+        let mut g = Game {
+            cells,
+            levels: [INF; HW],
+            scores: [0; 2],
+            move_count: 0,
+            finished: false,
+            legal: [0; LEGAL_WORDS],
         };
-        let words = [
-            legal[g * LEGAL_WORDS] & half[0],
-            legal[g * LEGAL_WORDS + 1] & half[1],
+        for i in 0..HW {
+            if g.cells[i] == PLAYABLE_SQUARE {
+                let (w, b) = legal_bit(i);
+                g.legal[w] |= b;
+            }
+        }
+        let played = g
+            .cells
+            .iter()
+            .any(|&v| v != PLAYABLE_SQUARE && v != NON_PLAYABLE_SQUARE);
+        g.move_count = u32::from(played);
+        g.finished = g.no_moves_left();
+        rebuild_levels(&g.cells, &mut g.levels, s);
+        g.scores = [
+            score_board(&g.cells, &g.levels, PLAYER_0_MARK),
+            score_board(&g.cells, &g.levels, PLAYER_1_MARK),
         ];
+        g
+    }
 
-        // Two words, unrolled: the second holds only 16 bits and is usually empty by the
-        // midgame, so a loop over them would spend its time on the branch, not the work.
-        let mut total: f64 = 0.0;
-        let mut w = words[0];
-        while w != 0 {
-            let k = w.trailing_zeros() as usize;
-            w &= w - 1;
-            total += dist[base + legal_cell(k)] as f64;
-        }
-        let mut w = words[1];
-        while w != 0 {
-            let k = 64 + w.trailing_zeros() as usize;
-            w &= w - 1;
-            total += dist[base + legal_cell(k)] as f64;
-        }
+    /// An empty bitboard is exactly "no playable square left".
+    #[inline]
+    fn no_moves_left(&self) -> bool {
+        self.legal[0] == 0 && self.legal[1] == 0
+    }
 
-        // Same degenerate branch as the reference kernel: an unmasked uniform draw over the
-        // whole board. Kept so the RNG is consumed identically.
+    /// Every square still playable, ignoring whose turn it is.
+    #[inline]
+    pub fn legal_bits(&self) -> [u64; LEGAL_WORDS] {
+        self.legal
+    }
+
+    /// The squares `player` may actually play right now: the playable set, narrowed to this
+    /// player's half on the opening move. One `AND` per word — see [`LEGAL_LEFT`].
+    #[inline]
+    pub fn legal_moves(&self, player: usize) -> [u64; LEGAL_WORDS] {
+        let half = if self.move_count != 0 {
+            LEGAL_ALL
+        } else if player == 0 {
+            LEGAL_LEFT
+        } else {
+            LEGAL_RIGHT
+        };
+        [self.legal[0] & half[0], self.legal[1] & half[1]]
+    }
+
+    /// How many moves `player` has. `popcount`, not a board scan.
+    #[inline]
+    pub fn legal_count(&self, player: usize) -> u32 {
+        let w = self.legal_moves(player);
+        w[0].count_ones() + w[1].count_ones()
+    }
+
+    /// Is board index `i` a legal move for `player`? A bit test, not a board read.
+    #[inline]
+    pub fn is_legal(&self, i: usize, player: usize) -> bool {
+        if i >= HW || legal_cell(i >> 1) != i {
+            return false; // not a playable-parity square, so it holds no bit of its own
+        }
+        let w = self.legal_moves(player);
+        let k = i >> 1;
+        w[k >> 6] >> (k & 63) & 1 == 1
+    }
+
+    /// The board index of the `k`th set bit of `w`, counting from the low end.
+    #[inline]
+    fn select(w: [u64; LEGAL_WORDS], mut k: u32) -> usize {
+        for (wi, &word) in w.iter().enumerate() {
+            let c = word.count_ones();
+            if k < c {
+                let mut x = word;
+                for _ in 0..k {
+                    x &= x - 1; // drop the lowest set bit
+                }
+                return legal_cell((wi << 6) + x.trailing_zeros() as usize);
+            }
+            k -= c;
+        }
+        unreachable!("select past the end of the legal set")
+    }
+
+    /// A uniformly random legal move for `player`. Panics if the game is over.
+    ///
+    /// This is the rollout primitive, and it never touches the board: one `popcount`, one
+    /// bounded draw, and a select over 80 bits.
+    #[inline]
+    pub fn random_move(&self, player: usize, rng: &mut Rng) -> usize {
+        let w = self.legal_moves(player);
+        let count = w[0].count_ones() + w[1].count_ones();
+        assert!(count > 0, "no legal move for player {player}");
+        Self::select(w, rng.randint(count as u64) as u32)
+    }
+
+    /// Sample a legal move for `player` from a weight per square, `dist[0..HW]`.
+    ///
+    /// Accumulate the weight of the legal squares, draw a threshold, then walk the set bits
+    /// again until the running sum crosses it. Weights need not be normalized. Set bits are
+    /// walked low to high, which is board order, so this consumes the same draw and makes the
+    /// same choice as the numba `sample_move_kernel` scanning all 160 squares against a
+    /// materialized mask — the tests hold it to that.
+    ///
+    /// One deliberate exception: an all-zero distribution falls back to a uniform draw over
+    /// the *legal* squares, where the numba version draws uniformly over the whole board and
+    /// can land on a square that is not playable at all. Nothing here has to stay
+    /// bit-compatible with that quirk, and a softmax policy never triggers it.
+    pub fn sample_move(&self, dist: &[f32], player: usize, rng: &mut Rng) -> usize {
+        debug_assert!(dist.len() >= HW, "distribution must cover the board");
+        let words = self.legal_moves(player);
+
+        let mut total = 0.0f64;
+        for (wi, &word) in words.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let k = (wi << 6) + w.trailing_zeros() as usize;
+                w &= w - 1;
+                total += dist[legal_cell(k)] as f64;
+            }
+        }
         if total < 1e-8 {
-            let idx = rng.randint(HW as u64) as i64;
-            r_out[g] = idx / WIDTH as i64;
-            c_out[g] = idx % WIDTH as i64;
-            continue;
+            return self.random_move(player, rng);
         }
 
         let threshold = rng.random() * total;
-        let mut cum: f64 = 0.0;
-        let mut chosen: usize = 0;
+        let mut cum = 0.0f64;
+        let mut chosen = usize::MAX;
         'scan: for (wi, &word) in words.iter().enumerate() {
             let mut w = word;
             while w != 0 {
                 let k = (wi << 6) + w.trailing_zeros() as usize;
                 w &= w - 1;
                 let cell = legal_cell(k);
-                let v = dist[base + cell] as f64;
+                let v = dist[cell] as f64;
                 if v > 0.0 {
                     cum += v;
                     if cum >= threshold {
@@ -854,283 +996,40 @@ fn sample_bits(
                 }
             }
         }
-        r_out[g] = (chosen / WIDTH) as i64;
-        c_out[g] = (chosen % WIDTH) as i64;
-    }
-}
-
-// ------------------------------------------------------------------------ batched game
-
-
-/// A batch of games scored incrementally.
-///
-/// Everything that does not involve scoring — the legal-move masks, the sampler, the
-/// first-move rule, `move_counts`, `finished` — is the reference code, reused unchanged.
-/// The only difference from [`BatchedLinesGame`] is that the board is scored by the level
-/// machinery above instead of by a from-scratch rescan after every move.
-pub struct IncrementalGame {
-    pub n: usize,
-    /// (N, H, W) row-major, same encoding as the reference.
-    pub boards: Vec<i8>,
-    /// (N, H, W) row-major levels, parallel to `boards`.
-    pub levels: Vec<u8>,
-    /// (N, 2) running score. Integer because every score is a sum of run lengths.
-    pub scores: Vec<i32>,
-    pub move_counts: Vec<i32>,
-    pub finished: Vec<bool>,
-    pub half_width: usize,
-    pub rng: Rng,
-    /// Squares still playable, as `[g * LEGAL_WORDS ..][.. LEGAL_WORDS]`. This is what the
-    /// sampler walks instead of a mask, what `get_legal_masks` expands from, and what makes
-    /// the finished check two comparisons instead of a board scan.
-    legal: Vec<u64>,
-    scratch: Scratch,
-}
-
-impl IncrementalGame {
-    /// Derive one game's legality bitboard from its board. Only needed when adopting a
-    /// position from outside; during play the bitboard is maintained, never rebuilt.
-    fn rebuild_legal(&mut self, g: usize) {
-        let cells = &self.boards[g * HW..(g + 1) * HW];
-        let mut w = [0u64; LEGAL_WORDS];
-        for i in 0..HW {
-            if cells[i] == PLAYABLE_SQUARE {
-                let (wi, b) = legal_bit(i);
-                w[wi] |= b;
-            }
+        // only reachable if rounding put the threshold past the whole sum
+        if chosen == usize::MAX {
+            return self.random_move(player, rng);
         }
-        self.legal[g * LEGAL_WORDS..(g + 1) * LEGAL_WORDS].copy_from_slice(&w);
+        chosen
     }
 
-    /// An empty bitboard is exactly "no playable square left".
+    /// Play one move: `i0` for player 0, `i1` for player 1, as board indices.
+    ///
+    /// Equal indices are a collision, which clears that square and its four diagonal
+    /// neighbours — see [`apply_move`]. Both moves must be legal; that is checked only in
+    /// debug builds, because the caller picked them out of [`Self::legal_moves`] and paying
+    /// for a re-check on every node of a search is not worth it.
     #[inline]
-    fn no_moves_left(&self, g: usize) -> bool {
-        self.legal[g * LEGAL_WORDS] == 0 && self.legal[g * LEGAL_WORDS + 1] == 0
-    }
-
-    /// This game's legality words. The cheap form of [`Self::get_legal_masks`] for a caller
-    /// that can consume 16 bytes instead of 1280 — count is `count_ones`, a legality check
-    /// is a bit test, and the opening-move restriction is an `AND` with `LEGAL_LEFT` or
-    /// `LEGAL_RIGHT`.
-    pub fn legal_bits(&self, g: usize) -> [u64; LEGAL_WORDS] {
-        [self.legal[g * LEGAL_WORDS], self.legal[g * LEGAL_WORDS + 1]]
-    }
-    pub fn new(num_games: usize, seed: u64) -> Self {
-        let mut boards = vec![NON_PLAYABLE_SQUARE; num_games * HW];
-        for g in 0..num_games {
-            for r in 0..HEIGHT {
-                for c in 0..WIDTH {
-                    if (r + c) % 2 == 0 {
-                        boards[g * HW + r * WIDTH + c] = PLAYABLE_SQUARE;
-                    }
-                }
-            }
-        }
-        let mut g = IncrementalGame {
-            n: num_games,
-            boards,
-            levels: vec![INF; num_games * HW],
-            scores: vec![0; num_games * 2],
-            move_counts: vec![0; num_games],
-            finished: vec![false; num_games],
-            half_width: WIDTH / 2,
-            rng: Rng::new(seed),
-            legal: vec![0; num_games * LEGAL_WORDS],
-            scratch: Scratch::new(),
-        };
-        for i in 0..num_games {
-            g.rebuild_legal(i);
-        }
-        g
-    }
-
-    /// Adopt arbitrary boards. The board *is* the state, so nothing else is asked for.
-    ///
-    /// Levels come from the one global BFS, scores from a full rescan, legality from a scan
-    /// for playable squares. The two flags the engine also carries are derived rather than
-    /// supplied: a game is finished exactly when no playable square is left, and it is on
-    /// its opening move exactly when nothing has been played — no marks and no blasted
-    /// squares. `move_counts` is only ever compared against zero, never counted with, so
-    /// 0-or-1 carries everything that depends on it; this is the same rule the reference
-    /// applies when it imports a printed board.
-    pub fn from_state(boards: Vec<i8>, seed: u64) -> Self {
-        let n = boards.len() / HW;
-        let mut move_counts = vec![0i32; n];
-        let mut finished = vec![false; n];
-        for i in 0..n {
-            let cells = &boards[i * HW..(i + 1) * HW];
-            let played = cells
-                .iter()
-                .any(|&v| v != PLAYABLE_SQUARE && v != NON_PLAYABLE_SQUARE);
-            move_counts[i] = i32::from(played);
-            finished[i] = !cells.iter().any(|&v| v == PLAYABLE_SQUARE);
-        }
-        let mut g = IncrementalGame {
-            n,
-            boards,
-            levels: vec![INF; n * HW],
-            scores: vec![0; n * 2],
-            move_counts,
-            finished,
-            half_width: WIDTH / 2,
-            rng: Rng::new(seed),
-            legal: vec![0; n * LEGAL_WORDS],
-            scratch: Scratch::new(),
-        };
-        for i in 0..n {
-            g.rebuild_legal(i);
-        }
-        for i in 0..n {
-            let cells = &g.boards[i * HW..(i + 1) * HW];
-            let level = &mut g.levels[i * HW..(i + 1) * HW];
-            rebuild_levels(cells, level, &mut g.scratch);
-            g.scores[i * 2] = score_board(cells, level, PLAYER_0_MARK);
-            g.scores[i * 2 + 1] = score_board(cells, level, PLAYER_1_MARK);
-        }
-        g
-    }
-
-    fn active(&self) -> Vec<bool> {
-        self.finished.iter().map(|f| !f).collect()
-    }
-
-    /// Apply one sampled move per active game. Private: [`Self::distribution_step`] and
-    /// [`Self::action_step`] are the two ways in, and they differ only in where the moves
-    /// come from.
-    fn apply_step(&mut self, r0: &[i64], c0: &[i64], r1: &[i64], c1: &[i64], active: &[bool]) {
-        for g in 0..self.n {
-            if !active[g] {
-                continue;
-            }
-            let cells = &mut self.boards[g * HW..(g + 1) * HW];
-            let level = &mut self.levels[g * HW..(g + 1) * HW];
-            let score = &mut self.scores[g * 2..g * 2 + 2];
-            let legal = &mut self.legal[g * LEGAL_WORDS..(g + 1) * LEGAL_WORDS];
-            apply_move(
-                cells,
-                level,
-                score,
-                legal,
-                (r0[g] as usize, c0[g] as usize),
-                (r1[g] as usize, c1[g] as usize),
-                &mut self.scratch,
-            );
-            self.move_counts[g] += 1;
-            if self.no_moves_left(g) {
-                self.finished[g] = true;
-            }
-        }
-    }
-
-    /// Copy the named games into a fresh batch.
-    ///
-    /// Every derived quantity is copied rather than recomputed — levels and the legality
-    /// bitboard come across verbatim — so a clone costs a memcpy per game instead of the
-    /// global BFS and full rescore [`Self::from_state`] would pay for the same boards.
-    /// Naming a game twice is allowed and yields two independent copies.
-    ///
-    /// The clone draws a fresh RNG from the parent's stream, so a seeded parent still
-    /// determines everything its clones go on to do.
-    pub fn clone_states_to_batch(&mut self, indices: &[usize]) -> Self {
-        let mut t = IncrementalGame::new(indices.len(), self.rng.next_u64());
-        for (d, &g) in indices.iter().enumerate() {
-            t.boards[d * HW..(d + 1) * HW].copy_from_slice(&self.boards[g * HW..(g + 1) * HW]);
-            t.levels[d * HW..(d + 1) * HW].copy_from_slice(&self.levels[g * HW..(g + 1) * HW]);
-            t.legal[d * LEGAL_WORDS..(d + 1) * LEGAL_WORDS]
-                .copy_from_slice(&self.legal[g * LEGAL_WORDS..(g + 1) * LEGAL_WORDS]);
-            t.scores[d * 2] = self.scores[g * 2];
-            t.scores[d * 2 + 1] = self.scores[g * 2 + 1];
-            t.move_counts[d] = self.move_counts[g];
-            t.finished[d] = self.finished[g];
-        }
-        t
-    }
-
-    /// Sample one move per active game for `player`, without applying it.
-    ///
-    /// Exposed so a caller can measure or reuse the sampler on its own;
-    /// [`Self::distribution_step`] is this twice plus [`Self::apply_step`].
-    pub fn sample_moves(
-        &mut self,
-        dist: &[f32],
-        player: usize,
-        active: &[bool],
-        r_out: &mut [i64],
-        c_out: &mut [i64],
-    ) {
-        sample_bits(
-            dist, &self.legal, active, &self.move_counts,
-            self.n, player, &mut self.rng, r_out, c_out,
+    pub fn apply(&mut self, i0: usize, i1: usize, s: &mut Scratch) {
+        debug_assert!(!self.finished, "move played on a finished game");
+        debug_assert!(self.is_legal(i0, 0), "illegal move {i0} for player 0");
+        debug_assert!(self.is_legal(i1, 1), "illegal move {i1} for player 1");
+        apply_move(
+            &mut self.cells,
+            &mut self.levels,
+            &mut self.scores,
+            &mut self.legal,
+            i0,
+            i1,
+            s,
         );
+        self.move_count += 1;
+        self.finished = self.no_moves_left();
     }
 
-    /// One move for all active games, sampled from `dist_p0`/`dist_p1`.
-    ///
-    /// Unlike the reference, this never materializes the (N, H, W) legal masks: the live
-    /// list already says which squares are available, so the mask kernel — 2.6 MB of writes
-    /// per step at 2048 games — is skipped entirely.
-    pub fn distribution_step(&mut self, dist_p0: &[f32], dist_p1: &[f32]) {
-        let active = self.active();
-        if !active.iter().any(|&a| a) {
-            return;
-        }
-        let n = self.n;
-        let mut r0 = vec![0i64; n];
-        let mut c0 = vec![0i64; n];
-        let mut r1 = vec![0i64; n];
-        let mut c1 = vec![0i64; n];
-        self.sample_moves(dist_p0, 0, &active, &mut r0, &mut c0);
-        self.sample_moves(dist_p1, 1, &active, &mut r1, &mut c1);
-        self.apply_step(&r0, &c0, &r1, &c1, &active);
-    }
-
-    pub fn action_step(&mut self, idx_0: &[i64], idx_1: &[i64]) -> Result<(), String> {
-        let active = self.active();
-        if !active.iter().any(|&a| a) {
-            return Ok(());
-        }
-        // The reference builds both full masks just to read two entries per game. The same
-        // predicate reads straight off the board: a square is legal if it is still playable
-        // and, on the opening move, in the half this player is confined to.
-        let half = self.half_width;
-        let legal = |cells: &[i8], idx: usize, first: bool, player: usize| -> bool {
-            if cells[idx] != PLAYABLE_SQUARE {
-                return false;
-            }
-            if !first {
-                return true;
-            }
-            let c = idx % WIDTH;
-            if player == 0 { c < half } else { c >= half }
-        };
-
-        let mut invalid_indices: Vec<usize> = Vec::new();
-        for g in 0..self.n {
-            if !active[g] {
-                continue;
-            }
-            let cells = &self.boards[g * HW..(g + 1) * HW];
-            let first = self.move_counts[g] == 0;
-            if !legal(cells, idx_0[g] as usize, first, 0)
-                || !legal(cells, idx_1[g] as usize, first, 1)
-            {
-                invalid_indices.push(g);
-            }
-        }
-        if !invalid_indices.is_empty() {
-            return Err(format!(
-                "Invalid move detected in batch at game indices: {:?}. \
-                 Execution aborted; no games updated.",
-                invalid_indices
-            ));
-        }
-
-        let w = WIDTH as i64;
-        let r0: Vec<i64> = idx_0.iter().map(|&i| i / w).collect();
-        let c0: Vec<i64> = idx_0.iter().map(|&i| i % w).collect();
-        let r1: Vec<i64> = idx_1.iter().map(|&i| i / w).collect();
-        let c1: Vec<i64> = idx_1.iter().map(|&i| i % w).collect();
-        self.apply_step(&r0, &c0, &r1, &c1, &active);
-        Ok(())
+    /// Player 0's score minus player 1's — the value of the position, from p0's side.
+    #[inline]
+    pub fn margin(&self) -> i32 {
+        self.scores[0] - self.scores[1]
     }
 }

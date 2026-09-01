@@ -2,7 +2,7 @@
 name = "alpha_lines_game"
 version = "0.1.0"
 edition = "2021"
-description = "Incremental scorer for the alpha-lines batched game"
+description = "The alpha-lines game: one board, scored incrementally"
 
 # Deliberately zero dependencies: the engine is one self-contained file and must build and
 # run identically anywhere, without a crates.io fetch.

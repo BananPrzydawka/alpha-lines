@@ -1,25 +1,21 @@
 //! Per-call cost of every public function on the engine.
 //!
-//! The rollout benchmarks answer "how fast is a game"; this answers "how fast is a call",
-//! which is the question that matters to whatever drives the engine from outside. Pure
-//! accessors are timed on a representative mid-game batch and averaged over `--reps`;
-//! mutating calls are timed over a whole rollout and divided by the number of calls, which
-//! is the only honest average for something whose cost changes as the board fills.
+//! `bench` answers "how fast is a game"; this answers "how fast is a call", which is the
+//! question that matters to a search driving the engine one node at a time. Every row is one
+//! call, averaged over `--reps` invocations on a mid-game position — not on the opening
+//! position, where the fast paths are unrepresentative.
 //!
-//! One caveat on the numbers: any call that returns owned `Vec`s allocates and frees on
-//! every invocation — 2.6 MB per call for the masks at 2048 games — and that cost depends on
-//! the process's heap and cache state as much as on the code. The same `get_legal_masks`
-//! measures ~315 ns/game here and ~550 ns/game inside `bench`, which keeps several MB of
-//! recorded moves live throughout. The `_into` variants allocate nothing and are the stable
-//! comparison; the allocating rows are only comparable against each other, in this table.
+//! `apply` is the exception and is timed differently, over whole rollouts divided by the
+//! moves it took, because its cost changes as the board fills and no single position is a
+//! fair sample of it. Its row is therefore the same number `bench` reports as ns/move.
 //!
-//! Usage: api [--games N] [--reps R] [--warmup-moves M] [--seed S]
+//! Usage: api [--reps R] [--positions P] [--warmup-moves M] [--seed S]
 
 use std::hint::black_box;
 use std::time::Instant;
 
-use alpha_lines_game::incremental::{Rng, HEIGHT, HW, WIDTH};
-use alpha_lines_game::IncrementalGame;
+use alpha_lines_game::game::{Rng, Scratch, HEIGHT, HW, WIDTH};
+use alpha_lines_game::Game;
 
 fn arg_usize(args: &[String], key: &str, default: usize) -> usize {
     args.iter()
@@ -29,132 +25,163 @@ fn arg_usize(args: &[String], key: &str, default: usize) -> usize {
 }
 
 struct Table {
-    n: usize,
     rows: Vec<(String, f64, &'static str)>,
 }
 
 impl Table {
-    /// `secs` covers `calls` invocations over the whole batch of `n` games.
+    /// `secs` covers `calls` invocations.
     fn add(&mut self, name: &str, secs: f64, calls: usize, unit: &'static str) {
         self.rows.push((name.to_string(), secs / calls as f64, unit));
     }
     fn print(&self, title: &str) {
         println!("\n=== {title} ===");
-        println!("{:<34} {:>14}   {}", "call", "per call", "what one call covers");
+        println!("{:<30} {:>12}   {}", "call", "per call", "what one call covers");
         for (name, per_call, unit) in &self.rows {
-            println!("{:<34} {:>12.1}us   {}", name, per_call * 1e6, unit);
+            println!("{:<30} {:>10.1}ns   {}", name, per_call * 1e9, unit);
         }
-        let _ = self.n;
     }
+}
+
+/// A batch of independent mid-game positions to measure the pure accessors on.
+///
+/// One position would sit in L1 and every row would be a cache hit, which is not the
+/// situation a search is in. `--positions` of them, walked in order, is closer: a tree search
+/// touches a different node every time it descends.
+fn positions(count: usize, warmup: usize, seed: u64, s: &mut Scratch) -> Vec<Game> {
+    let mut rng = Rng::new(seed);
+    (0..count)
+        .map(|_| {
+            let mut g = Game::new();
+            for _ in 0..warmup {
+                if g.finished {
+                    break;
+                }
+                let (i0, i1) = (g.random_move(0, &mut rng), g.random_move(1, &mut rng));
+                g.apply(i0, i1, s);
+            }
+            g
+        })
+        .collect()
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let n = arg_usize(&args, "--games", 2048);
-    let reps = arg_usize(&args, "--reps", 100);
-    let warmup = arg_usize(&args, "--warmup-moves", 10);
+    let reps = arg_usize(&args, "--reps", 2000);
+    let count = arg_usize(&args, "--positions", 512);
+    let warmup = arg_usize(&args, "--warmup-moves", 20);
     let seed = arg_usize(&args, "--seed", 12345) as u64;
 
-    let mut rng = Rng::new(seed);
-    let d0: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
-    let d1: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+    let mut scratch = Scratch::new();
+    let mut rng = Rng::new(seed ^ 0xfeed);
+    let mid = positions(count, warmup, seed, &mut scratch);
+    let dist: Vec<f32> = (0..HW).map(|_| rng.random() as f32).collect();
+    let calls = reps * count;
 
-    // A mid-game batch: the pure accessors are timed on a board that has been played into,
-    // not on the opening position, where the fast paths are unrepresentative.
-    let mut mid_inc = IncrementalGame::new(n, seed);
-    for _ in 0..warmup {
-        mid_inc.distribution_step(&d0, &d1);
-    }
-    let idx: Vec<usize> = (0..n).step_by(2).collect();
+    let mut t = Table { rows: Vec::new() };
 
-    // ---------------------------------------------------------------- incremental engine
-    let mut t = Table { n, rows: Vec::new() };
-
-    let s = Instant::now();
-    for _ in 0..reps { black_box(IncrementalGame::new(black_box(n), seed)); }
-    t.add("new", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let b = mid_inc.boards.clone();
-    let s = Instant::now();
-    for _ in 0..reps { black_box(IncrementalGame::from_state(b.clone(), 0)); }
-    t.add("from_state", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    let s = Instant::now();
-    for _ in 0..reps { for g in 0..n { black_box(mid_inc.legal_bits(black_box(g))); } }
-    t.add("legal_bits (every game)", s.elapsed().as_secs_f64(), reps, "whole batch");
-
-    // A yardstick: copying the whole batch state, with no work done on it. Everything above
-    // and below has to move at least this much, so it says whether a call is anywhere near
-    // being limited by memory rather than by what it computes.
-    let state_bytes = mid_inc.boards.len() + mid_inc.levels.len() + n * 16 + n * 8 + n * 4 + n;
-    let mut sink_b = mid_inc.boards.clone();
-    let mut sink_l = mid_inc.levels.clone();
     let s = Instant::now();
     for _ in 0..reps {
-        sink_b.copy_from_slice(black_box(&mid_inc.boards));
-        sink_l.copy_from_slice(black_box(&mid_inc.levels));
-        black_box(&sink_b);
-        black_box(&sink_l);
+        black_box(Game::new());
     }
-    let copy = s.elapsed().as_secs_f64() / reps as f64;
-    t.add("memcpy boards+levels (yardstick)", s.elapsed().as_secs_f64(), reps, "whole batch");
-    println!(
-        "(batch state is {} KB; copying the {} KB of boards+levels takes {:.1}us, ~{:.1} GB/s)",
-        state_bytes / 1024,
-        (mid_inc.boards.len() + mid_inc.levels.len()) / 1024,
-        copy * 1e6,
-        (mid_inc.boards.len() + mid_inc.levels.len()) as f64 * 2.0 / copy / 1e9,
-    );
+    t.add("new", s.elapsed().as_secs_f64(), reps, "the opening position");
 
     let s = Instant::now();
-    for _ in 0..reps { black_box(mid_inc.clone_states_to_batch(black_box(&idx))); }
-    t.add("clone_states_to_batch (n/2)", s.elapsed().as_secs_f64(), reps, "half the batch");
-
-    // mutating calls: one rollout each, averaged over the calls it took
-    let mut g = IncrementalGame::new(n, seed);
-    let mut steps = 0usize;
-    let s = Instant::now();
-    while !g.finished.iter().all(|&f| f) { g.distribution_step(&d0, &d1); steps += 1; }
-    t.add("distribution_step", s.elapsed().as_secs_f64(), steps, "one move, all games");
-
-    // a recorded legal sequence, so the sampler and the action path can be timed apart
-    let mut rec: Vec<(Vec<i64>, Vec<i64>, Vec<bool>)> = Vec::new();
-    {
-        let mut probe = IncrementalGame::new(n, seed);
-        while !probe.finished.iter().all(|&f| f) {
-            let active: Vec<bool> = probe.finished.iter().map(|&x| !x).collect();
-            let (mut r0, mut c0v) = (vec![0i64; n], vec![0i64; n]);
-            let (mut r1, mut c1v) = (vec![0i64; n], vec![0i64; n]);
-            probe.sample_moves(&d0, 0, &active, &mut r0, &mut c0v);
-            probe.sample_moves(&d1, 1, &active, &mut r1, &mut c1v);
-            let i0: Vec<i64> = (0..n).map(|k| r0[k] * WIDTH as i64 + c0v[k]).collect();
-            let i1: Vec<i64> = (0..n).map(|k| r1[k] * WIDTH as i64 + c1v[k]).collect();
-            probe.action_step(&i0, &i1).unwrap();
-            rec.push((i0, i1, active));
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(g.clone());
         }
     }
+    t.add("clone", s.elapsed().as_secs_f64(), calls, "fork a position for a child node");
 
-    let mut g = IncrementalGame::new(n, seed);
-    let (mut ro, mut co) = (vec![0i64; n], vec![0i64; n]);
-    let mut calls = 0usize;
     let s = Instant::now();
-    for (_, _, active) in &rec {
-        g.sample_moves(&d0, 0, active, &mut ro, &mut co);
-        calls += 1;
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(Game::from_cells(g.cells, &mut scratch));
+        }
     }
-    t.add("sample_moves (one player)", s.elapsed().as_secs_f64(), calls, "one move, all games");
+    t.add("from_cells", s.elapsed().as_secs_f64(), calls, "adopt a board: BFS + full rescore");
 
-    let mut g = IncrementalGame::new(n, seed);
-    let mut calls = 0usize;
     let s = Instant::now();
-    for (i0, i1, _) in &rec {
-        g.action_step(i0, i1).unwrap();
-        calls += 1;
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(g.legal_bits());
+        }
     }
-    t.add("action_step", s.elapsed().as_secs_f64(), calls, "one move, all games");
+    t.add("legal_bits", s.elapsed().as_secs_f64(), calls, "the playable set, 80 bits");
 
-    t.print(format!("IncrementalGame, {n} games, {reps} reps").as_str());
+    let s = Instant::now();
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(g.legal_moves(0));
+        }
+    }
+    t.add("legal_moves", s.elapsed().as_secs_f64(), calls, "same, narrowed to one player");
 
+    let s = Instant::now();
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(g.legal_count(0));
+        }
+    }
+    t.add("legal_count", s.elapsed().as_secs_f64(), calls, "how many moves a player has");
 
-    println!("\n(HEIGHT x WIDTH = {HEIGHT} x {WIDTH}, batch of {n} games)");
+    let s = Instant::now();
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(g.is_legal(black_box(34), 0));
+        }
+    }
+    t.add("is_legal", s.elapsed().as_secs_f64(), calls, "one square, one bit test");
+
+    let s = Instant::now();
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(g.random_move(0, &mut rng));
+        }
+    }
+    t.add("random_move", s.elapsed().as_secs_f64(), calls, "uniform draw from the bitboard");
+
+    let s = Instant::now();
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(g.sample_move(&dist, 0, &mut rng));
+        }
+    }
+    t.add("sample_move", s.elapsed().as_secs_f64(), calls, "weighted draw over 160 floats");
+
+    let s = Instant::now();
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(g.margin());
+        }
+    }
+    t.add("margin", s.elapsed().as_secs_f64(), calls, "the position's value");
+
+    // `apply` over whole rollouts: its cost is a function of how full the board is, so the
+    // only honest average is over a game, not over one position replayed.
+    let rollouts = reps.div_ceil(4).max(1);
+    let mut moves = 0usize;
+    let s = Instant::now();
+    for _ in 0..rollouts {
+        let mut g = Game::new();
+        while !g.finished {
+            let (i0, i1) = (g.random_move(0, &mut rng), g.random_move(1, &mut rng));
+            g.apply(i0, i1, &mut scratch);
+            moves += 1;
+        }
+        black_box(&g.scores);
+    }
+    let played = s.elapsed().as_secs_f64();
+    t.add("apply (+ 2 random_move)", played, moves, "one move, averaged over whole games");
+
+    t.print(format!("Game, {count} mid-game positions, {reps} reps").as_str());
+
+    println!(
+        "\n(board {HEIGHT} x {WIDTH}; a Game is {} bytes, so the {count} positions above are \
+         {} KB\n and do not fit in L1. Rollout: {moves} moves over {rollouts} games, \
+         {:.1} moves/game.)",
+        std::mem::size_of::<Game>(),
+        count * std::mem::size_of::<Game>() / 1024,
+        moves as f64 / rollouts as f64,
+    );
 }

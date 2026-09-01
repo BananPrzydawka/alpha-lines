@@ -9,14 +9,18 @@
 //! engine owns. The Python's encoding and rendering have no counterpart here, because the
 //! engine does not implement them; they are the caller's job.
 //!
+//! The move file is a batch — N games advanced together — because the Python it is checking
+//! against is. The engine is not: it plays one board at a time, so this holds a `Vec<Game>`
+//! and steps every entry. That is the whole of what "batched" means here now.
+//!
 //! Binary formats are little-endian throughout.
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::PathBuf;
 
-use alpha_lines_game::incremental::{HEIGHT, HW, WIDTH};
-use alpha_lines_game::IncrementalGame;
+use alpha_lines_game::game::{Scratch, HEIGHT, HW, WIDTH};
+use alpha_lines_game::Game;
 
 const STATE_MAGIC: &[u8; 4] = b"ALST";
 const MOVES_MAGIC: &[u8; 4] = b"ALMV";
@@ -56,24 +60,17 @@ fn read_moves(path: &PathBuf) -> Moves {
 /// Expand the engine's 80-bit legality words into the dense masks the Python produces, so
 /// the two can be compared at all. The engine has no reason to do this itself; a caller that
 /// needs a mask for a policy network builds it once, in the shape that network wants.
-fn dense_masks(inc: &IncrementalGame) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-    let half = WIDTH / 2;
-    let (mut m0, mut m1) = (vec![0.0f32; inc.n * HW], vec![0.0f32; inc.n * HW]);
-    let (mut c0, mut c1) = (vec![0.0f32; inc.n], vec![0.0f32; inc.n]);
-    for g in 0..inc.n {
-        let bits = inc.legal_bits(g);
-        let first = inc.move_counts[g] == 0;
+fn dense_masks(games: &[Game]) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let n = games.len();
+    let (mut m0, mut m1) = (vec![0.0f32; n * HW], vec![0.0f32; n * HW]);
+    let (mut c0, mut c1) = (vec![0.0f32; n], vec![0.0f32; n]);
+    for (g, game) in games.iter().enumerate() {
         for i in 0..HW {
-            let k = i >> 1;
-            if i % 2 != (i / WIDTH) % 2 || bits[k >> 6] >> (k & 63) & 1 == 0 {
-                continue;
-            }
-            let c = i % WIDTH;
-            if !(first && c >= half) {
+            if game.is_legal(i, 0) {
                 m0[g * HW + i] = 1.0;
                 c0[g] += 1.0;
             }
-            if !(first && c < half) {
+            if game.is_legal(i, 1) {
                 m1[g * HW + i] = 1.0;
                 c1[g] += 1.0;
             }
@@ -99,15 +96,21 @@ impl StateWriter {
         StateWriter { w, records: 0, path, n }
     }
 
-    fn push(&mut self, game: &IncrementalGame) {
-        assert_eq!(game.n, self.n, "record batch size mismatch");
-        let (m0, m1, c0, c1) = dense_masks(game);
-        let scores: Vec<f32> = game.scores.iter().map(|&s| s as f32).collect();
+    fn push(&mut self, games: &[Game]) {
+        assert_eq!(games.len(), self.n, "record batch size mismatch");
+        let (m0, m1, c0, c1) = dense_masks(games);
 
-        write_i8(&mut self.w, &game.boards);
+        let boards: Vec<i8> = games.iter().flat_map(|g| g.cells).collect();
+        let scores: Vec<f32> = games
+            .iter()
+            .flat_map(|g| [g.scores[0] as f32, g.scores[1] as f32])
+            .collect();
+        let counts: Vec<i32> = games.iter().map(|g| g.move_count as i32).collect();
+        let fin: Vec<u8> = games.iter().map(|g| g.finished as u8).collect();
+
+        write_i8(&mut self.w, &boards);
         write_f32(&mut self.w, &scores);
-        write_i32(&mut self.w, &game.move_counts);
-        let fin: Vec<u8> = game.finished.iter().map(|&f| f as u8).collect();
+        write_i32(&mut self.w, &counts);
         self.w.write_all(&fin).unwrap();
         write_f32(&mut self.w, &m0);
         write_f32(&mut self.w, &m1);
@@ -162,27 +165,49 @@ fn main() {
     std::fs::create_dir_all(&out_dir).expect("create out dir");
 
     let moves = read_moves(&moves_path);
-    let mut game = IncrementalGame::new(moves.n, 0);
+    let mut games: Vec<Game> = (0..moves.n).map(|_| Game::new()).collect();
+    let mut scratch = Scratch::new();
     let mut state = StateWriter::create(out_dir.join(format!("state_{tag}.bin")), moves.n);
 
     // record 0 is the initial state, before any move
-    state.push(&game);
+    state.push(&games);
 
     for step in 0..moves.n_steps {
         let off = step * moves.n * 2;
-        let idx_0: Vec<i64> = (0..moves.n).map(|g| moves.data[off + g * 2] as i64).collect();
-        let idx_1: Vec<i64> = (0..moves.n).map(|g| moves.data[off + g * 2 + 1] as i64).collect();
-        if let Err(e) = game.action_step(&idx_0, &idx_1) {
-            eprintln!("action_step failed at step {step}: {e}");
-            std::process::exit(2);
+        // The engine only debug-asserts legality — the caller is expected to have picked out
+        // of `legal_moves`. Here the moves come from a file, so they are checked for real:
+        // this driver exists to catch disagreements, and a bad move file must be reported
+        // rather than replayed into undefined behaviour.
+        for (g, game) in games.iter().enumerate() {
+            if game.finished {
+                continue;
+            }
+            let (i0, i1) = (moves.data[off + g * 2], moves.data[off + g * 2 + 1]);
+            for (player, i) in [(0usize, i0), (1usize, i1)] {
+                if i < 0 || !game.is_legal(i as usize, player) {
+                    eprintln!("step {step}, game {g}: illegal move {i} for player {player}");
+                    std::process::exit(2);
+                }
+            }
         }
-        state.push(&game);
+        for (g, game) in games.iter_mut().enumerate() {
+            if game.finished {
+                continue;
+            }
+            let i0 = moves.data[off + g * 2] as usize;
+            let i1 = moves.data[off + g * 2 + 1] as usize;
+            game.apply(i0, i1, &mut scratch);
+        }
+        state.push(&games);
     }
     state.finish();
 
     // Adopting the final boards from scratch has to land on the same state the engine
-    // reached by playing there, which is what checks `from_state` against the Python too.
-    let adopted = IncrementalGame::from_state(game.boards.clone(), 0);
+    // reached by playing there, which is what checks `from_cells` against the Python too.
+    let adopted: Vec<Game> = games
+        .iter()
+        .map(|g| Game::from_cells(g.cells, &mut scratch))
+        .collect();
     let mut re = StateWriter::create(out_dir.join(format!("reimport_{tag}.bin")), moves.n);
     re.push(&adopted);
     re.finish();

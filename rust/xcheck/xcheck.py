@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-checks the Rust port in ../src against main/game.py.
+"""Cross-checks the Rust engine in ../src against main/game.py.
 
 Both implementations replay an identical, externally generated move sequence over a few
 hundred games and dump every observable piece of state after every move. The dumps are then
@@ -11,7 +11,7 @@ What is compared, per game and per step:
   both players' 7-channel encodings, the terminal outcome codes, the print_state rendering
   for both players, and the state reconstructed by import_prints from that rendering.
 
-Run:  uv run python rust/xcheck/xcheck.py [--games 300] [--seed 0] [--impl incremental]
+Run:  uv run python rust/xcheck/xcheck.py [--games 300] [--seed 0]
 """
 
 import argparse
@@ -212,8 +212,6 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--keep", action="store_true", help="keep the dump directory")
     ap.add_argument("--out-dir", default=None)
-    ap.add_argument("--impl", default="reference", choices=["reference", "incremental"],
-                    help="which Rust scorer to check against main/game.py")
     args = ap.parse_args()
 
     binary = ROOT / "rust" / "target" / "release" / "verify"

@@ -1,45 +1,53 @@
-//! Play a large batch of games and require the engine to match the oracle bit for bit, at
-//! every move, in every observable field.
+//! Play a lot of games and require the engine to match the oracle bit for bit, at every
+//! move, in every observable field.
 //!
-//! The reference (`game.rs` + `game_kernels.rs`) is a straight port of `main/game.py` and is
-//! itself verified byte-for-byte against the Python by `xcheck/xcheck.py`. So parity here is
-//! parity with the Python, transitively — which is why this single test can stand in for a
-//! pile of unit tests: anything the incremental engine gets wrong about a board, a score, a
-//! move count or a terminal flag shows up as a mismatch within a move or two of happening.
+//! The oracle (`tests/oracle`) is a straight port of `main/game_kernels.py` and is itself
+//! verified byte-for-byte against the Python by `xcheck/xcheck.py`. So parity here is parity
+//! with the Python, transitively — which is why these few tests can stand in for a pile of
+//! unit tests: anything the engine gets wrong about a board, a score, a move count or a
+//! terminal flag shows up as a mismatch within a move or two of happening.
 //!
-//! Three things a bare parity check would *not* catch, and how this covers them:
+//! The oracle is still batch-shaped, because the numba kernels it ports were. The engine is
+//! not: it plays one board at a time, so every test here holds a `Vec<Game>` against one
+//! oracle batch and steps them in step. That mismatch is doing useful work — the games share
+//! a single [`Scratch`], and hundreds of them interleaved through one workspace is exactly
+//! what would expose scratch state leaking from one board into the next.
 //!
-//! * **Levels.** They are internal to the incremental engine, so the reference has nothing
-//!   to compare against and a corrupt level can sit there until it eventually poisons a
-//!   score. `check_levels_and_scores` re-derives every level from scratch and re-scores
-//!   with the reference's own scorer, so the internal state is pinned too, not just the
-//!   output.
-//! * **The masks.** The reference builds them by scanning; the incremental engine packs the
-//!   same information into 80 bits. The dense form is compared here through the engine's
-//!   reference view, and the bitboard against the board itself in the API test below.
+//! Four things a bare parity check would *not* catch, and how they are covered:
+//!
+//! * **Levels.** They are internal to the engine, so the oracle has nothing to compare
+//!   against and a corrupt level can sit there until it eventually poisons a score.
+//!   `check_levels_and_scores` re-derives every level from scratch and re-scores with the
+//!   oracle's own scorer, so the internal state is pinned too, not just the output.
+//! * **The masks.** The oracle builds them by scanning 160 floats; the engine packs the same
+//!   information into 80 bits. Every square of every game is compared both ways.
 //! * **The rare paths.** Collisions are what drive the slow removal path, but only if there
 //!   is structure for them to cut: forcing one on every move flattens the board and the slow
 //!   path then runs *zero* times, measured. Pure random play is in fact the best exerciser of
-//!   it, and already collides on ~7% of moves. So the batch is mostly free play, and only the
-//!   even-numbered games are nudged — one forced collision every sixth step, which triples
-//!   the collision rate while leaving the blobs six moves to grow back. Both halves are
-//!   counted separately and both are asserted, so neither can quietly stop testing anything.
+//!   it, and already collides on ~7% of moves. So most games are free play, and only the
+//!   even-numbered ones are nudged — one forced collision every sixth step, which triples the
+//!   collision rate while leaving the blobs six moves to grow back. Both halves are counted
+//!   separately and both are asserted, so neither can quietly stop testing anything.
+//! * **Forking.** A search clones positions constantly, and a clone that shares something it
+//!   should not stays invisible until two branches interfere. `a_fork_is_independent...`
+//!   plays a parent and a clone apart and requires neither to feel the other.
 //!
-//! Meant to be run as `cargo test --release`; a debug build is ~50x slower. `PARITY_GAMES`
-//! overrides the batch size.
+//! Meant to be run as `cargo test --release`; a debug build is ~50x slower, but it is worth
+//! running there too — that is where `apply`'s legality `debug_assert`s are live.
+//! `PARITY_GAMES` overrides the game count.
 
 mod oracle;
 
-use alpha_lines_game::incremental::{
+use alpha_lines_game::game::{
     rebuild_levels, Rng, Scratch, HEIGHT, HW, INF, MAX_LEVEL, PLAYABLE_SQUARE, PLAYER_0_MARK,
     PLAYER_1_MARK, WIDTH,
 };
-use alpha_lines_game::IncrementalGame;
+use alpha_lines_game::Game;
 use oracle::{apply_and_score_kernel, legal_masks_kernel, sample_move_kernel, score_player};
 
-/// The oracle as a batch of games: four plain arrays and the kernels that move them. This is
-/// all `BatchedLinesGame` ever was for the purposes of checking the engine, minus the
-/// encoding and rendering the engine does not implement.
+/// The oracle as a batch of games: four plain arrays and the kernels that move them, in the
+/// shape the numba code had. Minus the encoding and rendering, which the engine does not
+/// implement and so has nothing to be checked against.
 struct Oracle {
     n: usize,
     boards: Vec<i8>,
@@ -111,30 +119,30 @@ impl Oracle {
     }
 }
 
-// ---------------------------------------------------------------- checks the engine does not carry
+
+// ------------------------------------------------- checks the engine does not carry
 //
-// The incremental engine ships no self-verification: re-deriving levels and re-scoring a
-// board is test code, and test code belongs here. Both checkers work off the public surface
-// — `boards`, `levels`, `scores`, `legal_bits` — plus the reference's own scorer, which is
-// what makes them evidence rather than the engine agreeing with itself.
+// The engine ships no self-verification: re-deriving levels and re-scoring a board is test
+// code, and test code belongs here. Both checkers work off the public surface — `cells`,
+// `levels`, `scores`, `legal_bits` — plus the oracle's own scorer, which is what makes them
+// evidence rather than the engine agreeing with itself.
 
 /// Every level must equal what a from-scratch BFS would produce, and every running score
-/// must equal what the reference scorer says about the same board.
-fn check_levels_and_scores(inc: &IncrementalGame, where_: &str) {
+/// must equal what the oracle's scorer says about the same board.
+fn check_levels_and_scores(games: &[Game], where_: &str) {
     let mut scratch = Scratch::new();
     let mut fresh = vec![0u8; HW];
-    for g in 0..inc.n {
-        let cells = &inc.boards[g * HW..(g + 1) * HW];
-        rebuild_levels(cells, &mut fresh, &mut scratch);
+    for (g, game) in games.iter().enumerate() {
+        rebuild_levels(&game.cells, &mut fresh, &mut scratch);
         assert_eq!(
-            &inc.levels[g * HW..(g + 1) * HW],
+            &game.levels[..],
             &fresh[..],
             "{where_}: game {g} levels drifted from a from-scratch rebuild"
         );
         for (k, mark) in [PLAYER_0_MARK, PLAYER_1_MARK].into_iter().enumerate() {
-            let want = score_player(cells, 0, mark, HEIGHT, WIDTH) as i32;
+            let want = score_player(&game.cells, 0, mark, HEIGHT, WIDTH) as i32;
             assert_eq!(
-                inc.scores[g * 2 + k], want,
+                game.scores[k], want,
                 "{where_}: game {g} player {k} running score is wrong"
             );
         }
@@ -143,60 +151,56 @@ fn check_levels_and_scores(inc: &IncrementalGame, where_: &str) {
 
 /// Every legality bit must match the board, and `finished` must match whether any bit is
 /// left. This also pins the bit packing itself, since the two sides are built by different
-/// code.
-fn check_legality(inc: &IncrementalGame, where_: &str) {
-    for g in 0..inc.n {
-        let cells = &inc.boards[g * HW..(g + 1) * HW];
-        let bits = inc.legal_bits(g);
+/// code: `legal_bits` is maintained one cleared bit at a time as moves are played, and the
+/// board is what the moves actually wrote.
+fn check_legality(games: &[Game], where_: &str) {
+    for (g, game) in games.iter().enumerate() {
+        let bits = game.legal_bits();
         let mut any = false;
         for i in 0..HW {
             let k = i >> 1;
-            let playable = cells[i] == PLAYABLE_SQUARE;
+            let playable = game.cells[i] == PLAYABLE_SQUARE;
             let parity = i % 2 == (i / WIDTH) % 2;
             let set = parity && bits[k >> 6] >> (k & 63) & 1 == 1;
             assert_eq!(set, playable, "{where_}: game {g} cell {i} legality bit");
             any |= playable;
         }
-        assert_eq!(inc.finished[g], !any, "{where_}: game {g} finished flag");
+        assert_eq!(game.finished, !any, "{where_}: game {g} finished flag");
     }
+}
+
+/// The boards, laid out the way the oracle lays out its batch, so the two can be compared in
+/// one assert instead of a loop that stops at the first mismatch.
+fn boards_of(games: &[Game]) -> Vec<i8> {
+    games.iter().flat_map(|g| g.cells).collect()
 }
 
 /// The engine keeps integer scores because every score is a sum of run lengths; the oracle
 /// keeps f32 because numpy did. The comparison needs one of them converted.
-fn scores_as_f32(inc: &IncrementalGame) -> Vec<f32> {
-    inc.scores.iter().map(|&s| s as f32).collect()
+fn scores_as_f32(games: &[Game]) -> Vec<f32> {
+    games
+        .iter()
+        .flat_map(|g| [g.scores[0] as f32, g.scores[1] as f32])
+        .collect()
 }
 
 /// The dense masks the oracle produces, rebuilt from the engine's 80-bit legality words.
 /// Not something the engine offers — this is the test doing the unpacking, so the two
 /// representations can be compared at all.
-fn masks_from_bits(inc: &IncrementalGame) -> (Vec<f32>, Vec<f32>) {
-    let half = WIDTH / 2;
-    let mut m0 = vec![0.0f32; inc.n * HW];
-    let mut m1 = vec![0.0f32; inc.n * HW];
-    for g in 0..inc.n {
-        let bits = inc.legal_bits(g);
-        let first = inc.move_counts[g] == 0;
+fn masks_from_bits(games: &[Game]) -> (Vec<f32>, Vec<f32>) {
+    let n = games.len();
+    let mut m0 = vec![0.0f32; n * HW];
+    let mut m1 = vec![0.0f32; n * HW];
+    for (g, game) in games.iter().enumerate() {
         for i in 0..HW {
-            let k = i >> 1;
-            if i % 2 != (i / WIDTH) % 2 || bits[k >> 6] >> (k & 63) & 1 == 0 {
-                continue;
-            }
-            let c = i % WIDTH;
-            if !(first && c >= half) {
-                m0[g * HW + i] = 1.0;
-            }
-            if !(first && c < half) {
-                m1[g * HW + i] = 1.0;
-            }
+            m0[g * HW + i] = f32::from(game.is_legal(i, 0));
+            m1[g * HW + i] = f32::from(game.is_legal(i, 1));
         }
     }
     (m0, m1)
 }
 
-
-/// One uniformly random legal index per game; 0 for finished games, which `action_step`
-/// range-checks but never applies.
+/// One uniformly random legal index per game; 0 for finished games, which is never applied.
 fn pick(mask: &[f32], finished: &[bool], n: usize, rng: &mut Rng) -> Vec<i64> {
     let mut out = vec![0i64; n];
     let mut legal: Vec<i64> = Vec::with_capacity(HW);
@@ -216,16 +220,49 @@ fn pick(mask: &[f32], finished: &[bool], n: usize, rng: &mut Rng) -> Vec<i64> {
     out
 }
 
-#[test]
-fn the_engine_matches_the_oracle_bit_for_bit() {
-    let n: usize = std::env::var("PARITY_GAMES")
+/// One move for every unfinished game, each game sampling its own moves.
+///
+/// The draw order is not incidental. The oracle samples player 0 for *every* game out of one
+/// RNG, then player 1 for every game, so to compare move against move this has to consume the
+/// same stream in the same order — hence two passes, even though a single game would
+/// naturally draw both of its moves together. A single differing draw sends the two sides
+/// down permanently different games, which is what makes divergence loud rather than subtle.
+fn sampled_step(games: &mut [Game], d0: &[f32], d1: &[f32], rng: &mut Rng, s: &mut Scratch) {
+    let n = games.len();
+    let mut i0 = vec![0usize; n];
+    let mut i1 = vec![0usize; n];
+    for (g, game) in games.iter().enumerate() {
+        if !game.finished {
+            i0[g] = game.sample_move(&d0[g * HW..][..HW], 0, rng);
+        }
+    }
+    for (g, game) in games.iter().enumerate() {
+        if !game.finished {
+            i1[g] = game.sample_move(&d1[g * HW..][..HW], 1, rng);
+        }
+    }
+    for (g, game) in games.iter_mut().enumerate() {
+        if !game.finished {
+            game.apply(i0[g], i1[g], s);
+        }
+    }
+}
+
+fn game_count(default: usize) -> usize {
+    std::env::var("PARITY_GAMES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(10_000);
+        .unwrap_or(default)
+}
+
+#[test]
+fn the_engine_matches_the_oracle_bit_for_bit() {
+    let n = game_count(10_000);
     let seed = 0xa1f4_1e5u64;
 
     let mut refg = Oracle::new(n, seed);
-    let mut inc = IncrementalGame::new(n, seed);
+    let mut games: Vec<Game> = (0..n).map(|_| Game::new()).collect();
+    let mut scratch = Scratch::new();
 
     let mut rng = Rng::new(seed ^ 0x9e37_79b9);
     // [random, forced] — the odd-numbered games and the even-numbered ones
@@ -260,17 +297,38 @@ fn the_engine_matches_the_oracle_bit_for_bit() {
             }
         }
 
-        refg.apply(&idx0, &idx1);
-        inc.action_step(&idx0, &idx1).unwrap();
+        // the move the oracle is about to play has to be one the engine agrees is legal
+        for (g, game) in games.iter().enumerate() {
+            if game.finished {
+                continue;
+            }
+            assert!(game.is_legal(idx0[g] as usize, 0), "g{g} p0 move at step {steps}");
+            assert!(game.is_legal(idx1[g] as usize, 1), "g{g} p1 move at step {steps}");
+        }
 
-        assert_eq!(inc.boards, refg.boards, "boards diverged at step {steps}");
-        assert_eq!(scores_as_f32(&inc), refg.scores, "scores diverged at step {steps}");
-        assert_eq!(inc.move_counts, refg.move_counts, "move counts at step {steps}");
-        assert_eq!(inc.finished, refg.finished, "finished flags at step {steps}");
+        refg.apply(&idx0, &idx1);
+        for (g, game) in games.iter_mut().enumerate() {
+            if !game.finished {
+                game.apply(idx0[g] as usize, idx1[g] as usize, &mut scratch);
+            }
+        }
+
+        assert_eq!(boards_of(&games), refg.boards, "boards diverged at step {steps}");
+        assert_eq!(scores_as_f32(&games), refg.scores, "scores diverged at step {steps}");
+        assert_eq!(
+            games.iter().map(|g| g.move_count as i32).collect::<Vec<_>>(),
+            refg.move_counts,
+            "move counts at step {steps}"
+        );
+        assert_eq!(
+            games.iter().map(|g| g.finished).collect::<Vec<_>>(),
+            refg.finished,
+            "finished flags at step {steps}"
+        );
         let (m0, m1, _, _) = refg.masks();
-        assert_eq!(masks_from_bits(&inc), (m0, m1), "legality at step {steps}");
-        check_levels_and_scores(&inc, &format!("step {steps}"));
-        check_legality(&inc, &format!("step {steps}"));
+        assert_eq!(masks_from_bits(&games), (m0, m1), "legality at step {steps}");
+        check_levels_and_scores(&games, &format!("step {steps}"));
+        check_legality(&games, &format!("step {steps}"));
 
         steps += 1;
         assert!(steps < 200, "rollout did not terminate");
@@ -300,56 +358,61 @@ fn the_engine_matches_the_oracle_bit_for_bit() {
 
 /// The sampler needs its own driver, which is why this cannot fold into the test above.
 ///
-/// That one feeds both engines an explicit move index so it can control what gets played;
-/// it therefore never runs the sampler at all. Here both sides pick their own moves from the
+/// That one feeds both sides an explicit move index so it can control what gets played; it
+/// therefore never runs `sample_move` at all. Here both sides pick their own moves from the
 /// same distributions and the same RNG seed, so a single differing draw sends the two games
-/// down permanently different paths — which makes divergence loud rather than subtle.
+/// down permanently different paths.
 ///
-/// The incremental sampler walks set bits in a bitboard; the reference walks 160 squares
-/// against a materialized f32 mask. Same order, same accumulation, same RNG consumption,
-/// including the degenerate all-zero-weight branch — this is what pins that down.
+/// The engine walks set bits in an 80-bit board; the oracle walks 160 squares against a
+/// materialized f32 mask. Same order, same accumulation, same RNG consumption — this is what
+/// pins that down. The masks agree exactly because a mask entry is 1.0 or 0.0, so
+/// `dist * mask` is either `dist` unchanged or an exact zero, and adding exact zeros cannot
+/// move an f64 sum.
 #[test]
-fn the_bitboard_sampler_picks_the_same_moves_as_the_oracle_sampler() {
-    let n: usize = std::env::var("PARITY_GAMES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10_000)
-        .min(2_000);
+fn the_weighted_sampler_picks_the_same_moves_as_the_oracle_sampler() {
+    // Fixed, and deliberately not honouring `PARITY_GAMES`: the step count asserted at the
+    // end is the length of the longest game in *this* population, so it is only a constant
+    // for a fixed number of games.
+    let n: usize = 2_000;
     let seed = 0x5a3_1e5u64;
 
-    // Both distributions are strictly positive on purpose. If every *legal* square carries
-    // exactly zero weight, both samplers take the same documented fallback — a uniform draw
-    // over all 160 squares — which can land on a square that is not playable at all. The
-    // reference absorbs that because it rescores the board from scratch; the incremental
-    // engine's `insert` assumes the square it is handed was playable, so from there the two
-    // legitimately disagree. That is inherited from the Python and is not what this test is
-    // about; a softmax policy never produces it.
+    // Both distributions are strictly positive on purpose. If every *legal* square carried
+    // exactly zero weight, both samplers would fall back — but to different things. The
+    // oracle takes a uniform draw over all 160 squares, which can land on a square that is
+    // not playable at all; it absorbs that because it rescores the board from scratch.
+    // `Game::sample_move` deliberately falls back to a uniform draw over the *legal* squares
+    // instead, which is the sane behaviour and not bit-compatible with the quirk. A softmax
+    // policy never produces the situation.
     let mut rng = Rng::new(seed);
     let d0: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
     let d1: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
 
     let mut refg = Oracle::new(n, seed);
-    let mut inc = IncrementalGame::new(n, seed);
+    let mut games: Vec<Game> = (0..n).map(|_| Game::new()).collect();
+    let mut scratch = Scratch::new();
+    // the engine's own RNG, seeded identically but stepped separately — the two must stay in
+    // lockstep by consuming the same draws, not by sharing a generator
+    let mut engine_rng = Rng::new(seed);
     let mut steps = 0usize;
 
     while !refg.finished.iter().all(|&f| f) {
         refg.distribution_step(&d0, &d1);
-        inc.distribution_step(&d0, &d1);
-        assert_eq!(inc.boards, refg.boards, "sampler diverged at step {steps}");
-        assert_eq!(scores_as_f32(&inc), refg.scores, "scores diverged at step {steps}");
-        check_levels_and_scores(&inc, &format!("step {steps}"));
-        check_legality(&inc, &format!("step {steps}"));
+        sampled_step(&mut games, &d0, &d1, &mut engine_rng, &mut scratch);
+        assert_eq!(boards_of(&games), refg.boards, "sampler diverged at step {steps}");
+        assert_eq!(scores_as_f32(&games), refg.scores, "scores diverged at step {steps}");
+        check_levels_and_scores(&games, &format!("step {steps}"));
+        check_legality(&games, &format!("step {steps}"));
         steps += 1;
         assert!(steps < 200, "rollout did not terminate");
     }
-    assert_eq!(steps, 44, "a full rollout should take 44 steps, took {steps}");
+    assert_eq!(steps, 44, "{n} games should take 44 steps to all finish, took {steps}");
 }
 
 /// Every externally visible call, checked against the oracle on many game states.
 ///
-/// The two tests above cover the engine's *behaviour* — that playing a game produces the
-/// same board and the same score. This one covers its *surface*: for each public call, on
-/// each of a rollout's states, does the engine hand back what the oracle says it should.
+/// The two tests above cover the engine's *behaviour* — that playing a game produces the same
+/// board and the same score. This one covers its *surface*: for each public call, on each of
+/// a rollout's states, does the engine hand back what the oracle says it should.
 ///
 /// `legal_bits` is the one call returning a different representation rather than different
 /// data: it packs into 80 bits what the oracle spreads over 160 floats. So it is checked for
@@ -357,8 +420,6 @@ fn the_bitboard_sampler_picks_the_same_moves_as_the_oracle_sampler() {
 /// checked to be exactly that set intersected with the first-move half rule.
 #[test]
 fn every_public_call_agrees_with_the_oracle() {
-    use alpha_lines_game::incremental::LEGAL_WORDS;
-
     let n: usize = 512;
     let seed = 0xc0de_5eedu64;
     let half = WIDTH / 2;
@@ -366,23 +427,28 @@ fn every_public_call_agrees_with_the_oracle() {
     let mut rng = Rng::new(seed);
     let d0: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
     let d1: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+    let uniform = vec![1.0f32; HW];
 
     let mut refg = Oracle::new(n, seed);
-    let mut inc = IncrementalGame::new(n, seed);
+    let mut games: Vec<Game> = (0..n).map(|_| Game::new()).collect();
+    let mut scratch = Scratch::new();
+    let mut engine_rng = Rng::new(seed);
+    let mut draw_rng = Rng::new(seed ^ 0xdd);
     let mut steps = 0usize;
 
     loop {
-        assert_eq!(inc.boards, refg.boards, "boards at step {steps}");
-        assert_eq!(scores_as_f32(&inc), refg.scores, "scores at step {steps}");
-        assert_eq!(inc.move_counts, refg.move_counts, "move_counts at step {steps}");
-        assert_eq!(inc.finished, refg.finished, "finished at step {steps}");
-        assert_eq!(inc.scores.len(), 2 * n, "one integer score per player per game");
+        assert_eq!(boards_of(&games), refg.boards, "boards at step {steps}");
+        assert_eq!(scores_as_f32(&games), refg.scores, "scores at step {steps}");
 
-        // legal_bits, cell by cell, against the board and against the oracle's masks
         let (want0, want1, wc0, wc1) = refg.masks();
-        for g in 0..n {
-            let bits = inc.legal_bits(g);
-            assert_eq!(bits.len(), LEGAL_WORDS);
+        for (g, game) in games.iter().enumerate() {
+            assert_eq!(game.move_count as i32, refg.move_counts[g], "move_count g{g}");
+            assert_eq!(game.finished, refg.finished[g], "finished g{g}");
+            assert_eq!(game.margin(), game.scores[0] - game.scores[1], "margin g{g}");
+
+            // legal_bits / legal_moves / legal_count / is_legal, cell by cell, against the
+            // board and against the oracle's masks
+            let bits = game.legal_bits();
             let first = refg.move_counts[g] == 0;
             let (mut n0, mut n1) = (0.0f32, 0.0f32);
             for i in 0..HW {
@@ -395,109 +461,120 @@ fn every_public_call_agrees_with_the_oracle() {
                 let want_1 = playable && !(first && c < half);
                 assert_eq!(want0[g * HW + i] == 1.0, want_0, "mask0 g{g} cell {i}");
                 assert_eq!(want1[g * HW + i] == 1.0, want_1, "mask1 g{g} cell {i}");
+                assert_eq!(game.is_legal(i, 0), want_0, "is_legal g{g} p0 cell {i}");
+                assert_eq!(game.is_legal(i, 1), want_1, "is_legal g{g} p1 cell {i}");
                 n0 += f32::from(want_0);
                 n1 += f32::from(want_1);
             }
             assert_eq!((wc0[g], wc1[g]), (n0, n1), "legal counts g{g} at step {steps}");
+            assert_eq!(game.legal_count(0) as f32, n0, "legal_count g{g} p0");
+            assert_eq!(game.legal_count(1) as f32, n1, "legal_count g{g} p1");
+
+            // both samplers have to land inside the legal set, and inside this player's half
+            // on the opening move
+            if !game.finished {
+                for player in [0usize, 1usize] {
+                    let a = game.random_move(player, &mut draw_rng);
+                    let b = game.sample_move(&uniform, player, &mut draw_rng);
+                    assert!(game.is_legal(a, player), "random_move g{g} p{player} illegal");
+                    assert!(game.is_legal(b, player), "sample_move g{g} p{player} illegal");
+                }
+            }
         }
 
-        // from_state is handed the board and nothing else, so everything else has to come
-        // back from it — including the two flags it is no longer told
-        let rebuilt = IncrementalGame::from_state(inc.boards.clone(), seed);
-        assert_eq!(rebuilt.scores, inc.scores, "from_state scores at step {steps}");
-        assert_eq!(rebuilt.levels, inc.levels, "from_state levels at step {steps}");
-        assert_eq!(rebuilt.finished, inc.finished, "from_state finished at step {steps}");
-        assert_eq!(
-            rebuilt.move_counts.iter().map(|&m| m.min(1)).collect::<Vec<_>>(),
-            inc.move_counts.iter().map(|&m| m.min(1)).collect::<Vec<_>>(),
-            "from_state first-move flag at step {steps}"
-        );
-        check_levels_and_scores(&rebuilt, "from_state");
-        check_legality(&rebuilt, "from_state");
+        // from_cells is handed the board and nothing else, so everything else has to come
+        // back from it — including the two flags it is no longer told. `move_count` is the
+        // one thing that cannot: the board records whether any move was made, not how many,
+        // which is all the opening-move rule ever asks.
+        for (g, game) in games.iter().enumerate() {
+            let mut adopted = Game::from_cells(game.cells, &mut scratch);
+            assert_eq!(
+                adopted.move_count,
+                u32::from(game.move_count > 0),
+                "from_cells g{g} first-move flag at step {steps}"
+            );
+            adopted.move_count = game.move_count;
+            assert_eq!(adopted, *game, "from_cells g{g} differs at step {steps}");
+        }
 
         if refg.finished.iter().all(|&f| f) {
             break;
         }
         refg.distribution_step(&d0, &d1);
-        inc.distribution_step(&d0, &d1);
+        sampled_step(&mut games, &d0, &d1, &mut engine_rng, &mut scratch);
         steps += 1;
         assert!(steps < 200, "rollout did not terminate");
     }
 
-    // an illegal action must be rejected, name the games it was wrong about, and leave the
-    // batch exactly as it was
-    let mut a = IncrementalGame::new(n, seed);
-    let before = a.boards.clone();
-    let bad = vec![1i64; n]; // (0,1) is not a playable square
-    let err = a.action_step(&bad, &bad).unwrap_err();
-    assert!(err.contains("Invalid move"), "unexpected rejection message: {err}");
-    assert!(err.contains(&format!("{}", n - 1)), "the message should name every bad game");
-    assert_eq!(a.boards, before, "a rejected action_step must leave the batch untouched");
-
     println!("{n} games, {steps} steps, every public call compared at every step");
 }
 
-/// `clone_states_to_batch` copies derived state — levels and the legality bitboard — rather
-/// than recomputing it. That is the whole reason it is cheap, and also the whole reason it
-/// can be wrong in a way `from_state` cannot: a copy that drops or shifts a field produces a
-/// batch that looks fine until it is played. So the clone is checked three ways: against a
-/// from-scratch rebuild of the same boards, against its parent field by field, and by being
-/// played forward to make sure it behaves like the games it came from.
+/// Forking a position must produce a game that neither feels nor is felt by its parent.
+///
+/// This is the operation a tree search leans on hardest, and the way it breaks is quiet: a
+/// clone that shared something would look right until two branches were played apart. The
+/// derived `Clone` cannot drop a field, but the [`Scratch`] the two games take turns
+/// borrowing could carry state from one into the other — so the parent and the fork are
+/// played apart through *one* workspace, in alternating order, and both are held to the
+/// oracle's scorer the whole way.
 #[test]
-fn a_clone_carries_the_whole_state_and_keeps_playing_correctly() {
+fn a_fork_is_independent_of_the_game_it_came_from() {
     let n = 256;
-    let seed = 0xc10e_5eedu64;
+    let seed = 0xf0_1ced_u64;
     let mut rng = Rng::new(seed);
-    let d0: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
-    let d1: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+    let mut scratch = Scratch::new();
 
-    let mut inc = IncrementalGame::new(n, seed);
+    let mut parents: Vec<Game> = (0..n).map(|_| Game::new()).collect();
     for _ in 0..12 {
-        inc.distribution_step(&d0, &d1);
+        for game in parents.iter_mut() {
+            let (i0, i1) = (game.random_move(0, &mut rng), game.random_move(1, &mut rng));
+            game.apply(i0, i1, &mut scratch);
+        }
     }
 
-    // naming a game twice must give two independent copies, so the list is deliberately
-    // out of order and has a repeat in it
-    let picked: Vec<usize> = (0..n).step_by(5).chain([3, 3, 1, 0]).collect();
-    let clone = inc.clone_states_to_batch(&picked);
-    assert_eq!(clone.n, picked.len());
+    // a fork is a memcpy, and equal to what it came from
+    let mut forks: Vec<Game> = parents.clone();
+    assert_eq!(forks, parents, "a fresh fork differs from its parent");
+    // a third copy, taken at the same moment and then never touched again, plus the boards
+    // it held at that moment recorded outside any Game
+    let frozen = parents.clone();
+    let fork_point: Vec<[i8; HW]> = parents.iter().map(|g| g.cells).collect();
 
-    check_levels_and_scores(&clone, "clone");
-    check_legality(&clone, "clone");
-
-    // every field must equal the game it was copied from
-    for (d, &g) in picked.iter().enumerate() {
-        assert_eq!(&clone.boards[d * HW..(d + 1) * HW], &inc.boards[g * HW..(g + 1) * HW],
-                   "clone board {d} <- {g}");
-        assert_eq!(&clone.levels[d * HW..(d + 1) * HW], &inc.levels[g * HW..(g + 1) * HW],
-                   "clone levels {d} <- {g}");
-        assert_eq!(clone.legal_bits(d), inc.legal_bits(g), "clone legality {d} <- {g}");
-        assert_eq!(&clone.scores[d * 2..d * 2 + 2], &inc.scores[g * 2..g * 2 + 2],
-                   "clone scores {d} <- {g}");
-        assert_eq!(clone.move_counts[d], inc.move_counts[g], "clone move_count {d} <- {g}");
-        assert_eq!(clone.finished[d], inc.finished[g], "clone finished {d} <- {g}");
-    }
-
-    // and it must be indistinguishable from adopting the same boards the slow way
-    let rebuilt = IncrementalGame::from_state(clone.boards.clone(), seed);
-    assert_eq!(clone.levels, rebuilt.levels, "clone levels differ from a from-scratch rebuild");
-    assert_eq!(clone.scores, rebuilt.scores, "clone scores differ from a from-scratch rebuild");
-    assert_eq!(clone.finished, rebuilt.finished, "clone finished differs");
-
-    // finally: play it out, and require it to stay correct the whole way
-    let mut clone = clone;
-    let cn = clone.n;
-    let e0: Vec<f32> = (0..cn * HW).map(|_| rng.random() as f32).collect();
-    let e1: Vec<f32> = (0..cn * HW).map(|_| rng.random() as f32).collect();
+    // play them apart, alternating so the shared scratch is handed back and forth mid-game
     let mut steps = 0;
-    while !clone.finished.iter().all(|&f| f) {
-        clone.distribution_step(&e0, &e1);
-        check_levels_and_scores(&clone, &format!("clone, step {steps}"));
-        check_legality(&clone, &format!("clone, step {steps}"));
+    while parents.iter().any(|g| !g.finished) || forks.iter().any(|g| !g.finished) {
+        for g in 0..n {
+            for side in [&mut parents, &mut forks] {
+                let game = &mut side[g];
+                if game.finished {
+                    continue;
+                }
+                let (i0, i1) = (game.random_move(0, &mut rng), game.random_move(1, &mut rng));
+                game.apply(i0, i1, &mut scratch);
+            }
+        }
+        check_levels_and_scores(&parents, &format!("parent, step {steps}"));
+        check_levels_and_scores(&forks, &format!("fork, step {steps}"));
+        check_legality(&parents, &format!("parent, step {steps}"));
+        check_legality(&forks, &format!("fork, step {steps}"));
         steps += 1;
-        assert!(steps < 200, "clone did not terminate");
+        assert!(steps < 200, "rollout did not terminate");
     }
-    assert!(steps > 10, "the clone finished suspiciously fast");
+    assert!(steps > 10, "the games finished suspiciously fast");
+
+    // they were played apart, so they must have ended apart — otherwise this test would pass
+    // just as happily if `apply` did nothing
+    assert!(
+        (0..n).any(|g| parents[g].cells != forks[g].cells),
+        "a parent and its fork played independently ended up identical"
+    );
+    // and the copy nobody played must still hold the position it was forked from — checked
+    // against boards recorded outside any Game, so nothing that happened afterwards, in
+    // either branch or in the workspace they shared, wrote through into it
+    for g in 0..n {
+        assert_eq!(frozen[g].cells, fork_point[g], "an untouched fork was written into");
+        assert_ne!(frozen[g].cells, parents[g].cells, "the parent never left the fork point");
+    }
 }
 
 /// The engine and the oracle define the square encoding and the RNG separately — on purpose,
@@ -506,16 +583,16 @@ fn a_clone_carries_the_whole_state_and_keeps_playing_correctly() {
 /// constants are a compile-time check and cost nothing to keep.
 #[test]
 fn the_engine_and_the_oracle_still_agree_on_the_encoding_and_the_rng() {
-    use alpha_lines_game::incremental as inc;
+    use alpha_lines_game::game as eng;
 
-    const _: () = assert!(inc::NON_PLAYABLE_SQUARE == oracle::NON_PLAYABLE_SQUARE);
-    const _: () = assert!(inc::PLAYABLE_SQUARE == oracle::PLAYABLE_SQUARE);
-    const _: () = assert!(inc::REMOVED_SQUARE == oracle::REMOVED_SQUARE);
-    const _: () = assert!(inc::PLAYER_0_MARK == oracle::PLAYER_0_MARK);
-    const _: () = assert!(inc::PLAYER_1_MARK == oracle::PLAYER_1_MARK);
+    const _: () = assert!(eng::NON_PLAYABLE_SQUARE == oracle::NON_PLAYABLE_SQUARE);
+    const _: () = assert!(eng::PLAYABLE_SQUARE == oracle::PLAYABLE_SQUARE);
+    const _: () = assert!(eng::REMOVED_SQUARE == oracle::REMOVED_SQUARE);
+    const _: () = assert!(eng::PLAYER_0_MARK == oracle::PLAYER_0_MARK);
+    const _: () = assert!(eng::PLAYER_1_MARK == oracle::PLAYER_1_MARK);
 
     // and the two RNGs must be the same generator, or the samplers would diverge
-    let (mut a, mut b) = (inc::Rng::new(0xabc), oracle::Rng::new(0xabc));
+    let (mut a, mut b) = (eng::Rng::new(0xabc), oracle::Rng::new(0xabc));
     for k in 0..1000 {
         assert_eq!(a.next_u64(), b.next_u64(), "rng streams diverged at draw {k}");
     }
@@ -530,16 +607,18 @@ fn no_real_level_ever_comes_close_to_the_cap() {
     let n = 2048;
     let seed = 0x1e5e_1u64;
     let mut rng = Rng::new(seed);
-    let d0: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
-    let d1: Vec<f32> = (0..n * HW).map(|_| rng.random() as f32).collect();
+    let mut scratch = Scratch::new();
 
-    let mut inc = IncrementalGame::new(n, seed);
     let mut highest = 0u8;
-    while !inc.finished.iter().all(|&f| f) {
-        inc.distribution_step(&d0, &d1);
-        for &l in &inc.levels {
-            if l != INF && l > highest {
-                highest = l;
+    for _ in 0..n {
+        let mut game = Game::new();
+        while !game.finished {
+            let (i0, i1) = (game.random_move(0, &mut rng), game.random_move(1, &mut rng));
+            game.apply(i0, i1, &mut scratch);
+            for &l in &game.levels {
+                if l != INF && l > highest {
+                    highest = l;
+                }
             }
         }
     }
