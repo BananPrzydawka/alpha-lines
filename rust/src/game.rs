@@ -10,7 +10,8 @@
 //! because a bit cannot survive a deletion in the middle of a line anchored at both ends.
 //!
 //! Only `(r + c)` even squares are playable, so a mark's only neighbours are its four
-//! diagonals — that is what [`DIAG`] encodes.
+//! diagonals — that is what [`DIAG`] encodes. Those 80 squares are what the engine stores
+//! and indexes; see [`SQUARES`].
 //!
 //! [`Game`] is the public surface. Everything above it is the scorer it sits on. The module
 //! has no dependencies on the rest of the crate and can be lifted out as a single file.
@@ -19,8 +20,19 @@
 pub const HEIGHT: usize = 10;
 pub const WIDTH: usize = 16;
 
-/// Cells per board.
+/// Cells on the `HEIGHT x WIDTH` board, half of which can never hold anything.
 pub const HW: usize = HEIGHT * WIDTH;
+
+/// Playable squares, and the size of every array here.
+///
+/// The engine indexes squares, not board cells: `square = r * ROW + j`, where `j` counts the
+/// playable columns of row `r`, which are `2j + (r & 1)`. Same index space as the legality
+/// mask, so a mask bit and a `cells` entry are the same number. [`board_index`] and
+/// [`square_index`] convert at the boundary.
+pub const SQUARES: usize = HW / 2;
+
+/// Playable squares per row.
+pub const ROW: usize = WIDTH / 2;
 
 /// Square encoding. A square is one of these five things and nothing else.
 pub const NON_PLAYABLE_SQUARE: i8 = 0;
@@ -32,12 +44,12 @@ pub const PLAYER_1_MARK: i8 = 4;
 /// "No route to the border." Also acts as the saturating top of the level range.
 pub const INF: u8 = 255;
 
-/// The largest level a real path can have: a player holds at most `HW / 4` marks and a
+/// The largest level a real path can have: a player holds at most `SQUARES / 2` marks and a
 /// shortest path visits each once. A bound, not a mechanism — nothing legitimate hits it.
-pub const MAX_LEVEL: u8 = (HW / 4) as u8;
+pub const MAX_LEVEL: u8 = (SQUARES / 2) as u8;
 
 const _: () = assert!(
-    HW / 4 < INF as usize,
+    SQUARES / 2 < INF as usize,
     "board is too large for a u8 level: MAX_LEVEL would collide with INF"
 );
 
@@ -105,37 +117,63 @@ impl Rng {
 
 // -------------------------------------------------------------------------------- geometry
 
-/// The four diagonal neighbours: the only neighbours a mark can have.
-const DIAG: [(i64, i64); 4] = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
+/// A diagonal step, as a row delta and whether it moves left. The four of these are the only
+/// neighbours a mark can have, since orthogonal neighbours are never playable.
+type Dir = (i64, bool);
+
+const DIAG: [Dir; 4] = [(-1, true), (-1, false), (1, true), (1, false)];
 
 /// The two diagonal families that score, as forward steps.
 /// Anti-diagonals hold `r + c` constant; main diagonals hold `c - r` constant.
-const ANTI: (i64, i64) = (1, -1);
-const MAIN: (i64, i64) = (1, 1);
-const FAMILIES: [(i64, i64); 2] = [ANTI, MAIN];
+const ANTI: Dir = (1, true);
+const MAIN: Dir = (1, false);
+const FAMILIES: [Dir; 2] = [ANTI, MAIN];
 
 #[inline]
-fn on_border(i: usize) -> bool {
-    let (r, c) = (i / WIDTH, i % WIDTH);
-    r == 0 || r == HEIGHT - 1 || c == 0 || c == WIDTH - 1
+fn back(d: Dir) -> Dir {
+    (-d.0, !d.1)
 }
 
-/// The cell one step `(dr, dc)` from `i`, or `None` if that leaves the board.
+/// The squares on the edge of the board, precomputed.
+const BORDER: [u64; LEGAL_WORDS] = {
+    let mut m = [0u64; LEGAL_WORDS];
+    let mut k = 0;
+    while k < SQUARES {
+        let (r, j) = (k / ROW, k % ROW);
+        let c = 2 * j + (r & 1);
+        if r == 0 || r == HEIGHT - 1 || c == 0 || c == WIDTH - 1 {
+            m[k >> 6] |= 1u64 << (k & 63);
+        }
+        k += 1;
+    }
+    m
+};
+
 #[inline]
-fn step(i: usize, d: (i64, i64)) -> Option<usize> {
-    let (r, c) = ((i / WIDTH) as i64, (i % WIDTH) as i64);
-    let (nr, nc) = (r + d.0, c + d.1);
-    if nr < 0 || nr >= HEIGHT as i64 || nc < 0 || nc >= WIDTH as i64 {
+fn on_border(k: usize) -> bool {
+    BORDER[k >> 6] >> (k & 63) & 1 == 1
+}
+
+/// The square one diagonal step `d` from `k`, or `None` if that leaves the board.
+///
+/// A diagonal always changes the row by one, which flips its parity, so the playable column
+/// moves by `(r & 1)` going right and `(r & 1) - 1` going left.
+#[inline]
+fn step(k: usize, d: Dir) -> Option<usize> {
+    let (r, j) = ((k / ROW) as i64, (k % ROW) as i64);
+    let nr = r + d.0;
+    let nj = j + (r & 1) - i64::from(d.1);
+    if nr < 0 || nr >= HEIGHT as i64 || nj < 0 || nj >= ROW as i64 {
         None
     } else {
-        Some(nr as usize * WIDTH + nc as usize)
+        Some(nr as usize * ROW + nj as usize)
     }
 }
 
-/// Is the cell one step `d` from `i` a mark of player `p`?
+/// Is the square one step `d` from `k` a mark of player `p`?
 #[inline]
-fn mark_at(cells: &[i8], i: usize, d: (i64, i64), p: i8) -> bool {
-    matches!(step(i, d), Some(n) if cells[n] == p)
+fn mark_at(cells: &[i8], k: usize, d: Dir, p: i8) -> bool {
+    matches!(step(k, d), Some(n) if cells[n] == p)
 }
 
 #[inline]
@@ -175,11 +213,11 @@ impl Default for Scratch {
 impl Scratch {
     pub fn new() -> Self {
         Scratch {
-            stamp: vec![0; HW],
+            stamp: vec![0; SQUARES],
             epoch: 0,
-            stack: Vec::with_capacity(HW),
-            queue: Vec::with_capacity(HW),
-            comp: Vec::with_capacity(HW),
+            stack: Vec::with_capacity(SQUARES),
+            queue: Vec::with_capacity(SQUARES),
+            comp: Vec::with_capacity(SQUARES),
             deps: Vec::with_capacity(4),
             buckets: (0..=MAX_LEVEL as usize).map(|_| Vec::new()).collect(),
             cursor: 0,
@@ -338,7 +376,7 @@ pub fn rebuild_levels(cells: &[i8], level: &mut [u8], s: &mut Scratch) {
     level.iter_mut().for_each(|l| *l = INF);
     for p in [PLAYER_0_MARK, PLAYER_1_MARK] {
         s.queue_reset();
-        for i in 0..HW {
+        for i in 0..SQUARES {
             if cells[i] == p && on_border(i) {
                 level[i] = 0;
                 s.push(i, 0);
@@ -398,7 +436,7 @@ fn contribution(cells: &[i8], level: &[u8], cells_of_interest: &[u16], p: i8) ->
 /// The whole board's score for `p`. Only for adopting a board; otherwise the score is
 /// maintained incrementally.
 fn score_board(cells: &[i8], level: &[u8], p: i8) -> i32 {
-    (0..HW).map(|i| runs_starting_at(cells, level, i, p)).sum()
+    (0..SQUARES).map(|i| runs_starting_at(cells, level, i, p)).sum()
 }
 
 /// Score of the runs that *begin* at `i`, in either family. Zero if `i` holds no mark of
@@ -410,8 +448,7 @@ fn runs_starting_at(cells: &[i8], level: &[u8], i: usize, p: i8) -> i32 {
     }
     let mut total = 0i32;
     for v in FAMILIES {
-        let back = (-v.0, -v.1);
-        if mark_at(cells, i, back, p) {
+        if mark_at(cells, i, back(v), p) {
             continue; // not the first cell of this run
         }
         let mut run_len = 1i32;
@@ -430,7 +467,7 @@ fn runs_starting_at(cells: &[i8], level: &[u8], i: usize, p: i8) -> i32 {
     total
 }
 
-fn run_side(cells: &[i8], i: usize, v: (i64, i64), p: i8) -> i32 {
+fn run_side(cells: &[i8], i: usize, v: Dir, p: i8) -> i32 {
     match step(i, v) {
         Some(a) if cells[a] == p => match step(a, v) {
             Some(b) if cells[b] == p => 2,
@@ -447,8 +484,7 @@ fn run_side(cells: &[i8], i: usize, v: (i64, i64), p: i8) -> i32 {
 fn local_delta(cells: &[i8], i: usize, p: i8) -> i32 {
     let mut d = 0;
     for v in FAMILIES {
-        let back = (-v.0, -v.1);
-        let la = run_side(cells, i, back, p);
+        let la = run_side(cells, i, back(v), p);
         let lb = run_side(cells, i, v, p);
         if la > 0 || lb > 0 {
             d += 1 + (la == 1) as i32 + (lb == 1) as i32;
@@ -606,80 +642,62 @@ fn apply_move(
 
 // ------------------------------------------------------------------- legality bitboard
 
-/// `u64`s in a legality mask. The 80 playable squares pack into 80 bits: `i / 2` maps them
-/// onto `0..80` densely and in row-major order, since row `r`'s playable columns are
-/// `2j + (r & 1)`, so `i / 2 == r * 8 + j`. Order matters — the sampler's cumulative scan
-/// walks bits low to high, which is board order.
+/// `u64`s in a legality mask: one bit per square, in the same index space as `cells`, so bit
+/// `k` and `cells[k]` are the same square. Walk a mask with
+/// `while w != 0 { let sq = base + w.trailing_zeros() as usize; w &= w - 1; }`.
 ///
 /// This is a count of words, not a width; the words are `u64` at every use site.
 pub const LEGAL_WORDS: usize = 2;
 
-const _: () = assert!(HW / 2 == 80, "the legality bitboard assumes 80 playable squares");
-const _: () = assert!(LEGAL_WORDS * 64 >= HW / 2, "the mask cannot hold every playable square");
+const _: () = assert!(LEGAL_WORDS * 64 >= SQUARES, "the mask cannot hold every square");
 
-/// The 80 valid bits — the opening position.
+/// Every square, which is the opening position.
 const LEGAL_ALL: [u64; LEGAL_WORDS] = [!0u64, 0xFFFF];
 
-/// The opening-move half-board rule, precomputed: `c < 8` is `j < 4` for both row parities,
-/// so the rule is the low nibble of every byte and applying it is one `AND`.
+/// The opening-move half-board rule, precomputed: `c < WIDTH / 2` is `j < ROW / 2` for both
+/// row parities, so the rule is the low nibble of every byte and applying it is one `AND`.
 const LEGAL_LEFT: [u64; LEGAL_WORDS] = [0x0F0F_0F0F_0F0F_0F0F, 0x0F0F];
 const LEGAL_RIGHT: [u64; LEGAL_WORDS] = [0xF0F0_F0F0_F0F0_F0F0, 0xF0F0];
 
-/// Word and bit for a board index. A non-playable index aliases onto its even neighbour,
-/// harmless because that bit is never set.
-#[inline]
-fn legal_bit(i: usize) -> (usize, u64) {
-    let k = i >> 1;
-    (k >> 6, 1u64 << (k & 63))
-}
-
-/// The board index a bit position stands for — the decoder for [`Game::legal_moves`], which
-/// is otherwise 80 opaque bit positions. Walk a mask with
-/// `while w != 0 { let cell = legal_cell(base + w.trailing_zeros() as usize); w &= w - 1; }`.
-#[inline]
-pub fn legal_cell(k: usize) -> usize {
-    (k << 1) | ((k >> 3) & 1)
-}
-
 /// Mark a square as no longer playable: every square a move writes, marked or blasted.
 #[inline]
-fn clear_legal(legal: &mut [u64], i: usize) {
-    let (w, b) = legal_bit(i);
-    legal[w] &= !b;
+fn clear_legal(legal: &mut [u64], k: usize) {
+    legal[k >> 6] &= !(1u64 << (k & 63));
+}
+
+/// The board index — row-major over `HEIGHT x WIDTH` — of a square. For talking to anything
+/// that wants the full board: a printed position, a policy tensor, the Python.
+#[inline]
+pub fn board_index(square: usize) -> usize {
+    let (r, j) = (square / ROW, square % ROW);
+    r * WIDTH + 2 * j + (r & 1)
+}
+
+/// The square at a board index, or `None` if that cell is not playable.
+#[inline]
+pub fn square_index(board: usize) -> Option<usize> {
+    if board >= HW || (board / WIDTH + board % WIDTH) % 2 != 0 {
+        return None;
+    }
+    Some(board / WIDTH * ROW + board % WIDTH / 2)
 }
 
 
 // ------------------------------------------------------------------------- single game
 
-/// The opening position, laid out at compile time so `Game::new` is a memcpy.
-const OPENING: [i8; HW] = {
-    let mut a = [NON_PLAYABLE_SQUARE; HW];
-    let mut r = 0;
-    while r < HEIGHT {
-        let mut c = 0;
-        while c < WIDTH {
-            if (r + c) % 2 == 0 {
-                a[r * WIDTH + c] = PLAYABLE_SQUARE;
-            }
-            c += 1;
-        }
-        r += 1;
-    }
-    a
-};
-
-/// One game: ~350 bytes of fixed-size arrays, no indirection, no allocation. Clone it into
-/// a tree node, play it forward, throw it away.
+/// One game: 192 bytes of fixed-size arrays, no indirection, no allocation. Clone it into a
+/// tree node, play it forward, throw it away.
 ///
 /// It carries the scorer's derived state — `levels` and the running `scores` — which is why
 /// a clone is a memcpy while [`Self::from_cells`] has to pay for a BFS and a full rescore.
 /// The [`Scratch`] is not part of it; pass one in.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Game {
-    /// The board, row-major, in the encoding at the top of this file.
-    pub cells: [i8; HW],
+    /// One entry per playable square, in the encoding at the top of this file. Indexed by
+    /// square, not board cell — see [`SQUARES`], [`board_index`].
+    pub cells: [i8; SQUARES],
     /// Steps to the border through own marks, parallel to `cells`. See the module docs.
-    pub levels: [u8; HW],
+    pub levels: [u8; SQUARES],
     /// Running score, integer because every score is a sum of run lengths.
     pub scores: [i32; 2],
     /// Only ever compared against zero, for the opening-move half-board rule.
@@ -695,11 +713,11 @@ impl Default for Game {
 }
 
 impl Game {
-    /// The opening position: 80 playable squares, nothing played.
+    /// The opening position: every square playable, nothing played.
     pub fn new() -> Self {
         Game {
-            cells: OPENING,
-            levels: [INF; HW],
+            cells: [PLAYABLE_SQUARE; SQUARES],
+            levels: [INF; SQUARES],
             scores: [0; 2],
             move_count: 0,
             finished: false,
@@ -713,19 +731,18 @@ impl Game {
     /// `move_count` comes back as 0 or 1, not the real count — the board records whether a
     /// move was made, not how many, and the half-board rule only asks which. Same rule the
     /// Python applies when importing a printed board.
-    pub fn from_cells(cells: [i8; HW], s: &mut Scratch) -> Self {
+    pub fn from_cells(cells: [i8; SQUARES], s: &mut Scratch) -> Self {
         let mut g = Game {
             cells,
-            levels: [INF; HW],
+            levels: [INF; SQUARES],
             scores: [0; 2],
             move_count: 0,
             finished: false,
             legal: [0; LEGAL_WORDS],
         };
-        for i in 0..HW {
-            if g.cells[i] == PLAYABLE_SQUARE {
-                let (w, b) = legal_bit(i);
-                g.legal[w] |= b;
+        for k in 0..SQUARES {
+            if g.cells[k] == PLAYABLE_SQUARE {
+                g.legal[k >> 6] |= 1u64 << (k & 63);
             }
         }
         let played = g
@@ -748,9 +765,10 @@ impl Game {
         self.legal[0] == 0 && self.legal[1] == 0
     }
 
-    /// The squares `player` may play, as a mask: 80 bits, decoded by [`legal_cell`]. On the
-    /// opening move this is narrowed to the player's half; after it, both players see the
-    /// same two words, so `legal_moves(0) | legal_moves(1)` is the playable set.
+    /// The squares `player` may play, as a mask: one bit per square, same index space as
+    /// `cells`. On the opening move this is narrowed to the player's half; after it, both
+    /// players see the same two words, so `legal_moves(0) | legal_moves(1)` is the playable
+    /// set.
     #[inline]
     pub fn legal_moves(&self, player: usize) -> [u64; LEGAL_WORDS] {
         let half = if self.move_count != 0 {
@@ -770,7 +788,7 @@ impl Game {
         w[0].count_ones() + w[1].count_ones()
     }
 
-    /// The board index of the `k`th set bit of `w`, from the low end.
+    /// The square of the `k`th set bit of `w`, from the low end.
     #[inline]
     fn select(w: [u64; LEGAL_WORDS], mut k: u32) -> usize {
         for (wi, &word) in w.iter().enumerate() {
@@ -780,7 +798,7 @@ impl Game {
                 for _ in 0..k {
                     x &= x - 1; // drop the lowest set bit
                 }
-                return legal_cell((wi << 6) + x.trailing_zeros() as usize);
+                return (wi << 6) + x.trailing_zeros() as usize;
             }
             k -= c;
         }
@@ -795,10 +813,10 @@ impl Game {
         Self::select(w, rng.randint(count as u64) as u32)
     }
 
-    /// Draw one legal move for `player`, weighting each square by `dist`. Weights need not
-    /// be normalized; an all-zero distribution falls back to a uniform draw over the mask.
+    /// Draw one legal move for `player`, weighting each square by `dist[square]`. Weights
+    /// need not be normalized; an all-zero distribution falls back to a uniform draw.
     fn sample(&self, dist: &[f32], player: usize, rng: &mut Rng) -> usize {
-        debug_assert!(dist.len() >= HW, "distribution must cover the board");
+        debug_assert!(dist.len() >= SQUARES, "distribution must cover every square");
         let words = self.legal_moves(player);
 
         let mut total = 0.0f64;
@@ -807,7 +825,7 @@ impl Game {
             while w != 0 {
                 let k = (wi << 6) + w.trailing_zeros() as usize;
                 w &= w - 1;
-                total += dist[legal_cell(k)] as f64;
+                total += dist[k] as f64;
             }
         }
         if total < 1e-8 {
@@ -822,12 +840,11 @@ impl Game {
             while w != 0 {
                 let k = (wi << 6) + w.trailing_zeros() as usize;
                 w &= w - 1;
-                let cell = legal_cell(k);
-                let v = dist[cell] as f64;
+                let v = dist[k] as f64;
                 if v > 0.0 {
                     cum += v;
                     if cum >= threshold {
-                        chosen = cell;
+                        chosen = k;
                         break 'scan;
                     }
                 }
@@ -840,8 +857,8 @@ impl Game {
         chosen
     }
 
-    /// Play the moves `i0` and `i1`, as board indices. Equal indices are a collision, which
-    /// clears that square and its four diagonal neighbours.
+    /// Play the moves `i0` and `i1`, as squares. Equal indices are a collision, which clears
+    /// that square and its four diagonal neighbours.
     ///
     /// Both moves must be legal — checked in debug builds only, so pick them out of
     /// [`Self::legal_moves`].
@@ -863,9 +880,9 @@ impl Game {
         self.finished = self.no_moves_left();
     }
 
-    /// Play one move drawn from a weight per square for each player, `dist_0[0..HW]` and
-    /// `dist_1[0..HW]`. The other way in besides [`Self::action_step`]; they differ only in
-    /// where the moves come from.
+    /// Play one move drawn from a weight per square for each player, `dist_0[0..SQUARES]`
+    /// and `dist_1[0..SQUARES]`. The other way in besides [`Self::action_step`]; they differ
+    /// only in where the moves come from.
     pub fn distribution_step(
         &mut self,
         dist_0: &[f32],
@@ -879,14 +896,10 @@ impl Game {
         self.action_step(i0, i1, s);
     }
 
-    /// Does `player`'s mask hold the bit for `i`? For the debug assertions only; a caller
-    /// wanting this reads its own mask.
+    /// Does `player`'s mask hold the bit for square `k`? For the debug assertions only; a
+    /// caller wanting this reads its own mask.
     #[inline]
-    fn holds_bit(&self, i: usize, player: usize) -> bool {
-        if i >= HW || legal_cell(i >> 1) != i {
-            return false; // not a playable-parity square, so it holds no bit of its own
-        }
-        let k = i >> 1;
-        self.legal_moves(player)[k >> 6] >> (k & 63) & 1 == 1
+    fn holds_bit(&self, k: usize, player: usize) -> bool {
+        k < SQUARES && self.legal_moves(player)[k >> 6] >> (k & 63) & 1 == 1
     }
 }

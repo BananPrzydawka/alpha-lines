@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::PathBuf;
 
-use alpha_lines_game::game::{legal_cell, Scratch, HEIGHT, HW, WIDTH, LEGAL_WORDS};
+use alpha_lines_game::game::{board_index, square_index, Scratch, HEIGHT, HW, SQUARES, WIDTH};
 use alpha_lines_game::Game;
 
 const STATE_MAGIC: &[u8; 4] = b"ALST";
@@ -48,8 +48,7 @@ fn read_moves(path: &PathBuf) -> Moves {
     Moves { n, n_steps, data }
 }
 
-/// Expand the engine's 80-bit masks into the dense ones the Python produces, so the two can
-/// be compared.
+/// Expand the engine's masks into the dense board-shaped ones the Python produces.
 fn dense_masks(games: &[Game]) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let n = games.len();
     let (mut m0, mut m1) = (vec![0.0f32; n * HW], vec![0.0f32; n * HW]);
@@ -61,9 +60,9 @@ fn dense_masks(games: &[Game]) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
             for (wi, &word) in game.legal_moves(player).iter().enumerate() {
                 let mut w = word;
                 while w != 0 {
-                    let cell = legal_cell((wi << 6) + w.trailing_zeros() as usize);
+                    let sq = (wi << 6) + w.trailing_zeros() as usize;
                     w &= w - 1;
-                    dense[g * HW + cell] = 1.0;
+                    dense[g * HW + board_index(sq)] = 1.0;
                     count[g] += 1.0;
                 }
             }
@@ -72,14 +71,20 @@ fn dense_masks(games: &[Game]) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     (m0, m1, c0, c1)
 }
 
-/// Does `mask` hold the bit for board index `i`? Needed to police a move file this driver
-/// did not produce.
-fn holds(mask: [u64; LEGAL_WORDS], i: i32) -> bool {
-    if i < 0 || i as usize >= HW || legal_cell(i as usize >> 1) != i as usize {
-        return false;
+/// The engine's squares as a full board, which is what the Python dumps.
+fn expand(cells: &[i8; SQUARES]) -> Vec<i8> {
+    let mut board = vec![0i8; HW];
+    for (sq, &v) in cells.iter().enumerate() {
+        board[board_index(sq)] = v;
     }
-    let k = i as usize >> 1;
-    mask[k >> 6] >> (k & 63) & 1 == 1
+    board
+}
+
+/// The square a move file's board index names, if the mask holds it. Needed to police a file
+/// this driver did not produce.
+fn legal_square(mask: [u64; 2], board: i32) -> Option<usize> {
+    let sq = square_index(usize::try_from(board).ok()?)?;
+    (mask[sq >> 6] >> (sq & 63) & 1 == 1).then_some(sq)
 }
 
 struct StateWriter {
@@ -103,7 +108,7 @@ impl StateWriter {
         assert_eq!(games.len(), self.n, "record batch size mismatch");
         let (m0, m1, c0, c1) = dense_masks(games);
 
-        let boards: Vec<i8> = games.iter().flat_map(|g| g.cells).collect();
+        let boards: Vec<i8> = games.iter().flat_map(|g| expand(&g.cells)).collect();
         let scores: Vec<f32> = games
             .iter()
             .flat_map(|g| [g.scores[0] as f32, g.scores[1] as f32])
@@ -178,25 +183,24 @@ fn main() {
     for step in 0..moves.n_steps {
         let off = step * moves.n * 2;
         // the engine only debug-asserts legality, so a move file is checked for real
-        for (g, game) in games.iter().enumerate() {
-            if game.finished {
-                continue;
-            }
-            let (i0, i1) = (moves.data[off + g * 2], moves.data[off + g * 2 + 1]);
-            for (player, i) in [(0usize, i0), (1usize, i1)] {
-                if !holds(game.legal_moves(player), i) {
-                    eprintln!("step {step}, game {g}: illegal move {i} for player {player}");
-                    std::process::exit(2);
-                }
-            }
-        }
         for (g, game) in games.iter_mut().enumerate() {
             if game.finished {
                 continue;
             }
-            let i0 = moves.data[off + g * 2] as usize;
-            let i1 = moves.data[off + g * 2 + 1] as usize;
-            game.action_step(i0, i1, &mut scratch);
+            let mut sq = [0usize; 2];
+            for (player, slot) in sq.iter_mut().enumerate() {
+                let board = moves.data[off + g * 2 + player];
+                match legal_square(game.legal_moves(player), board) {
+                    Some(k) => *slot = k,
+                    None => {
+                        eprintln!(
+                            "step {step}, game {g}: illegal move {board} for player {player}"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            game.action_step(sq[0], sq[1], &mut scratch);
         }
         state.push(&games);
     }

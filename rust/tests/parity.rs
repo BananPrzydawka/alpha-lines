@@ -3,8 +3,9 @@
 //! The oracle (`tests/oracle`) is a port of `main/game_kernels.py`, itself verified against
 //! the Python by `xcheck/xcheck.py`, so parity here is parity with the Python transitively.
 //!
-//! It is batch-shaped because the numba kernels were; the engine is not, so the tests hold a
-//! `Vec<Game>` against one oracle batch. The games share one `Scratch`, which is what would
+//! It is batch-shaped and board-shaped because the numba kernels were; the engine is neither,
+//! so the tests hold a `Vec<Game>` against one oracle batch and convert square indices to
+//! board indices at every comparison. The games share one `Scratch`, which is what would
 //! expose workspace state leaking from one board into the next.
 //!
 //! Checks the oracle cannot make on its own: levels are re-derived from scratch every step,
@@ -17,8 +18,8 @@
 mod oracle;
 
 use alpha_lines_game::game::{
-    legal_cell, rebuild_levels, Rng, Scratch, HEIGHT, HW, INF, LEGAL_WORDS, MAX_LEVEL,
-    PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK, WIDTH,
+    board_index, rebuild_levels, square_index, Rng, Scratch, HEIGHT, HW, INF, LEGAL_WORDS,
+    MAX_LEVEL, PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK, SQUARES, WIDTH,
 };
 use alpha_lines_game::Game;
 use oracle::{apply_and_score_kernel, legal_masks_kernel, sample_move_kernel, score_player};
@@ -97,9 +98,10 @@ impl Oracle {
 
 
 /// Every level must equal a from-scratch BFS, and every running score the oracle's scorer.
+/// The oracle scores a full board, so the squares are expanded for it.
 fn check_levels_and_scores(games: &[Game], where_: &str) {
     let mut scratch = Scratch::new();
-    let mut fresh = vec![0u8; HW];
+    let mut fresh = vec![0u8; SQUARES];
     for (g, game) in games.iter().enumerate() {
         rebuild_levels(&game.cells, &mut fresh, &mut scratch);
         assert_eq!(
@@ -107,8 +109,9 @@ fn check_levels_and_scores(games: &[Game], where_: &str) {
             &fresh[..],
             "{where_}: game {g} levels drifted from a from-scratch rebuild"
         );
+        let board = expand(&game.cells);
         for (k, mark) in [PLAYER_0_MARK, PLAYER_1_MARK].into_iter().enumerate() {
-            let want = score_player(&game.cells, 0, mark, HEIGHT, WIDTH) as i32;
+            let want = score_player(&board, 0, mark, HEIGHT, WIDTH) as i32;
             assert_eq!(
                 game.scores[k], want,
                 "{where_}: game {g} player {k} running score is wrong"
@@ -125,29 +128,35 @@ fn check_legality(games: &[Game], where_: &str) {
         let (a, b) = (game.legal_moves(0), game.legal_moves(1));
         let bits = [a[0] | b[0], a[1] | b[1]];
         let mut any = false;
-        for i in 0..HW {
-            let k = i >> 1;
-            let playable = game.cells[i] == PLAYABLE_SQUARE;
-            let parity = i % 2 == (i / WIDTH) % 2;
-            let set = parity && bits[k >> 6] >> (k & 63) & 1 == 1;
-            assert_eq!(set, playable, "{where_}: game {g} cell {i} legality bit");
+        for k in 0..SQUARES {
+            let playable = game.cells[k] == PLAYABLE_SQUARE;
+            let set = bits[k >> 6] >> (k & 63) & 1 == 1;
+            assert_eq!(set, playable, "{where_}: game {g} square {k} legality bit");
             any |= playable;
         }
         assert_eq!(game.finished, !any, "{where_}: game {g} finished flag");
     }
 }
 
-/// Does `player`'s mask hold the bit for board index `i`? Unpacked here from the documented
-/// layout, not asked of the engine, which is what makes agreement evidence.
-fn legal_at(game: &Game, i: usize, player: usize) -> bool {
-    if i >= HW || legal_cell(i >> 1) != i {
-        return false; // not a playable-parity square, so it holds no bit of its own
+/// The engine's squares as a full board, which is the shape the oracle works in.
+fn expand(cells: &[i8; SQUARES]) -> Vec<i8> {
+    let mut board = vec![0i8; HW];
+    for (sq, &v) in cells.iter().enumerate() {
+        board[board_index(sq)] = v;
     }
-    let k = i >> 1;
-    game.legal_moves(player)[k >> 6] >> (k & 63) & 1 == 1
+    board
 }
 
-/// A uniformly random legal move: `popcount`, one bounded draw, one select over 80 bits.
+/// Does `player`'s mask hold the bit for *board* index `i`? Unpacked here from the documented
+/// layout, not asked of the engine, which is what makes agreement evidence.
+fn legal_at(game: &Game, i: usize, player: usize) -> bool {
+    match square_index(i) {
+        None => false,
+        Some(k) => game.legal_moves(player)[k >> 6] >> (k & 63) & 1 == 1,
+    }
+}
+
+/// A uniformly random legal square: `popcount`, one bounded draw, one select over 80 bits.
 fn uniform_move(game: &Game, player: usize, rng: &mut Rng) -> usize {
     let w: [u64; LEGAL_WORDS] = game.legal_moves(player);
     let count = w[0].count_ones() + w[1].count_ones();
@@ -160,16 +169,22 @@ fn uniform_move(game: &Game, player: usize, rng: &mut Rng) -> usize {
             for _ in 0..k {
                 x &= x - 1; // clear the lowest set bit
             }
-            return legal_cell((wi << 6) + x.trailing_zeros() as usize);
+            return (wi << 6) + x.trailing_zeros() as usize;
         }
         k -= c;
     }
     unreachable!("select past the end of the legal set")
 }
 
+/// The oracle's board-indexed move as a square. Panics on a cell that is not playable, which
+/// would be the oracle handing out a move the engine cannot represent.
+fn as_square(board: i64) -> usize {
+    square_index(board as usize).expect("oracle picked a non-playable cell")
+}
+
 /// The boards laid out the way the oracle lays out its batch.
 fn boards_of(games: &[Game]) -> Vec<i8> {
-    games.iter().flat_map(|g| g.cells).collect()
+    games.iter().flat_map(|g| expand(&g.cells)).collect()
 }
 
 /// The engine scores in integers, the oracle in f32 because numpy did.
@@ -272,7 +287,7 @@ fn the_engine_matches_the_oracle_bit_for_bit() {
         refg.apply(&idx0, &idx1);
         for (g, game) in games.iter_mut().enumerate() {
             if !game.finished {
-                game.action_step(idx0[g] as usize, idx1[g] as usize, &mut scratch);
+                game.action_step(as_square(idx0[g]), as_square(idx1[g]), &mut scratch);
             }
         }
 
@@ -324,8 +339,13 @@ fn the_engine_matches_the_oracle_bit_for_bit() {
 /// then player 1 for every game; a single `Game` draws both of its own moves together, so
 /// only a batch of one consumes the RNG in the same order.
 ///
+/// The oracle weights all 160 board cells and the engine weights the 80 squares, so its
+/// distribution is the oracle's packed down. The two totals stay bit-identical: the cells
+/// dropped are never playable, so the oracle multiplies them by a zero mask and adding exact
+/// zeros cannot move an f64 sum.
+///
 /// The distributions are strictly positive on purpose: on an all-zero one the two fall back
-/// to different things, the oracle drawing uniformly over all 160 squares — a numba quirk a
+/// to different things, the oracle drawing uniformly over all 160 cells — a numba quirk a
 /// softmax policy never triggers.
 #[test]
 fn distribution_step_picks_the_same_moves_as_the_oracle_sampler() {
@@ -339,6 +359,8 @@ fn distribution_step_picks_the_same_moves_as_the_oracle_sampler() {
         let mut rng = Rng::new(s);
         let d0: Vec<f32> = (0..HW).map(|_| rng.random() as f32).collect();
         let d1: Vec<f32> = (0..HW).map(|_| rng.random() as f32).collect();
+        let pack = |d: &[f32]| (0..SQUARES).map(|k| d[board_index(k)]).collect::<Vec<f32>>();
+        let (p0, p1) = (pack(&d0), pack(&d1));
 
         let mut refg = Oracle::new(1, s);
         let mut game = Game::new();
@@ -347,8 +369,8 @@ fn distribution_step_picks_the_same_moves_as_the_oracle_sampler() {
 
         while !refg.finished[0] {
             refg.distribution_step(&d0, &d1);
-            game.distribution_step(&d0, &d1, &mut engine_rng, &mut scratch);
-            assert_eq!(&game.cells[..], &refg.boards[..], "g{g} board at step {steps}");
+            game.distribution_step(&p0, &p1, &mut engine_rng, &mut scratch);
+            assert_eq!(expand(&game.cells), refg.boards, "g{g} board at step {steps}");
             assert_eq!(
                 [game.scores[0] as f32, game.scores[1] as f32],
                 [refg.scores[0], refg.scores[1]],
@@ -413,11 +435,14 @@ fn every_public_call_agrees_with_the_oracle() {
             assert_eq!(game.legal_count(0) as f32, n0, "legal_count g{g} p0");
             assert_eq!(game.legal_count(1) as f32, n1, "legal_count g{g} p1");
 
-            // a move drawn from the mask has to be inside it
+            // a move drawn from the mask has to be inside it, and has to round-trip through
+            // the board index space the oracle works in
             if !game.finished {
                 for player in [0usize, 1usize] {
-                    let m = uniform_move(game, player, &mut draw_rng);
-                    assert!(legal_at(game, m, player), "drawn move g{g} p{player} illegal");
+                    let sq = uniform_move(game, player, &mut draw_rng);
+                    let board = board_index(sq);
+                    assert_eq!(square_index(board), Some(sq), "square {sq} did not round-trip");
+                    assert!(legal_at(game, board, player), "drawn move g{g} p{player} illegal");
                 }
             }
         }
@@ -444,7 +469,7 @@ fn every_public_call_agrees_with_the_oracle() {
         refg.apply(&idx0, &idx1);
         for (g, game) in games.iter_mut().enumerate() {
             if !game.finished {
-                game.action_step(idx0[g] as usize, idx1[g] as usize, &mut scratch);
+                game.action_step(as_square(idx0[g]), as_square(idx1[g]), &mut scratch);
             }
         }
         steps += 1;
@@ -477,7 +502,7 @@ fn a_fork_is_independent_of_the_game_it_came_from() {
     assert_eq!(forks, parents, "a fresh fork differs from its parent");
     // a third copy never touched again, plus its boards recorded outside any Game
     let frozen = parents.clone();
-    let fork_point: Vec<[i8; HW]> = parents.iter().map(|g| g.cells).collect();
+    let fork_point: Vec<[i8; SQUARES]> = parents.iter().map(|g| g.cells).collect();
 
     // alternating, so the shared scratch is handed back and forth mid-game
     let mut steps = 0;

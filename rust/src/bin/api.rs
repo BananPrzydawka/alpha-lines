@@ -9,7 +9,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use alpha_lines_game::game::{legal_cell, Rng, Scratch, HEIGHT, HW, WIDTH};
+use alpha_lines_game::game::{Rng, Scratch, HEIGHT, SQUARES, WIDTH};
 use alpha_lines_game::Game;
 
 /// A uniformly random legal move for `player`, out of the engine's mask.
@@ -25,7 +25,7 @@ fn uniform_move(g: &Game, player: usize, rng: &mut Rng) -> usize {
             for _ in 0..k {
                 x &= x - 1;
             }
-            return legal_cell((wi << 6) + x.trailing_zeros() as usize);
+            return (wi << 6) + x.trailing_zeros() as usize;
         }
         k -= c;
     }
@@ -87,7 +87,7 @@ fn main() {
     let mut scratch = Scratch::new();
     let mut rng = Rng::new(seed ^ 0xfeed);
     let mid = positions(count, warmup, seed, &mut scratch);
-    let dist: Vec<f32> = (0..HW).map(|_| rng.random() as f32).collect();
+    let dist: Vec<f32> = (0..SQUARES).map(|_| rng.random() as f32).collect();
     let calls = reps * count;
 
     let mut t = Table { rows: Vec::new() };

@@ -41,6 +41,10 @@ nodes are looked up by hashing instead of path.
 
 so we start of with n nodes. each steps untill they reach a leaf, accumulate into one model call.
 
-a node kinda needs to store a whole game becasue we need to be able to copy it to step to a new game. and we kinda need to store all games separately because otherwose how would separate nodes work?
+select node from possible moves, 
+compute its hash, lookup if it exists  --  so the function/class takes the current hash, current board state, and move to perform. the key trick is we do not use the game implementation to step, instead build all the logic for it inside the hash. it only needs to be able to do one move, and doenst need scores or anything else. that means that with the current game all it really needs is collision logic, as everything else is just placing marks. this way it can be near instant (hopefully). i reckon conditional logic for the hashes will be slower than just doing 2 xors always. write this implementation in a separate file i think.
 
-however because game steps are so simple, and because we no longer lookup by path but by state, we could build a completelly standalone hashing method that runs lightning fast and allows for moves directly.
+if it doesnt clone current game
+then step to it
+
+this is my outline idea for mcts. by using hashing we will automatically combine same graph nodes, and achieve higher mcts efficiency. for now i want you to implement just hte zobrist hashing in a different rust file.

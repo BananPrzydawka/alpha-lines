@@ -1,6 +1,6 @@
 //! Time per game: build a `Game`, play it to the end with random moves, repeat.
 //!
-//! Two ways of choosing the move are timed. `distribution_step` scans an HW-float
+//! Two ways of choosing the move are timed. `distribution_step` scans an 80-float
 //! distribution, which is what a policy network hands you — over one distribution reused by
 //! every game (L1) and over a fresh slice per game (not L1). A uniform pick over the mask,
 //! done here in the driver, is the floor: what a move costs when choosing it is free.
@@ -15,7 +15,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use alpha_lines_game::game::{legal_cell, Rng, Scratch, HW};
+use alpha_lines_game::game::{Rng, Scratch, SQUARES};
 use alpha_lines_game::Game;
 
 /// A uniformly random legal move for `player`, out of the engine's mask: `popcount` for how
@@ -33,7 +33,7 @@ fn uniform_move(g: &Game, player: usize, rng: &mut Rng) -> usize {
             for _ in 0..k {
                 x &= x - 1;
             }
-            return legal_cell((wi << 6) + x.trailing_zeros() as usize);
+            return (wi << 6) + x.trailing_zeros() as usize;
         }
         k -= c;
     }
@@ -120,7 +120,7 @@ fn header(title: &str) {
 enum Sampler<'a> {
     /// Uniform over the mask, in the driver.
     Bits,
-    /// `distribution_step` over `HW` weights that stay in cache.
+    /// `distribution_step` over `SQUARES` weights that stay in cache.
     Hot(&'a [f32]),
     /// `distribution_step` over a fresh slice per game out of a large array.
     Cold(&'a [f32]),
@@ -131,7 +131,7 @@ fn rollouts(games: usize, seed: u64, sampler: Sampler) -> Sample {
     let mut rng = Rng::new(seed);
     let mut moves = 0usize;
     let slices = match sampler {
-        Sampler::Cold(d) => d.len() / HW,
+        Sampler::Cold(d) => d.len() / SQUARES,
         _ => 1,
     };
 
@@ -146,7 +146,7 @@ fn rollouts(games: usize, seed: u64, sampler: Sampler) -> Sample {
                 }
                 Sampler::Hot(d) => g.distribution_step(d, d, &mut rng, &mut scratch),
                 Sampler::Cold(d) => {
-                    let s = &d[(k % slices) * HW..][..HW];
+                    let s = &d[(k % slices) * SQUARES..][..SQUARES];
                     g.distribution_step(s, s, &mut rng, &mut scratch);
                 }
             }
@@ -174,7 +174,7 @@ fn main() {
 
     // every square the same weight, so the weighted scan picks uniformly too — the same
     // games as the driver-side pick, reached by doing much more work
-    let dist = vec![1.0f32; positions * HW];
+    let dist = vec![1.0f32; positions * SQUARES];
 
     // warm up the clocks
     black_box(rollouts(200, seed, Sampler::Bits).games);
@@ -185,7 +185,7 @@ fn main() {
         let s = seed + sweep as u64 * 7919;
         let measured = [
             ("uniform over the mask", rollouts(games, s, Sampler::Bits)),
-            ("weighted, hot dist", rollouts(games, s, Sampler::Hot(&dist[..HW]))),
+            ("weighted, hot dist", rollouts(games, s, Sampler::Hot(&dist[..SQUARES]))),
             ("weighted, cold dist", rollouts(games, s, Sampler::Cold(&dist))),
         ];
         for (k, (label, sample)) in measured.into_iter().enumerate() {
@@ -211,7 +211,7 @@ fn main() {
          worth, the hot one reuses\n a single vector. The uniform pick reads no \
          distribution at all and is {:.2}x faster\n than the cold weighted scan.)",
         std::mem::size_of::<Game>(),
-        HW,
+        SQUARES,
         rows[2].best.per_game() / rows[0].best.per_game(),
     );
 }
