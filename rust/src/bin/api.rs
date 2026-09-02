@@ -4,13 +4,15 @@
 //! The two step calls are timed over whole rollouts divided by the moves it took, since
 //! their cost changes as the board fills and no single position is a fair sample.
 //!
+//! The `zobrist` rows are what a search pays to look up a child before building one.
+//!
 //! Usage: api [--reps R] [--positions P] [--warmup-moves M] [--seed S]
 
 use std::hint::black_box;
 use std::time::Instant;
 
 use alpha_lines_game::game::{Rng, Scratch, HEIGHT, SQUARES, WIDTH};
-use alpha_lines_game::Game;
+use alpha_lines_game::{zobrist, Game};
 
 /// A uniformly random legal move for `player`, out of the engine's mask.
 fn uniform_move(g: &Game, player: usize, rng: &mut Rng) -> usize {
@@ -157,6 +159,31 @@ fn main() {
         black_box(&g.scores);
     }
     t.add("distribution_step", s.elapsed().as_secs_f64(), moves, "one move, over whole games");
+
+    let s = Instant::now();
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(zobrist::hash(&g.cells));
+        }
+    }
+    t.add("zobrist::hash", s.elapsed().as_secs_f64(), calls, "hash a board from scratch");
+
+    // one ordinary move and one collision, since only the collision reads the board
+    let s = Instant::now();
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(zobrist::step(black_box(0), &g.cells, black_box(9), black_box(30)));
+        }
+    }
+    t.add("zobrist::step", s.elapsed().as_secs_f64(), calls, "hash a child, ordinary move");
+
+    let s = Instant::now();
+    for _ in 0..reps {
+        for g in &mid {
+            black_box(zobrist::step(black_box(0), &g.cells, black_box(30), black_box(30)));
+        }
+    }
+    t.add("zobrist::step (collision)", s.elapsed().as_secs_f64(), calls, "hash a child, collision");
 
     t.print(format!("Game, {count} mid-game positions, {reps} reps").as_str());
 

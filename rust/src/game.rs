@@ -170,6 +170,32 @@ fn step(k: usize, d: Dir) -> Option<usize> {
     }
 }
 
+/// The value [`NEIGHBOURS`] uses for a diagonal that leaves the board.
+pub const OFF_BOARD: u8 = SQUARES as u8;
+
+/// The four diagonal neighbours of every square, in [`DIAG`] order, with [`OFF_BOARD`] where
+/// a direction leaves the board. Precomputed so a caller can walk the board without
+/// recomputing the geometry — and so nothing has to reimplement [`step`] to do it.
+pub const NEIGHBOURS: [[u8; 4]; SQUARES] = {
+    let mut t = [[OFF_BOARD; 4]; SQUARES];
+    let mut k = 0;
+    while k < SQUARES {
+        let (r, j) = ((k / ROW) as i64, (k % ROW) as i64);
+        let mut d = 0;
+        while d < 4 {
+            let (dr, left) = DIAG[d];
+            let nr = r + dr;
+            let nj = j + (r & 1) - if left { 1 } else { 0 };
+            if nr >= 0 && nr < HEIGHT as i64 && nj >= 0 && nj < ROW as i64 {
+                t[k][d] = (nr as usize * ROW + nj as usize) as u8;
+            }
+            d += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
 /// Is the square one step `d` from `k` a mark of player `p`?
 #[inline]
 fn mark_at(cells: &[i8], k: usize, d: Dir, p: i8) -> bool {
