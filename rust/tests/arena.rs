@@ -1,17 +1,45 @@
 //! The node stack: lookup, deletion, slot reuse, tombstone rehashing, and the id rules.
 
-use alpha_lines_game::game::SQUARES;
+use alpha_lines_game::game::{Rng, Scratch};
 use alpha_lines_game::mcts::arena::IdWrite;
 use alpha_lines_game::mcts::{Arena, Config, K};
+use alpha_lines_game::Game;
 
 fn cfg(capacity: usize) -> Config {
     Config { node_capacity: capacity, ..Config::default() }
 }
 
-fn board(seed: u8) -> [u8; SQUARES] {
-    let mut b = [0u8; SQUARES];
-    b[0] = seed;
-    b
+/// A position `plies` moves in, so nodes hold games that differ from each other.
+fn board(plies: u8) -> Game {
+    let mut g = Game::new();
+    let mut rng = Rng::new(u64::from(plies) + 1);
+    let mut scratch = Scratch::new();
+    for _ in 0..plies {
+        if g.finished {
+            break;
+        }
+        let w0 = g.legal_moves(0);
+        let w1 = g.legal_moves(1);
+        let pick = |w: [u64; 2], r: &mut Rng| -> usize {
+            let n = w[0].count_ones() + w[1].count_ones();
+            let mut k = r.randint(u64::from(n)) as u32;
+            for (wi, &word) in w.iter().enumerate() {
+                let c = word.count_ones();
+                if k < c {
+                    let mut x = word;
+                    for _ in 0..k {
+                        x &= x - 1;
+                    }
+                    return (wi << 6) + x.trailing_zeros() as usize;
+                }
+                k -= c;
+            }
+            unreachable!()
+        };
+        let (a, b) = (pick(w0, &mut rng), pick(w1, &mut rng));
+        g.action_step(a, b, &mut scratch);
+    }
+    g
 }
 
 #[test]
@@ -55,7 +83,7 @@ fn a_removed_slot_is_reused_and_carries_none_of_the_old_node() {
     assert_eq!(m, n, "the freed slot should come back");
     assert_eq!(a.node(m).stats, 0, "stats must be reset");
     assert_eq!(a.node(m).ids(), &[22]);
-    assert_eq!(a.node(m).board, board(2));
+    assert_eq!(a.node(m).game, board(2));
     assert_eq!(a.get(1), None, "the old key must be gone");
 }
 
@@ -156,4 +184,49 @@ fn clearing_drops_everything_and_the_arena_is_reusable() {
     }
     let n = a.insert(42, board(0), 0, 0).unwrap();
     assert_eq!(a.get(42), Some(n));
+}
+
+/// Terminality and the terminal values come off the node's own game, so there is no second
+/// copy to fall out of step with it.
+#[test]
+fn a_node_reads_terminality_from_the_game_it_owns() {
+    let mut a: Arena<()> = Arena::new(&cfg(8));
+    let midgame = a.insert(1, board(10), 0, 0).unwrap();
+    assert!(!a.node(midgame).is_terminal());
+
+    let mut g = Game::new();
+    let mut rng = Rng::new(4);
+    let mut scratch = Scratch::new();
+    while !g.finished {
+        let pick = |w: [u64; 2], r: &mut Rng| -> usize {
+            let n = w[0].count_ones() + w[1].count_ones();
+            let mut k = r.randint(u64::from(n)) as u32;
+            for (wi, &word) in w.iter().enumerate() {
+                let c = word.count_ones();
+                if k < c {
+                    let mut x = word;
+                    for _ in 0..k {
+                        x &= x - 1;
+                    }
+                    return (wi << 6) + x.trailing_zeros() as usize;
+                }
+                k -= c;
+            }
+            unreachable!()
+        };
+        let (i0, i1) = (pick(g.legal_moves(0), &mut rng), pick(g.legal_moves(1), &mut rng));
+        g.action_step(i0, i1, &mut scratch);
+    }
+    let scores = g.scores;
+    let done = a.insert(2, g, 0, 0).unwrap();
+    assert!(a.node(done).is_terminal());
+
+    let v = a.node(done).terminal_values();
+    let want = match scores[0].cmp(&scores[1]) {
+        std::cmp::Ordering::Greater => [1.0, -1.0],
+        std::cmp::Ordering::Less => [-1.0, 1.0],
+        std::cmp::Ordering::Equal => [0.0, 0.0],
+    };
+    assert_eq!(v, want, "scores {scores:?} gave the wrong outcome");
+    assert_eq!(v[0], -v[1], "the game is zero sum");
 }

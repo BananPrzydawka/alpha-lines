@@ -8,4 +8,4 @@ pub mod arena;
 pub mod config;
 
 pub use arena::{Arena, Node};
-pub use config::{Config, K, PENDING, TERMINAL};
+pub use config::{Config, K, PENDING};

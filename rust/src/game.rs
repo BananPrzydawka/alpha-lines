@@ -906,6 +906,18 @@ impl Game {
         self.finished = self.no_moves_left();
     }
 
+    /// Win, draw or loss as `+1`, `0`, `-1` for each player, from the final scores. Only
+    /// meaningful once the game is [`Self::finished`].
+    #[inline]
+    pub fn terminal_values(&self) -> [f32; 2] {
+        debug_assert!(self.finished, "terminal values of an unfinished game");
+        match self.scores[0].cmp(&self.scores[1]) {
+            std::cmp::Ordering::Greater => [1.0, -1.0],
+            std::cmp::Ordering::Less => [-1.0, 1.0],
+            std::cmp::Ordering::Equal => [0.0, 0.0],
+        }
+    }
+
     /// Play one move drawn from a weight per square for each player, `dist_0[0..SQUARES]`
     /// and `dist_1[0..SQUARES]`. The other way in besides [`Self::action_step`]; they differ
     /// only in where the moves come from.

@@ -3,9 +3,9 @@
 /// Game-id slots per node. Compile-time because it sizes an array on every node.
 pub const K: usize = 16;
 
-/// Bits in `Node::flags`.
+/// Bits in `Node::flags`. Terminality is not a flag: a node owns its game, so it is
+/// `game.finished`, and a stored copy could only drift from it.
 pub const PENDING: u8 = 1 << 0;
-pub const TERMINAL: u8 = 1 << 1;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {

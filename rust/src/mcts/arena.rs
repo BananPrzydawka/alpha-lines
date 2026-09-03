@@ -5,21 +5,25 @@
 //! on demand up to `node_capacity`, so a large capacity reserves address space without
 //! touching it.
 
-use crate::game::SQUARES;
-use crate::mcts::config::{Config, K, PENDING, TERMINAL};
+use crate::game::Game;
+use crate::mcts::config::{Config, K, PENDING};
 
 /// An index slot holding no node.
 const EMPTY: u32 = u32::MAX;
 /// An index slot whose node was deleted; probing continues through it.
 const TOMB: u32 = u32::MAX - 1;
 
+/// A node owns the position it stands for.
+///
+/// A child is built by cloning its parent's game and stepping it, which is the only time the
+/// engine is touched: descending through nodes that already exist moves by Zobrist key alone.
+/// Holding the game also means `terminal` and the terminal values are read off it rather than
+/// stored beside it, so they cannot drift.
 #[derive(Clone, Debug)]
 pub struct Node<S> {
     pub key: u64,
-    pub board: [u8; SQUARES],
+    pub game: Game,
     pub flags: u8,
-    /// Valid only when `flags & TERMINAL`.
-    pub terminal_values: [f32; 2],
     /// Game ids that have used this node, oldest-overwritten once full.
     pub ids: [u16; K],
     pub id_count: u8,
@@ -28,11 +32,16 @@ pub struct Node<S> {
 }
 
 impl<S> Node<S> {
+    /// Evaluation requested but not yet returned.
     pub fn is_pending(&self) -> bool {
         self.flags & PENDING != 0
     }
     pub fn is_terminal(&self) -> bool {
-        self.flags & TERMINAL != 0
+        self.game.finished
+    }
+    /// Win/draw/loss per player. Only meaningful when [`Self::is_terminal`].
+    pub fn terminal_values(&self) -> [f32; 2] {
+        self.game.terminal_values()
     }
     pub fn ids(&self) -> &[u16] {
         &self.ids[..self.id_count as usize]
@@ -122,14 +131,13 @@ impl<S: Default + Clone> Arena<S> {
     ///
     /// Returns `None` when the stack is full, which the caller has to treat as a search
     /// budget being exhausted rather than an error.
-    pub fn insert(&mut self, key: u64, board: [u8; SQUARES], flags: u8, id: u16) -> Option<u32> {
+    pub fn insert(&mut self, key: u64, game: Game, flags: u8, id: u16) -> Option<u32> {
         let slot = match self.free.pop() {
             Some(s) => {
                 let n = &mut self.nodes[s as usize];
                 n.key = key;
-                n.board = board;
+                n.game = game;
                 n.flags = flags;
-                n.terminal_values = [0.0; 2];
                 n.ids[0] = id;
                 n.id_count = 1;
                 n.id_cursor = 0;
@@ -144,9 +152,8 @@ impl<S: Default + Clone> Arena<S> {
                 ids[0] = id;
                 self.nodes.push(Node {
                     key,
-                    board,
+                    game,
                     flags,
-                    terminal_values: [0.0; 2],
                     ids,
                     id_count: 1,
                     id_cursor: 0,
