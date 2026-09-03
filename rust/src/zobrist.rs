@@ -23,6 +23,8 @@ use crate::game::{
 /// One slot per value a square can hold, indexed by the encoding itself.
 const STATES: usize = 4;
 
+const _: () = assert!(STATES.is_power_of_two(), "the index mask in `hash` assumes it");
+
 /// SplitMix64, as a const fn: `(next state, output)`.
 const fn next(s: u64) -> (u64, u64) {
     let s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -94,7 +96,8 @@ pub const OPENING: u64 = 0;
 pub fn hash(cells: &[u8; SQUARES]) -> u64 {
     let mut h = OPENING;
     for (sq, &v) in cells.iter().enumerate() {
-        h ^= KEYS[sq][v as usize];
+        // the mask is a no-op on real values and drops the bounds check
+        h ^= KEYS[sq][(v & (STATES as u8 - 1)) as usize];
     }
     h
 }
