@@ -74,7 +74,7 @@ fn puct_selection_matches_the_python_formula() {
         let stats = random_stats_puct(g.legal_moves(0), &mut rng);
         for player in 0..2 {
             let legal = g.legal_moves(player);
-            let got = Puct::select(&stats, legal, player, &c, &mut rng);
+            let got = Puct::select(&mut stats.clone(), legal, player, &c, &mut rng);
             let want = puct_reference(&stats, legal, player, f64::from(c.c_puct));
             assert_eq!(got.action as usize, want, "trial {trial} player {player}");
             assert_eq!(got.prob, 1.0, "puct is deterministic");
@@ -105,7 +105,7 @@ fn puct_never_picks_an_illegal_square() {
             for sq in squares(legal) {
                 stats.q[player][sq] = -100.0;
             }
-            let got = Puct::select(&stats, legal, player, &c, &mut rng);
+            let got = Puct::select(&mut stats.clone(), legal, player, &c, &mut rng);
             let sq = got.action as usize;
             assert!(legal[sq >> 6] >> (sq & 63) & 1 == 1, "picked illegal square {sq}");
         }
@@ -258,7 +258,7 @@ fn exp3_sampling_follows_the_mixed_strategy() {
     let draws = 400_000;
     let mut hits = vec![0u32; SQUARES];
     for _ in 0..draws {
-        let ch = Exp3::select(&stats, legal, 0, &c, &mut rng);
+        let ch = Exp3::select(&mut stats, legal, 0, &c, &mut rng);
         let sq = ch.action as usize;
         assert!(legal[sq >> 6] >> (sq & 63) & 1 == 1, "sampled illegal square {sq}");
         assert!(
@@ -372,4 +372,84 @@ fn default_exp3_weights_give_the_uniform_strategy() {
             assert!((out[sq] - 1.0 / n).abs() < 1e-6, "square {sq} is not uniform");
         }
     }
+}
+
+/// The average strategy is what a root emits as its training target, and it is accumulated
+/// on every node — not only on roots — so that promoting an interior node into a root keeps
+/// the search work already done at that state instead of restarting the average.
+#[test]
+fn exp3_selection_accumulates_the_average_strategy() {
+    let c = cfg();
+    let mut rng = Rng::new(0xA7E);
+    let g = position(7, 31);
+    let legal = g.legal_moves(0);
+    let mut stats = Exp3Stats::default();
+
+    let mut want = [0.0f32; SQUARES];
+    Exp3::mixed(&stats, legal, 0, c.exp3_gamma, &mut want);
+
+    let draws = 500;
+    for _ in 0..draws {
+        Exp3::select(&mut stats, legal, 0, &c, &mut rng);
+    }
+    // no backup ran, so the strategy never moved and the sum is that strategy, `draws` times
+    for sq in squares(legal) {
+        let got = f64::from(stats.strategy_sum[0][sq]);
+        let expect = f64::from(want[sq]) * f64::from(draws);
+        assert!(
+            (got - expect).abs() < 0.05,
+            "square {sq}: summed {got}, expected {expect}"
+        );
+    }
+    // the other player was never selected for, so its sum is untouched
+    assert!(stats.strategy_sum[1].iter().all(|&v| v == 0.0));
+
+    // normalised, the sum is the strategy back again — which is what the target is
+    let total: f32 = squares(legal).map(|sq| stats.strategy_sum[0][sq]).sum();
+    for sq in squares(legal) {
+        assert!((stats.strategy_sum[0][sq] / total - want[sq]).abs() < 1e-4);
+    }
+}
+
+/// Backups move the strategy, so the average must lag behind the current one — that is the
+/// whole point of averaging rather than reading the latest.
+#[test]
+fn the_average_strategy_lags_the_current_one() {
+    let c = cfg();
+    let mut rng = Rng::new(0x1A6);
+    let g = position(7, 32);
+    let legal = g.legal_moves(0);
+    let counts = [g.legal_count(0), g.legal_count(1)];
+    let favourite = squares(legal).next().unwrap();
+    let mut stats = Exp3Stats::default();
+
+    for _ in 0..300 {
+        Exp3::select(&mut stats, legal, 0, &c, &mut rng);
+        // reward one square hard, every time
+        let choice = [
+            Choice { action: favourite as u8, prob: 0.1 },
+            Choice { action: squares(g.legal_moves(1)).next().unwrap() as u8, prob: 0.1 },
+        ];
+        Exp3::backup(&mut stats, choice, [1.0, 1.0], counts, &c);
+    }
+
+    let mut current = [0.0f32; SQUARES];
+    Exp3::mixed(&stats, legal, 0, c.exp3_gamma, &mut current);
+    let total: f32 = squares(legal).map(|sq| stats.strategy_sum[0][sq]).sum();
+    let average = stats.strategy_sum[0][favourite] / total;
+
+    // the mixture caps any square at (1 - gamma) + gamma / n, so it can never reach 1
+    let uniform = 1.0 / counts[0] as f32;
+    let ceiling = 1.0 - c.exp3_gamma + c.exp3_gamma * uniform;
+    assert!(
+        current[favourite] > 5.0 * uniform && current[favourite] <= ceiling,
+        "the rewarded square is at {} against uniform {uniform} and a ceiling of {ceiling}",
+        current[favourite]
+    );
+    assert!(
+        average < current[favourite],
+        "the average ({average}) should lag the current strategy ({})",
+        current[favourite]
+    );
+    assert!(average > 1.0 / counts[0] as f32, "but it should still have moved off uniform");
 }

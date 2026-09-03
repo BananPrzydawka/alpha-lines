@@ -29,8 +29,11 @@ pub trait Variant {
     );
 
     /// Choose a move for `player` out of `legal`, which must not be empty.
+    ///
+    /// Takes the statistics mutably because EXP3 accumulates its average strategy here, which
+    /// is the thing a root eventually emits as a training target.
     fn select(
-        stats: &Self::Stats,
+        stats: &mut Self::Stats,
         legal: [u64; LEGAL_WORDS],
         player: usize,
         cfg: &Config,
@@ -130,7 +133,7 @@ impl Variant for Puct {
     /// `total` is the node's own edge counts and is never read from a parent or a child, so
     /// backups arriving from several games compose here.
     fn select(
-        stats: &PuctStats,
+        stats: &mut PuctStats,
         legal: [u64; LEGAL_WORDS],
         player: usize,
         cfg: &Config,
@@ -179,13 +182,23 @@ impl Variant for Puct {
 #[derive(Clone, Debug)]
 pub struct Exp3Stats {
     pub log_w: [[f32; SQUARES]; 2],
+    /// Every mixed strategy this node has played, summed. Normalised, it is the average
+    /// strategy — the training target a root emits.
+    ///
+    /// Carried on interior nodes, not only roots, because promotion turns an interior node
+    /// into a root: the sum it built up while interior is exactly the search work that would
+    /// otherwise be thrown away when the game steps into it.
+    pub strategy_sum: [[f32; SQUARES]; 2],
 }
 
 impl Default for Exp3Stats {
     /// All zero, which is the uniform strategy: the softmax of a flat vector is flat, and
     /// `(1 - gamma) / n + gamma / n` is `1 / n`. That is what an unevaluated node plays.
     fn default() -> Self {
-        Exp3Stats { log_w: [[0.0; SQUARES]; 2] }
+        Exp3Stats {
+            log_w: [[0.0; SQUARES]; 2],
+            strategy_sum: [[0.0; SQUARES]; 2],
+        }
     }
 }
 
@@ -248,50 +261,34 @@ impl Variant for Exp3 {
         }
     }
 
-    /// Sample from the mixed strategy by inverse CDF, in board order.
-    ///
-    /// Three passes over the legal set and no `SQUARES`-wide buffer: the strategy is rebuilt
-    /// term by term inside the scan, which is all the sampler needs.
+    /// Build the mixed strategy, add it to the running average, and sample from it by
+    /// inverse CDF in board order.
     fn select(
-        stats: &Exp3Stats,
+        stats: &mut Exp3Stats,
         legal: [u64; LEGAL_WORDS],
         player: usize,
         cfg: &Config,
         rng: &mut Rng,
     ) -> Choice {
-        let log_w = &stats.log_w[player];
-        let n = count(legal);
-        debug_assert!(n > 0, "select over an empty legal set");
-        let gamma = cfg.exp3_gamma;
-        let top = Self::top(log_w, legal);
+        let mut probs = [0.0f32; SQUARES];
+        Self::mixed(stats, legal, player, cfg.exp3_gamma, &mut probs);
 
-        let mut sum = 0.0f32;
-        for sq in squares(legal) {
-            sum += (log_w[sq] - top).exp();
-        }
-
-        // the strategy sums to 1 by construction, so the threshold is drawn against 1
-        let threshold = rng.random() as f32;
-        let floor = gamma / n as f32;
+        let sum = &mut stats.strategy_sum[player];
+        let threshold = rng.random() as f32; // the strategy sums to 1 by construction
         let mut cum = 0.0f32;
-        let mut chosen = usize::MAX;
-        let mut prob = 0.0f32;
+        let mut chosen = None;
         let mut last = (0usize, 0.0f32);
         for sq in squares(legal) {
-            let p = (1.0 - gamma) * ((log_w[sq] - top).exp() / sum) + floor;
-            last = (sq, p);
-            cum += p;
-            if cum > threshold {
-                chosen = sq;
-                prob = p;
-                break;
+            sum[sq] += probs[sq];
+            last = (sq, probs[sq]);
+            cum += probs[sq];
+            if chosen.is_none() && cum > threshold {
+                chosen = Some(last);
             }
         }
-        // only reachable if rounding left the running sum just short of the draw
-        if chosen == usize::MAX {
-            (chosen, prob) = last;
-        }
-        Choice { action: chosen as u8, prob }
+        // `chosen` is None only if rounding left the running sum just short of the draw
+        let (action, prob) = chosen.unwrap_or(last);
+        Choice { action: action as u8, prob }
     }
 
     /// `log_w[a] += gamma * (reward / prob) / num_legal`, with `reward = (value + 1) / 2`.
