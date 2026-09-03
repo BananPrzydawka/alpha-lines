@@ -11,6 +11,7 @@
 //! search can look up a child before deciding to build one.
 
 pub mod game;
+pub mod mcts;
 pub mod zobrist;
 
 pub use game::{Game, Scratch, HEIGHT, HW, ROW, SQUARES, WIDTH};
