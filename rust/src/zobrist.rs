@@ -16,11 +16,12 @@
 //! around, and a given board hashes the same in every run.
 
 use crate::game::{
-    NEIGHBOURS, OFF_BOARD, PLAYER_0_MARK, PLAYER_1_MARK, REMOVED_SQUARE, SQUARES,
+    NEIGHBOURS, OFF_BOARD, PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK, REMOVED_SQUARE,
+    SQUARES,
 };
 
 /// One slot per value a square can hold, indexed by the encoding itself.
-const STATES: usize = 5;
+const STATES: usize = 4;
 
 /// SplitMix64, as a const fn: `(next state, output)`.
 const fn next(s: u64) -> (u64, u64) {
@@ -31,10 +32,11 @@ const fn next(s: u64) -> (u64, u64) {
     (s, z ^ (z >> 31))
 }
 
-/// `KEYS[square][state]`, with the playable and non-playable states left at zero.
+/// `KEYS[square][state]`, with the playable state left at zero.
 ///
-/// Zeroing the playable state is what makes the opening position hash to [`OPENING`] and a
-/// placed mark cost one XOR instead of two: there is no old key to cancel.
+/// Zeroing it is what makes the opening position hash to [`OPENING`] and a placed mark cost
+/// one XOR instead of two: there is no old key to cancel. It falls out of the encoding, since
+/// playable is 0.
 const KEYS: [[u64; STATES]; SQUARES] = {
     let mut k = [[0u64; STATES]; SQUARES];
     let mut seed = 0x5EED_A1F4_1E50_2B17;
@@ -42,10 +44,7 @@ const KEYS: [[u64; STATES]; SQUARES] = {
     while sq < SQUARES {
         let mut st = 0;
         while st < STATES {
-            if st == REMOVED_SQUARE as usize
-                || st == PLAYER_0_MARK as usize
-                || st == PLAYER_1_MARK as usize
-            {
+            if st != PLAYABLE_SQUARE as usize {
                 let (s, v) = next(seed);
                 seed = s;
                 k[sq][st] = v;
@@ -92,7 +91,7 @@ const BLAST: [[u64; STATES]; SQUARES + 1] = {
 pub const OPENING: u64 = 0;
 
 /// Hash a board from scratch. For a root position, or to check an incremental chain.
-pub fn hash(cells: &[i8; SQUARES]) -> u64 {
+pub fn hash(cells: &[u8; SQUARES]) -> u64 {
     let mut h = OPENING;
     for (sq, &v) in cells.iter().enumerate() {
         h ^= KEYS[sq][v as usize];
@@ -109,7 +108,7 @@ pub fn hash(cells: &[i8; SQUARES]) -> u64 {
 /// whose key is zero, to a mark. A collision is the only case that has to read anything —
 /// five squares are cleared and what they held decides the key to cancel.
 #[inline]
-pub fn step(h: u64, cells: &[i8; SQUARES], i0: usize, i1: usize) -> u64 {
+pub fn step(h: u64, cells: &[u8; SQUARES], i0: usize, i1: usize) -> u64 {
     debug_assert!(i0 < SQUARES && i1 < SQUARES, "move off the board");
 
     if i0 != i1 {

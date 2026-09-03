@@ -10,7 +10,10 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::PathBuf;
 
-use alpha_lines_game::game::{board_index, square_index, Scratch, HEIGHT, HW, SQUARES, WIDTH};
+use alpha_lines_game::game::{
+    board_index, square_index, Scratch, HEIGHT, HW, PLAYABLE_SQUARE, PLAYER_0_MARK,
+    PLAYER_1_MARK, REMOVED_SQUARE, SQUARES, WIDTH,
+};
 use alpha_lines_game::Game;
 
 const STATE_MAGIC: &[u8; 4] = b"ALST";
@@ -72,10 +75,32 @@ fn dense_masks(games: &[Game]) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
 }
 
 /// The engine's squares as a full board, which is what the Python dumps.
-fn expand(cells: &[i8; SQUARES]) -> Vec<i8> {
-    let mut board = vec![0i8; HW];
+/// The Python's board encoding, which the engine does not share.
+///
+/// It covers the whole `HEIGHT x WIDTH` grid, so it needs a value for the unplayable half
+/// that has no square index, and it orders the four real values differently. The engine's
+/// order is a subset lattice on purpose (see `game::PLAYABLE_SQUARE`); this maps between
+/// them at the one place the two meet.
+const PY_NON_PLAYABLE: i8 = 0;
+const PY_PLAYABLE: i8 = 1;
+const PY_REMOVED: i8 = 2;
+const PY_PLAYER_0: i8 = 3;
+const PY_PLAYER_1: i8 = 4;
+
+fn to_python(v: u8) -> i8 {
+    match v {
+        PLAYABLE_SQUARE => PY_PLAYABLE,
+        PLAYER_0_MARK => PY_PLAYER_0,
+        PLAYER_1_MARK => PY_PLAYER_1,
+        REMOVED_SQUARE => PY_REMOVED,
+        _ => unreachable!("square value {v}"),
+    }
+}
+
+fn expand(cells: &[u8; SQUARES]) -> Vec<i8> {
+    let mut board = vec![PY_NON_PLAYABLE; HW];
     for (sq, &v) in cells.iter().enumerate() {
-        board[board_index(sq)] = v;
+        board[board_index(sq)] = to_python(v);
     }
     board
 }

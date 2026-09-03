@@ -19,7 +19,7 @@ mod oracle;
 
 use alpha_lines_game::game::{
     board_index, rebuild_levels, square_index, Rng, Scratch, HEIGHT, HW, INF, LEGAL_WORDS,
-    MAX_LEVEL, PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK, SQUARES, WIDTH,
+    MAX_LEVEL, PLAYABLE_SQUARE, PLAYER_0_MARK, PLAYER_1_MARK, REMOVED_SQUARE, SQUARES, WIDTH,
 };
 use alpha_lines_game::Game;
 use oracle::{apply_and_score_kernel, legal_masks_kernel, sample_move_kernel, score_player};
@@ -42,7 +42,7 @@ impl Oracle {
             for r in 0..HEIGHT {
                 for c in 0..WIDTH {
                     if (r + c) % 2 == 0 {
-                        boards[g * HW + r * WIDTH + c] = PLAYABLE_SQUARE;
+                        boards[g * HW + r * WIDTH + c] = PY_PLAYABLE;
                     }
                 }
             }
@@ -110,7 +110,7 @@ fn check_levels_and_scores(games: &[Game], where_: &str) {
             "{where_}: game {g} levels drifted from a from-scratch rebuild"
         );
         let board = expand(&game.cells);
-        for (k, mark) in [PLAYER_0_MARK, PLAYER_1_MARK].into_iter().enumerate() {
+        for (k, mark) in [PY_PLAYER_0, PY_PLAYER_1].into_iter().enumerate() {
             let want = score_player(&board, 0, mark, HEIGHT, WIDTH) as i32;
             assert_eq!(
                 game.scores[k], want,
@@ -138,11 +138,33 @@ fn check_legality(games: &[Game], where_: &str) {
     }
 }
 
+/// The Python's board encoding, which the engine does not share.
+///
+/// It covers the whole `HEIGHT x WIDTH` grid, so it needs a value for the unplayable half
+/// that has no square index, and it orders the four real values differently. The engine's
+/// order is a subset lattice on purpose (see `game::PLAYABLE_SQUARE`); this maps between
+/// them at the one place the two meet.
+const PY_NON_PLAYABLE: i8 = 0;
+const PY_PLAYABLE: i8 = 1;
+const PY_REMOVED: i8 = 2;
+const PY_PLAYER_0: i8 = 3;
+const PY_PLAYER_1: i8 = 4;
+
+fn to_python(v: u8) -> i8 {
+    match v {
+        PLAYABLE_SQUARE => PY_PLAYABLE,
+        PLAYER_0_MARK => PY_PLAYER_0,
+        PLAYER_1_MARK => PY_PLAYER_1,
+        REMOVED_SQUARE => PY_REMOVED,
+        _ => unreachable!("square value {v}"),
+    }
+}
+
 /// The engine's squares as a full board, which is the shape the oracle works in.
-fn expand(cells: &[i8; SQUARES]) -> Vec<i8> {
-    let mut board = vec![0i8; HW];
+fn expand(cells: &[u8; SQUARES]) -> Vec<i8> {
+    let mut board = vec![PY_NON_PLAYABLE; HW];
     for (sq, &v) in cells.iter().enumerate() {
-        board[board_index(sq)] = v;
+        board[board_index(sq)] = to_python(v);
     }
     board
 }
@@ -419,7 +441,7 @@ fn every_public_call_agrees_with_the_oracle() {
             for i in 0..HW {
                 let k = i >> 1;
                 let set = i % 2 == (i / WIDTH) % 2 && bits[k >> 6] >> (k & 63) & 1 == 1;
-                let playable = refg.boards[g * HW + i] == PLAYABLE_SQUARE;
+                let playable = refg.boards[g * HW + i] == PY_PLAYABLE;
                 assert_eq!(set, playable, "legal_moves g{g} cell {i} at step {steps}");
                 let c = i % WIDTH;
                 let want_0 = playable && !(first && c >= half);
@@ -502,7 +524,7 @@ fn a_fork_is_independent_of_the_game_it_came_from() {
     assert_eq!(forks, parents, "a fresh fork differs from its parent");
     // a third copy never touched again, plus its boards recorded outside any Game
     let frozen = parents.clone();
-    let fork_point: Vec<[i8; SQUARES]> = parents.iter().map(|g| g.cells).collect();
+    let fork_point: Vec<[u8; SQUARES]> = parents.iter().map(|g| g.cells).collect();
 
     // alternating, so the shared scratch is handed back and forth mid-game
     let mut steps = 0;
@@ -538,23 +560,95 @@ fn a_fork_is_independent_of_the_game_it_came_from() {
     }
 }
 
-/// The engine and the oracle define the encoding and the RNG separately, on purpose. This
-/// pins the two definitions together so they cannot drift.
+/// The engine and the oracle encode a square differently, on purpose: the engine's values
+/// are a subset lattice so reachability is a bitwise test, the oracle's are the Python's.
+/// This pins the mapping between them, and the lattice property the engine leans on.
 #[test]
-fn the_engine_and_the_oracle_still_agree_on_the_encoding_and_the_rng() {
+fn the_two_encodings_map_onto_each_other_and_the_lattice_holds() {
     use alpha_lines_game::game as eng;
 
-    const _: () = assert!(eng::NON_PLAYABLE_SQUARE == oracle::NON_PLAYABLE_SQUARE);
-    const _: () = assert!(eng::PLAYABLE_SQUARE == oracle::PLAYABLE_SQUARE);
-    const _: () = assert!(eng::REMOVED_SQUARE == oracle::REMOVED_SQUARE);
-    const _: () = assert!(eng::PLAYER_0_MARK == oracle::PLAYER_0_MARK);
-    const _: () = assert!(eng::PLAYER_1_MARK == oracle::PLAYER_1_MARK);
+    assert_eq!(
+        (PY_NON_PLAYABLE, PY_PLAYABLE, PY_REMOVED, PY_PLAYER_0, PY_PLAYER_1),
+        (
+            oracle::NON_PLAYABLE_SQUARE,
+            oracle::PLAYABLE_SQUARE,
+            oracle::REMOVED_SQUARE,
+            oracle::PLAYER_0_MARK,
+            oracle::PLAYER_1_MARK
+        ),
+        "this file's view of the Python encoding drifted from the oracle's"
+    );
+    assert_eq!(to_python(eng::PLAYABLE_SQUARE), oracle::PLAYABLE_SQUARE);
+    assert_eq!(to_python(eng::REMOVED_SQUARE), oracle::REMOVED_SQUARE);
+    assert_eq!(to_python(eng::PLAYER_0_MARK), oracle::PLAYER_0_MARK);
+    assert_eq!(to_python(eng::PLAYER_1_MARK), oracle::PLAYER_1_MARK);
+
+    // every transition the game can make only sets bits
+    for (from, to) in [
+        (PLAYABLE_SQUARE, PLAYER_0_MARK),
+        (PLAYABLE_SQUARE, PLAYER_1_MARK),
+        (PLAYABLE_SQUARE, REMOVED_SQUARE),
+        (PLAYER_0_MARK, REMOVED_SQUARE),
+        (PLAYER_1_MARK, REMOVED_SQUARE),
+    ] {
+        assert_eq!(from & !to, 0, "{from} -> {to} clears a bit, so reachability breaks");
+    }
+    // and everything it cannot make clears one, so the test rejects it
+    for (from, to) in [
+        (PLAYER_0_MARK, PLAYABLE_SQUARE),
+        (PLAYER_1_MARK, PLAYABLE_SQUARE),
+        (REMOVED_SQUARE, PLAYABLE_SQUARE),
+        (REMOVED_SQUARE, PLAYER_0_MARK),
+        (REMOVED_SQUARE, PLAYER_1_MARK),
+        (PLAYER_0_MARK, PLAYER_1_MARK),
+        (PLAYER_1_MARK, PLAYER_0_MARK),
+    ] {
+        assert_ne!(from & !to, 0, "{from} -> {to} should read as unreachable");
+    }
 
     // and the two RNGs must be the same generator, or the samplers would diverge
     let (mut a, mut b) = (eng::Rng::new(0xabc), oracle::Rng::new(0xabc));
     for k in 0..1000 {
         assert_eq!(a.next_u64(), b.next_u64(), "rng streams diverged at draw {k}");
     }
+}
+
+/// The sweep prunes with `reachable_from`, so it has to be exact on real play: every position
+/// a game passes through is reachable from each earlier one and from none of the later ones.
+///
+/// Strict in both directions because every ply sets at least two bits — a non-colliding move
+/// marks two playable squares, and a collision turns its centre from playable to removed —
+/// so a later position always has bits an earlier one lacks.
+#[test]
+fn reachability_matches_what_a_game_actually_passes_through() {
+    let mut rng = Rng::new(0x0EA0_4AB1);
+    let mut scratch = Scratch::new();
+    let mut pairs = 0usize;
+
+    for _ in 0..300 {
+        let mut game = Game::new();
+        let mut history = vec![game.clone()];
+        while !game.finished {
+            let (i0, i1) = (uniform_move(&game, 0, &mut rng), uniform_move(&game, 1, &mut rng));
+            game.action_step(i0, i1, &mut scratch);
+            history.push(game.clone());
+        }
+        assert!(history.len() > 30, "a game should take more than 30 plies");
+
+        for (i, from) in history.iter().enumerate() {
+            for (j, to) in history.iter().enumerate() {
+                let want = i <= j;
+                assert_eq!(
+                    to.reachable_from(from),
+                    want,
+                    "ply {j} from ply {i} should be {}",
+                    if want { "reachable" } else { "unreachable" }
+                );
+                pairs += 1;
+            }
+        }
+    }
+    println!("{pairs} ply pairs checked");
 }
 
 /// `MAX_LEVEL` is a bound derived on paper; this checks it against a lot of real games. If

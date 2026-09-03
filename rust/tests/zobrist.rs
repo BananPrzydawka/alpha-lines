@@ -141,7 +141,7 @@ fn distinct_positions_get_distinct_hashes() {
 
     let mut rng = Rng::new(0xD15C);
     let mut scratch = Scratch::new();
-    let mut seen: HashMap<u64, [i8; SQUARES]> = HashMap::new();
+    let mut seen: HashMap<u64, [u8; SQUARES]> = HashMap::new();
     let mut equal = 0usize;
 
     for _ in 0..3_000 {
