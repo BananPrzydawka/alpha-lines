@@ -52,10 +52,10 @@ fn a_node_can_be_found_by_key_and_not_by_another() {
     assert_eq!(a.node(n).ids(), &[7]);
 }
 
-/// Keys that land in the same bucket must still be told apart, and deleting one must not
-/// hide the other behind a tombstone.
+/// Keys that land in the same slot must be told apart, and deleting one from the middle of
+/// the run must leave the others findable — which is the whole job of the backward shift.
 #[test]
-fn colliding_keys_probe_past_each_other_and_past_tombstones() {
+fn deleting_from_the_middle_of_a_run_keeps_the_rest_findable() {
     let mut a: Arena<()> = Arena::new(&cfg(64));
     let slots = 128u64; // capacity 64 -> 128 index slots
     let (k1, k2, k3) = (5, 5 + slots, 5 + 2 * slots);
@@ -66,8 +66,13 @@ fn colliding_keys_probe_past_each_other_and_past_tombstones() {
 
     a.remove(n2);
     assert_eq!(a.get(k2), None, "a removed key must not be found");
-    assert_eq!(a.get(k1), Some(n1), "a tombstone must not hide an earlier key");
-    assert_eq!(a.get(k3), Some(n3), "a tombstone must not hide a later key");
+    assert_eq!(a.get(k1), Some(n1), "the entry before the hole was lost");
+    assert_eq!(a.get(k3), Some(n3), "the entry after the hole was stranded");
+    assert!(a.shifted > 0, "k3 had to be pulled back, so a shift must have happened");
+
+    // and the run is closed up, not merely still walkable: k3 was pulled from slot 7 into
+    // the hole at 6, which is as close to its home as it can get with k1 sitting on it
+    assert_eq!(a.probe_lengths(), (1.5, 2), "the run was not compacted");
 }
 
 #[test]
@@ -231,9 +236,8 @@ fn a_node_reads_terminality_from_the_game_it_owns() {
     assert_eq!(v[0], -v[1], "the game is zero sum");
 }
 
-/// Probe runs lengthen with live entries and tombstones together, so the rebuild has to be
-/// triggered on both. Triggering on tombstones alone lets total occupancy climb until every
-/// lookup walks a long run.
+/// Probe length must stay bounded by how many entries are live, forever, with no rebuild.
+/// Nothing accumulates, so heavy churn should leave the index exactly as good as a fresh one.
 ///
 /// The table is held near capacity throughout, because an index that is nearly empty has
 /// nothing to say about probe lengths.
@@ -269,27 +273,24 @@ fn the_index_stays_short_to_probe_through_heavy_churn() {
     }
 
     assert_eq!(a.len(), live.len());
-    assert!(a.rehashes > 0, "the index was never rebuilt, so this tested nothing");
-    assert!(worst_mean < 2.5, "mean probe length reached {worst_mean:.2}");
-    assert!(worst_max < 60, "worst probe length reached {worst_max}");
+    assert!(a.shifted > 0, "no deletion ever had to close a gap, so this tested nothing");
+    assert!(worst_mean < 2.0, "mean probe length reached {worst_mean:.2}");
+    assert!(worst_max < 40, "worst probe length reached {worst_max}");
     println!(
-        "300 rounds near capacity: {} rehashes, mean probe {worst_mean:.2}, worst {worst_max}",
-        a.rehashes
+        "300 rounds near capacity: {} shifts, mean probe {worst_mean:.2}, worst {worst_max}",
+        a.shifted
     );
 }
 
-/// A tombstoned slot keeps the key of the node that was there. Probing must not match on it,
-/// or a deleted key would read as present — and `get` checks the slot before the key for
-/// exactly that reason.
+/// A deleted key must be gone, and its slot reusable by an unrelated key.
 #[test]
-fn a_tombstoned_slot_does_not_match_its_old_key() {
+fn a_deleted_key_is_gone_and_its_slot_is_reusable() {
     let mut a: Arena<()> = Arena::new(&cfg(64));
     let n = a.insert(0xDEAD, board(1), 0, 1).unwrap();
     assert_eq!(a.get(0xDEAD), Some(n));
     a.remove(n);
-    assert_eq!(a.get(0xDEAD), None, "the stale key in the tombstone matched");
+    assert_eq!(a.get(0xDEAD), None, "a stale key was still matched");
 
-    // and the slot is reusable by a different key without confusion
     let m = a.insert(0xBEEF, board(2), 0, 2).unwrap();
     assert_eq!(a.get(0xBEEF), Some(m));
     assert_eq!(a.get(0xDEAD), None);
@@ -308,4 +309,49 @@ fn key_zero_is_an_ordinary_key() {
     a.remove(n);
     assert_eq!(a.get(0), None);
     assert_eq!(a.get(1), Some(m), "removing key 0 must not hide key 1");
+}
+
+/// The backward shift is the one piece of this table that can lose data silently: a wrong
+/// move strands a key that is still in the index, and nothing complains until a lookup that
+/// should hit misses. So it is soaked — random inserts and deletes, with every live key
+/// checked after every operation, at a load high enough to make runs long.
+#[test]
+fn the_index_never_loses_a_key_under_random_insert_and_delete() {
+    let capacity = 700; // 2048 slots, so a full table sits at a third and runs are real
+    let mut a: Arena<()> = Arena::new(&cfg(capacity));
+    let mut rng = Rng::new(0x50AC);
+    let mut live: Vec<u64> = Vec::new();
+
+    for op in 0..60_000u64 {
+        // bias towards inserting while there is room, so the table stays busy
+        let insert = live.is_empty() || (live.len() < capacity && rng.randint(3) != 0);
+        if insert {
+            let key = rng.next_u64();
+            if a.get(key).is_some() {
+                continue;
+            }
+            match a.insert(key, board(0), 0, 0) {
+                Some(_) => live.push(key),
+                None => continue,
+            }
+        } else {
+            let at = rng.randint(live.len() as u64) as usize;
+            let key = live.swap_remove(at);
+            let n = a.get(key).expect("live key vanished before its delete");
+            a.remove(n);
+            assert_eq!(a.get(key), None, "op {op}: a deleted key is still present");
+        }
+
+        // every live key, every operation
+        assert_eq!(a.len(), live.len(), "op {op}: live count drifted");
+        for &key in &live {
+            assert!(a.get(key).is_some(), "op {op}: lost key {key}");
+        }
+    }
+    println!(
+        "60k random ops, {} live at the end, {} shifts, probe {:?}",
+        a.len(),
+        a.shifted,
+        a.probe_lengths()
+    );
 }

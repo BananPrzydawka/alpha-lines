@@ -10,21 +10,26 @@
 //! just to compare a key would be a cache miss on every step of every probe, on the hottest
 //! path in the search. Index entries are 16 bytes, four to a cache line.
 //!
-//! Deletion tombstones. The alternative — shifting later entries back into the hole, so no
-//! marker is needed — is faster in isolation but moves entries, which makes the table hostile
-//! to concurrent readers and pins it to linear probing. Tombstones are cheap here anyway now
-//! that walking past one is an in-cache read rather than a node dereference.
+//! Deleting repairs the probe run instead of marking it. Linear probing puts a key at the
+//! first free slot at or after its home, so emptying a slot can strand a later key that had
+//! probed past it. Rather than leave a tombstone saying "keep walking", the delete pulls any
+//! such key back into the hole. Nothing is left behind, so probe length depends only on how
+//! many entries are live, and the index never needs rebuilding.
+//!
+//! The catch is that entries move, which rules out concurrent readers and pins the table to
+//! linear probing. Both are fine here: the search is single-threaded by design, linear
+//! probing is what the cache wants anyway, and nothing outside holds an index position —
+//! callers hold node slots, which never move.
 
 use crate::game::Game;
 use crate::mcts::config::{Config, K, PENDING};
 
 /// An index slot holding no node.
 const EMPTY: u32 = u32::MAX;
-/// An index slot whose node was deleted; probing continues through it.
-const TOMB: u32 = u32::MAX - 1;
 
 /// One index slot: the key and the node it names. Holding the key here is what keeps probing
-/// out of the node array. A tombstoned entry keeps its stale key, so `slot` is checked first.
+/// out of the node array, and it is also what lets a delete work out where a displaced entry
+/// wanted to live.
 #[derive(Clone, Copy)]
 struct Entry {
     key: u64,
@@ -88,12 +93,10 @@ pub struct Arena<S> {
     mask: usize,
     capacity: usize,
     live: usize,
-    tombstones: usize,
-    occupancy_limit: usize,
     /// Diagnostics: id writes that displaced an existing id.
     pub overflows: u64,
-    /// Diagnostics: times the key index has been rebuilt.
-    pub rehashes: u64,
+    /// Diagnostics: index entries pulled back into a hole by a delete.
+    pub shifted: u64,
 }
 
 impl<S: Default + Clone> Arena<S> {
@@ -108,10 +111,8 @@ impl<S: Default + Clone> Arena<S> {
             mask: slots - 1,
             capacity,
             live: 0,
-            tombstones: 0,
-            occupancy_limit: (slots as f32 * cfg.index_occupancy) as usize,
             overflows: 0,
-            rehashes: 0,
+            shifted: 0,
         }
     }
 
@@ -126,9 +127,6 @@ impl<S: Default + Clone> Arena<S> {
     }
     pub fn free_depth(&self) -> usize {
         self.free.len()
-    }
-    pub fn tombstones(&self) -> usize {
-        self.tombstones
     }
 
     pub fn node(&self, i: u32) -> &Node<S> {
@@ -146,7 +144,7 @@ impl<S: Default + Clone> Arena<S> {
             if e.slot == EMPTY {
                 return None;
             }
-            if e.slot != TOMB && e.key == key {
+            if e.key == key {
                 return Some(e.slot);
             }
             b = (b + 1) & self.mask;
@@ -158,7 +156,7 @@ impl<S: Default + Clone> Arena<S> {
     pub fn probe_lengths(&self) -> (f64, usize) {
         let (mut total, mut worst) = (0usize, 0usize);
         for (b, e) in self.index.iter().enumerate() {
-            if e.slot == EMPTY || e.slot == TOMB {
+            if e.slot == EMPTY {
                 continue;
             }
             let home = e.key as usize & self.mask;
@@ -212,31 +210,16 @@ impl<S: Default + Clone> Arena<S> {
         Some(slot)
     }
 
-    /// Drop a node: tombstone its index entry and return the slot to the free list.
+    /// Drop a node: repair its probe run and return the slot to the free list.
     pub fn remove(&mut self, i: u32) {
         let key = self.nodes[i as usize].key;
-        let mut b = key as usize & self.mask;
-        loop {
-            let e = self.index[b];
-            if e.slot == EMPTY {
-                return; // not indexed; nothing to do
-            }
-            if e.slot == i {
-                self.index[b].slot = TOMB;
-                self.tombstones += 1;
-                break;
-            }
-            b = (b + 1) & self.mask;
+        if !self.index_remove(key, i) {
+            return; // not indexed; nothing to do
         }
         self.nodes[i as usize].id_count = 0;
         self.nodes[i as usize].key = 0;
         self.free.push(i);
         self.live -= 1;
-        // probe runs lengthen with live entries and tombstones together, so that is what the
-        // rebuild is triggered on
-        if self.live + self.tombstones > self.occupancy_limit {
-            self.rehash();
-        }
     }
 
     /// Record that game `id` has used node `i`, per the spec's id-write rule.
@@ -292,34 +275,52 @@ impl<S: Default + Clone> Arena<S> {
         self.free.clear();
         self.index.iter_mut().for_each(|e| *e = Entry::VACANT);
         self.live = 0;
-        self.tombstones = 0;
     }
 
     fn index_insert(&mut self, key: u64, slot: u32) {
         let mut b = key as usize & self.mask;
-        loop {
-            let e = self.index[b];
-            if e.slot == EMPTY || e.slot == TOMB {
-                if e.slot == TOMB {
-                    self.tombstones -= 1;
-                }
-                self.index[b] = Entry { key, slot };
-                return;
-            }
+        while self.index[b].slot != EMPTY {
             b = (b + 1) & self.mask;
         }
+        self.index[b] = Entry { key, slot };
     }
 
-    /// Rebuild the index, clearing tombstones. Node slots do not move.
-    fn rehash(&mut self) {
-        self.rehashes += 1;
-        self.index.iter_mut().for_each(|e| *e = Entry::VACANT);
-        self.tombstones = 0;
-        for i in 0..self.nodes.len() as u32 {
-            if self.nodes[i as usize].id_count > 0 {
-                let key = self.nodes[i as usize].key;
-                self.index_insert(key, i);
+    /// Take `key` out of the index and close the gap behind it. Returns whether it was there.
+    ///
+    /// Walking forward from the hole, an entry can be pulled back into it exactly when it is
+    /// already displaced at least as far as the hole is behind it — that is, when its home
+    /// slot is at or before the hole in probe order. Anything closer to home than that is
+    /// holding its own run together and must stay. Each move makes the vacated slot the new
+    /// hole, and the scan ends at the first empty slot, which nothing can have probed past.
+    fn index_remove(&mut self, key: u64, slot: u32) -> bool {
+        let mask = self.mask;
+        let mut hole = key as usize & mask;
+        loop {
+            let e = self.index[hole];
+            if e.slot == EMPTY {
+                return false;
+            }
+            if e.slot == slot && e.key == key {
+                break;
+            }
+            hole = (hole + 1) & mask;
+        }
+
+        let mut j = hole;
+        loop {
+            j = (j + 1) & mask;
+            let e = self.index[j];
+            if e.slot == EMPTY {
+                break;
+            }
+            let home = e.key as usize & mask;
+            if j.wrapping_sub(home) & mask >= j.wrapping_sub(hole) & mask {
+                self.index[hole] = e;
+                hole = j;
+                self.shifted += 1;
             }
         }
+        self.index[hole] = Entry::VACANT;
+        true
     }
 }
