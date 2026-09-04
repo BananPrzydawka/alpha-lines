@@ -33,7 +33,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let g = 8192;
-        let s = 200;
+        let s = 100;
         Config {
             g,
             b: 2048,
