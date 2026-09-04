@@ -21,8 +21,10 @@ pub struct Config {
     pub max_descents: u32,
     /// Node stack size.
     pub node_capacity: usize,
-    /// Fraction of the index that may be tombstones before a rehash.
-    pub tombstone_ratio: f32,
+    /// Fraction of the key index that may be occupied — live entries plus tombstones —
+    /// before it is rebuilt. Probe runs lengthen with total occupancy, not with live
+    /// entries, so this is the number that governs lookup cost.
+    pub index_occupancy: f32,
 
     pub c_puct: f32,
     pub alpha: f32,
@@ -42,7 +44,7 @@ impl Default for Config {
             max_descents: 4,
             // steady state trends to G * S / 2 (spec section 10); headroom on top
             node_capacity: g * s as usize / 2 * 5 / 4,
-            tombstone_ratio: 0.25,
+            index_occupancy: 0.7,
             c_puct: 1.5,
             alpha: 0.3,
             epsilon: 0.25,

@@ -90,9 +90,10 @@ fn count(legal: [u64; LEGAL_WORDS]) -> u32 {
 #[derive(Clone, Debug)]
 pub struct PuctStats {
     pub prior: [[f32; SQUARES]; 2],
-    pub visit: [[u16; SQUARES]; 2],
+    pub visit: [[u32; SQUARES]; 2],
     pub q: [[f32; SQUARES]; 2],
-    /// Backups dropped because an edge hit the `u16` visit ceiling.
+    /// Backups dropped because an edge hit the `u32` visit ceiling. Unreachable in practice;
+    /// it is here so that if it ever happens it is visible rather than silent.
     pub saturated: u32,
 }
 
@@ -140,13 +141,13 @@ impl Variant for Puct {
         _rng: &mut Rng,
     ) -> Choice {
         let (q, visit, prior) = (&stats.q[player], &stats.visit[player], &stats.prior[player]);
-        let total: u32 = squares(legal).map(|sq| u32::from(visit[sq])).sum();
+        let total: u64 = squares(legal).map(|sq| u64::from(visit[sq])).sum();
         let explore = cfg.c_puct * (total as f32).sqrt();
 
         let mut best = f32::NEG_INFINITY;
         let mut action = usize::MAX;
         for sq in squares(legal) {
-            let score = q[sq] + explore * prior[sq] / (1.0 + f32::from(visit[sq]));
+            let score = q[sq] + explore * prior[sq] / (1.0 + visit[sq] as f32);
             if score > best {
                 best = score;
                 action = sq;
@@ -166,12 +167,12 @@ impl Variant for Puct {
         for player in 0..2 {
             let sq = choice[player].action as usize;
             let n = stats.visit[player][sq];
-            if n == u16::MAX {
+            if n == u32::MAX {
                 stats.saturated += 1;
                 continue;
             }
             let q = &mut stats.q[player][sq];
-            *q = (*q * f32::from(n) + values[player]) / (f32::from(n) + 1.0);
+            *q = (*q * n as f32 + values[player]) / (n as f32 + 1.0);
             stats.visit[player][sq] = n + 1;
         }
     }

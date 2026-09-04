@@ -4,6 +4,16 @@
 //! Generic over the statistic block so PUCT and EXP3 share the storage. Nodes are allocated
 //! on demand up to `node_capacity`, so a large capacity reserves address space without
 //! touching it.
+//!
+//! The index stores the key beside the slot, so probing never reads a node. That matters
+//! because a node is ~2 KB and the array of them is close to a gigabyte: dereferencing one
+//! just to compare a key would be a cache miss on every step of every probe, on the hottest
+//! path in the search. Index entries are 16 bytes, four to a cache line.
+//!
+//! Deletion tombstones. The alternative — shifting later entries back into the hole, so no
+//! marker is needed — is faster in isolation but moves entries, which makes the table hostile
+//! to concurrent readers and pins it to linear probing. Tombstones are cheap here anyway now
+//! that walking past one is an in-cache read rather than a node dereference.
 
 use crate::game::Game;
 use crate::mcts::config::{Config, K, PENDING};
@@ -12,6 +22,18 @@ use crate::mcts::config::{Config, K, PENDING};
 const EMPTY: u32 = u32::MAX;
 /// An index slot whose node was deleted; probing continues through it.
 const TOMB: u32 = u32::MAX - 1;
+
+/// One index slot: the key and the node it names. Holding the key here is what keeps probing
+/// out of the node array. A tombstoned entry keeps its stale key, so `slot` is checked first.
+#[derive(Clone, Copy)]
+struct Entry {
+    key: u64,
+    slot: u32,
+}
+
+impl Entry {
+    const VACANT: Entry = Entry { key: 0, slot: EMPTY };
+}
 
 /// A node owns the position it stands for.
 ///
@@ -62,14 +84,16 @@ pub enum IdWrite {
 pub struct Arena<S> {
     nodes: Vec<Node<S>>,
     free: Vec<u32>,
-    index: Vec<u32>,
+    index: Vec<Entry>,
     mask: usize,
     capacity: usize,
     live: usize,
     tombstones: usize,
-    tombstone_limit: usize,
+    occupancy_limit: usize,
     /// Diagnostics: id writes that displaced an existing id.
     pub overflows: u64,
+    /// Diagnostics: times the key index has been rebuilt.
+    pub rehashes: u64,
 }
 
 impl<S: Default + Clone> Arena<S> {
@@ -80,13 +104,14 @@ impl<S: Default + Clone> Arena<S> {
         Arena {
             nodes: Vec::with_capacity(capacity.min(1 << 20)),
             free: Vec::new(),
-            index: vec![EMPTY; slots],
+            index: vec![Entry::VACANT; slots],
             mask: slots - 1,
             capacity,
             live: 0,
             tombstones: 0,
-            tombstone_limit: (slots as f32 * cfg.tombstone_ratio) as usize,
+            occupancy_limit: (slots as f32 * cfg.index_occupancy) as usize,
             overflows: 0,
+            rehashes: 0,
         }
     }
 
@@ -117,14 +142,34 @@ impl<S: Default + Clone> Arena<S> {
     pub fn get(&self, key: u64) -> Option<u32> {
         let mut b = key as usize & self.mask;
         loop {
-            match self.index[b] {
-                EMPTY => return None,
-                TOMB => {}
-                n if self.nodes[n as usize].key == key => return Some(n),
-                _ => {}
+            let e = self.index[b];
+            if e.slot == EMPTY {
+                return None;
+            }
+            if e.slot != TOMB && e.key == key {
+                return Some(e.slot);
             }
             b = (b + 1) & self.mask;
         }
+    }
+
+    /// Mean and worst probe distance over the live entries. A diagnostic, walked on demand
+    /// rather than counted on every lookup, so it costs the hot path nothing.
+    pub fn probe_lengths(&self) -> (f64, usize) {
+        let (mut total, mut worst) = (0usize, 0usize);
+        for (b, e) in self.index.iter().enumerate() {
+            if e.slot == EMPTY || e.slot == TOMB {
+                continue;
+            }
+            let home = e.key as usize & self.mask;
+            let d = (b.wrapping_sub(home)) & self.mask;
+            total += d + 1;
+            worst = worst.max(d + 1);
+        }
+        if self.live == 0 {
+            return (0.0, 0);
+        }
+        (total as f64 / self.live as f64, worst)
     }
 
     /// Add a node for `key`. The caller must have checked it is absent.
@@ -172,14 +217,14 @@ impl<S: Default + Clone> Arena<S> {
         let key = self.nodes[i as usize].key;
         let mut b = key as usize & self.mask;
         loop {
-            match self.index[b] {
-                EMPTY => return, // not indexed; nothing to do
-                n if n == i => {
-                    self.index[b] = TOMB;
-                    self.tombstones += 1;
-                    break;
-                }
-                _ => {}
+            let e = self.index[b];
+            if e.slot == EMPTY {
+                return; // not indexed; nothing to do
+            }
+            if e.slot == i {
+                self.index[b].slot = TOMB;
+                self.tombstones += 1;
+                break;
             }
             b = (b + 1) & self.mask;
         }
@@ -187,7 +232,9 @@ impl<S: Default + Clone> Arena<S> {
         self.nodes[i as usize].key = 0;
         self.free.push(i);
         self.live -= 1;
-        if self.tombstones > self.tombstone_limit {
+        // probe runs lengthen with live entries and tombstones together, so that is what the
+        // rebuild is triggered on
+        if self.live + self.tombstones > self.occupancy_limit {
             self.rehash();
         }
     }
@@ -243,7 +290,7 @@ impl<S: Default + Clone> Arena<S> {
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.free.clear();
-        self.index.iter_mut().for_each(|s| *s = EMPTY);
+        self.index.iter_mut().for_each(|e| *e = Entry::VACANT);
         self.live = 0;
         self.tombstones = 0;
     }
@@ -252,11 +299,11 @@ impl<S: Default + Clone> Arena<S> {
         let mut b = key as usize & self.mask;
         loop {
             let e = self.index[b];
-            if e == EMPTY || e == TOMB {
-                if e == TOMB {
+            if e.slot == EMPTY || e.slot == TOMB {
+                if e.slot == TOMB {
                     self.tombstones -= 1;
                 }
-                self.index[b] = slot;
+                self.index[b] = Entry { key, slot };
                 return;
             }
             b = (b + 1) & self.mask;
@@ -265,7 +312,8 @@ impl<S: Default + Clone> Arena<S> {
 
     /// Rebuild the index, clearing tombstones. Node slots do not move.
     fn rehash(&mut self) {
-        self.index.iter_mut().for_each(|s| *s = EMPTY);
+        self.rehashes += 1;
+        self.index.iter_mut().for_each(|e| *e = Entry::VACANT);
         self.tombstones = 0;
         for i in 0..self.nodes.len() as u32 {
             if self.nodes[i as usize].id_count > 0 {

@@ -33,7 +33,7 @@ fn random_stats_puct(legal: [u64; LEGAL_WORDS], rng: &mut Rng) -> PuctStats {
     for player in 0..2 {
         for sq in squares(legal) {
             s.prior[player][sq] = rng.random() as f32;
-            s.visit[player][sq] = (rng.randint(30)) as u16;
+            s.visit[player][sq] = rng.randint(30) as u32;
             s.q[player][sq] = rng.random() as f32 * 2.0 - 1.0;
         }
     }
@@ -144,13 +144,13 @@ fn puct_backup_keeps_a_running_mean() {
 fn puct_backup_saturates_rather_than_wrapping() {
     let c = cfg();
     let mut stats = PuctStats::default();
-    stats.visit[0][5] = u16::MAX;
-    stats.visit[1][5] = u16::MAX - 1;
+    stats.visit[0][5] = u32::MAX;
+    stats.visit[1][5] = u32::MAX - 1;
     let choice = [Choice { action: 5, prob: 1.0 }, Choice { action: 5, prob: 1.0 }];
 
     Puct::backup(&mut stats, choice, [1.0, 1.0], [40, 40], &c);
-    assert_eq!(stats.visit[0][5], u16::MAX, "must not wrap");
-    assert_eq!(stats.visit[1][5], u16::MAX);
+    assert_eq!(stats.visit[0][5], u32::MAX, "must not wrap");
+    assert_eq!(stats.visit[1][5], u32::MAX);
     assert_eq!(stats.saturated, 1, "the dropped backup is counted");
 
     Puct::backup(&mut stats, choice, [1.0, 1.0], [40, 40], &c);

@@ -230,3 +230,82 @@ fn a_node_reads_terminality_from_the_game_it_owns() {
     assert_eq!(v, want, "scores {scores:?} gave the wrong outcome");
     assert_eq!(v[0], -v[1], "the game is zero sum");
 }
+
+/// Probe runs lengthen with live entries and tombstones together, so the rebuild has to be
+/// triggered on both. Triggering on tombstones alone lets total occupancy climb until every
+/// lookup walks a long run.
+///
+/// The table is held near capacity throughout, because an index that is nearly empty has
+/// nothing to say about probe lengths.
+#[test]
+fn the_index_stays_short_to_probe_through_heavy_churn() {
+    let capacity = 1500;
+    let mut a: Arena<()> = Arena::new(&cfg(capacity));
+    let mut rng = Rng::new(0xC0FFEE);
+    let mut live: Vec<u64> = Vec::new();
+    let mut worst_mean = 0.0f64;
+    let mut worst_max = 0usize;
+
+    // fill to just under capacity, then churn a tenth of it every round
+    for round in 0..300u64 {
+        while live.len() < capacity - 1 {
+            let key = rng.next_u64();
+            if a.get(key).is_none() && a.insert(key, board(0), 0, 0).is_some() {
+                live.push(key);
+            }
+        }
+        for _ in 0..capacity / 10 {
+            let at = rng.randint(live.len() as u64) as usize;
+            let key = live.swap_remove(at);
+            let n = a.get(key).expect("live key must be present");
+            a.remove(n);
+        }
+        for &key in &live {
+            assert!(a.get(key).is_some(), "key {key} lost in round {round}");
+        }
+        let (mean, max) = a.probe_lengths();
+        worst_mean = worst_mean.max(mean);
+        worst_max = worst_max.max(max);
+    }
+
+    assert_eq!(a.len(), live.len());
+    assert!(a.rehashes > 0, "the index was never rebuilt, so this tested nothing");
+    assert!(worst_mean < 2.5, "mean probe length reached {worst_mean:.2}");
+    assert!(worst_max < 60, "worst probe length reached {worst_max}");
+    println!(
+        "300 rounds near capacity: {} rehashes, mean probe {worst_mean:.2}, worst {worst_max}",
+        a.rehashes
+    );
+}
+
+/// A tombstoned slot keeps the key of the node that was there. Probing must not match on it,
+/// or a deleted key would read as present — and `get` checks the slot before the key for
+/// exactly that reason.
+#[test]
+fn a_tombstoned_slot_does_not_match_its_old_key() {
+    let mut a: Arena<()> = Arena::new(&cfg(64));
+    let n = a.insert(0xDEAD, board(1), 0, 1).unwrap();
+    assert_eq!(a.get(0xDEAD), Some(n));
+    a.remove(n);
+    assert_eq!(a.get(0xDEAD), None, "the stale key in the tombstone matched");
+
+    // and the slot is reusable by a different key without confusion
+    let m = a.insert(0xBEEF, board(2), 0, 2).unwrap();
+    assert_eq!(a.get(0xBEEF), Some(m));
+    assert_eq!(a.get(0xDEAD), None);
+}
+
+/// Zobrist keys are already uniform, so the index masks them rather than hashing again.
+/// Key 0 is a real key — it is the opening position — and must behave like any other.
+#[test]
+fn key_zero_is_an_ordinary_key() {
+    let mut a: Arena<()> = Arena::new(&cfg(16));
+    let n = a.insert(0, board(0), 0, 3).unwrap();
+    assert_eq!(a.get(0), Some(n));
+    let m = a.insert(1, board(1), 0, 4).unwrap();
+    assert_eq!(a.get(0), Some(n), "key 0 was lost behind another entry");
+    assert_eq!(a.get(1), Some(m));
+    a.remove(n);
+    assert_eq!(a.get(0), None);
+    assert_eq!(a.get(1), Some(m), "removing key 0 must not hide key 1");
+}
