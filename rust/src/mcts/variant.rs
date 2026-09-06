@@ -28,17 +28,20 @@ pub trait Variant {
         player: usize,
     );
 
-    /// Choose a move for `player` out of `legal`, which must not be empty.
+    /// Choose the joint move: one square per player, out of that player's mask, neither of
+    /// which may be empty.
+    ///
+    /// Joint because the players move simultaneously and the search only ever wants both,
+    /// which also keeps a caller from pairing one player's mask with the other's index.
     ///
     /// Takes the statistics mutably because EXP3 accumulates its average strategy here, which
     /// is the thing a root eventually emits as a training target.
     fn select(
         stats: &mut Self::Stats,
-        legal: [u64; LEGAL_WORDS],
-        player: usize,
+        legal: [[u64; LEGAL_WORDS]; 2],
         cfg: &Config,
         rng: &mut Rng,
-    ) -> Choice;
+    ) -> [Choice; 2];
 
     /// Fold `values` into the edges named by `choice`.
     ///
@@ -57,19 +60,20 @@ pub trait Variant {
 #[derive(Clone, Copy)]
 pub struct MaskIter {
     words: [u64; LEGAL_WORDS],
-    at: usize,
+    /// Which of the two words is being drained.
+    word: usize,
 }
 
 impl Iterator for MaskIter {
     type Item = usize;
     fn next(&mut self) -> Option<usize> {
-        while self.at < LEGAL_WORDS {
-            let w = self.words[self.at];
+        while self.word < LEGAL_WORDS {
+            let w = self.words[self.word];
             if w != 0 {
-                self.words[self.at] = w & (w - 1);
-                return Some((self.at << 6) + w.trailing_zeros() as usize);
+                self.words[self.word] = w & (w - 1);
+                return Some((self.word << 6) + w.trailing_zeros() as usize);
             }
-            self.at += 1;
+            self.word += 1;
         }
         None
     }
@@ -77,7 +81,7 @@ impl Iterator for MaskIter {
 
 #[inline]
 pub fn squares(legal: [u64; LEGAL_WORDS]) -> MaskIter {
-    MaskIter { words: legal, at: 0 }
+    MaskIter { words: legal, word: 0 }
 }
 
 #[inline]
@@ -135,26 +139,31 @@ impl Variant for Puct {
     /// backups arriving from several games compose here.
     fn select(
         stats: &mut PuctStats,
-        legal: [u64; LEGAL_WORDS],
-        player: usize,
+        legal: [[u64; LEGAL_WORDS]; 2],
         cfg: &Config,
         _rng: &mut Rng,
-    ) -> Choice {
-        let (q, visit, prior) = (&stats.q[player], &stats.visit[player], &stats.prior[player]);
-        let total: u64 = squares(legal).map(|sq| u64::from(visit[sq])).sum();
-        let explore = cfg.c_puct * (total as f32).sqrt();
+    ) -> [Choice; 2] {
+        let mut out = [Choice { action: 0, prob: 1.0 }; 2];
+        for player in 0..2 {
+            let mask = legal[player];
+            let (q, visit, prior) =
+                (&stats.q[player], &stats.visit[player], &stats.prior[player]);
+            let total: u64 = squares(mask).map(|sq| u64::from(visit[sq])).sum();
+            let explore = cfg.c_puct * (total as f32).sqrt();
 
-        let mut best = f32::NEG_INFINITY;
-        let mut action = usize::MAX;
-        for sq in squares(legal) {
-            let score = q[sq] + explore * prior[sq] / (1.0 + visit[sq] as f32);
-            if score > best {
-                best = score;
-                action = sq;
+            let mut best = f32::NEG_INFINITY;
+            let mut action = usize::MAX;
+            for sq in squares(mask) {
+                let score = q[sq] + explore * prior[sq] / (1.0 + visit[sq] as f32);
+                if score > best {
+                    best = score;
+                    action = sq;
+                }
             }
+            debug_assert!(action != usize::MAX, "select over an empty legal set");
+            out[player] = Choice { action: action as u8, prob: 1.0 };
         }
-        debug_assert!(action != usize::MAX, "select over an empty legal set");
-        Choice { action: action as u8, prob: 1.0 }
+        out
     }
 
     fn backup(
@@ -266,30 +275,36 @@ impl Variant for Exp3 {
     /// inverse CDF in board order.
     fn select(
         stats: &mut Exp3Stats,
-        legal: [u64; LEGAL_WORDS],
-        player: usize,
+        legal: [[u64; LEGAL_WORDS]; 2],
         cfg: &Config,
         rng: &mut Rng,
-    ) -> Choice {
+    ) -> [Choice; 2] {
+        // one buffer for both players: `mixed` writes only the squares it is about to read
         let mut probs = [0.0f32; SQUARES];
-        Self::mixed(stats, legal, player, cfg.exp3_gamma, &mut probs);
+        let mut out = [Choice { action: 0, prob: 0.0 }; 2];
 
-        let sum = &mut stats.strategy_sum[player];
-        let threshold = rng.random() as f32; // the strategy sums to 1 by construction
-        let mut cum = 0.0f32;
-        let mut chosen = None;
-        let mut last = (0usize, 0.0f32);
-        for sq in squares(legal) {
-            sum[sq] += probs[sq];
-            last = (sq, probs[sq]);
-            cum += probs[sq];
-            if chosen.is_none() && cum > threshold {
-                chosen = Some(last);
+        for player in 0..2 {
+            let mask = legal[player];
+            Self::mixed(stats, mask, player, cfg.exp3_gamma, &mut probs);
+
+            let sum = &mut stats.strategy_sum[player];
+            let threshold = rng.random() as f32; // the strategy sums to 1 by construction
+            let mut cum = 0.0f32;
+            let mut chosen = None;
+            let mut last = (0usize, 0.0f32);
+            for sq in squares(mask) {
+                sum[sq] += probs[sq];
+                last = (sq, probs[sq]);
+                cum += probs[sq];
+                if chosen.is_none() && cum > threshold {
+                    chosen = Some(last);
+                }
             }
+            // `chosen` is None only if rounding left the running sum just short of the draw
+            let (action, prob) = chosen.unwrap_or(last);
+            out[player] = Choice { action: action as u8, prob };
         }
-        // `chosen` is None only if rounding left the running sum just short of the draw
-        let (action, prob) = chosen.unwrap_or(last);
-        Choice { action: action as u8, prob }
+        out
     }
 
     /// `log_w[a] += gamma * (reward / prob) / num_legal`, with `reward = (value + 1) / 2`.

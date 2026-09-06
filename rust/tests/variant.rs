@@ -72,12 +72,12 @@ fn puct_selection_matches_the_python_formula() {
             continue;
         }
         let stats = random_stats_puct(g.legal_moves(0), &mut rng);
+        let legal = [g.legal_moves(0), g.legal_moves(1)];
+        let got = Puct::select(&mut stats.clone(), legal, &c, &mut rng);
         for player in 0..2 {
-            let legal = g.legal_moves(player);
-            let got = Puct::select(&mut stats.clone(), legal, player, &c, &mut rng);
-            let want = puct_reference(&stats, legal, player, f64::from(c.c_puct));
-            assert_eq!(got.action as usize, want, "trial {trial} player {player}");
-            assert_eq!(got.prob, 1.0, "puct is deterministic");
+            let want = puct_reference(&stats, legal[player], player, f64::from(c.c_puct));
+            assert_eq!(got[player].action as usize, want, "trial {trial} player {player}");
+            assert_eq!(got[player].prob, 1.0, "puct is deterministic");
             checked += 1;
         }
     }
@@ -96,18 +96,21 @@ fn puct_never_picks_an_illegal_square() {
             continue;
         }
         let mut stats = PuctStats::default();
+        let legal = [g.legal_moves(0), g.legal_moves(1)];
         for player in 0..2 {
             for sq in 0..SQUARES {
                 stats.q[player][sq] = 100.0; // illegal squares would win on score
                 stats.prior[player][sq] = 1.0;
             }
-            let legal = g.legal_moves(player);
-            for sq in squares(legal) {
+            for sq in squares(legal[player]) {
                 stats.q[player][sq] = -100.0;
             }
-            let got = Puct::select(&mut stats.clone(), legal, player, &c, &mut rng);
-            let sq = got.action as usize;
-            assert!(legal[sq >> 6] >> (sq & 63) & 1 == 1, "picked illegal square {sq}");
+        }
+        let got = Puct::select(&mut stats.clone(), legal, &c, &mut rng);
+        for player in 0..2 {
+            let sq = got[player].action as usize;
+            let mask = legal[player];
+            assert!(mask[sq >> 6] >> (sq & 63) & 1 == 1, "picked illegal square {sq}");
         }
     }
 }
@@ -258,7 +261,7 @@ fn exp3_sampling_follows_the_mixed_strategy() {
     let draws = 400_000;
     let mut hits = vec![0u32; SQUARES];
     for _ in 0..draws {
-        let ch = Exp3::select(&mut stats, legal, 0, &c, &mut rng);
+        let ch = Exp3::select(&mut stats, [legal, legal], &c, &mut rng)[0];
         let sq = ch.action as usize;
         assert!(legal[sq >> 6] >> (sq & 63) & 1 == 1, "sampled illegal square {sq}");
         assert!(
@@ -389,8 +392,9 @@ fn exp3_selection_accumulates_the_average_strategy() {
     Exp3::mixed(&stats, legal, 0, c.exp3_gamma, &mut want);
 
     let draws = 500;
+    let other = g.legal_moves(1);
     for _ in 0..draws {
-        Exp3::select(&mut stats, legal, 0, &c, &mut rng);
+        Exp3::select(&mut stats, [legal, other], &c, &mut rng);
     }
     // no backup ran, so the strategy never moved and the sum is that strategy, `draws` times
     for sq in squares(legal) {
@@ -401,8 +405,10 @@ fn exp3_selection_accumulates_the_average_strategy() {
             "square {sq}: summed {got}, expected {expect}"
         );
     }
-    // the other player was never selected for, so its sum is untouched
-    assert!(stats.strategy_sum[1].iter().all(|&v| v == 0.0));
+    // selection is joint, so the second player accumulated over its own mask and nowhere else
+    assert!(squares(other).all(|sq| stats.strategy_sum[1][sq] > 0.0));
+    let mut off = (0..SQUARES).filter(|&sq| other[sq >> 6] >> (sq & 63) & 1 == 0);
+    assert!(off.all(|sq| stats.strategy_sum[1][sq] == 0.0));
 
     // normalised, the sum is the strategy back again — which is what the target is
     let total: f32 = squares(legal).map(|sq| stats.strategy_sum[0][sq]).sum();
@@ -423,8 +429,9 @@ fn the_average_strategy_lags_the_current_one() {
     let favourite = squares(legal).next().unwrap();
     let mut stats = Exp3Stats::default();
 
+    let other = g.legal_moves(1);
     for _ in 0..300 {
-        Exp3::select(&mut stats, legal, 0, &c, &mut rng);
+        Exp3::select(&mut stats, [legal, other], &c, &mut rng);
         // reward one square hard, every time
         let choice = [
             Choice { action: favourite as u8, prob: 0.1 },
