@@ -8,7 +8,7 @@
 //! buffer filled by walking the slots from 0, a step once 2048 games are ready, 100
 //! simulations per game per move.
 //!
-//! Usage: run [--cycles N] [--exp3]
+//! Usage: run [--cycles N] [--exp3] [--peaked]
 
 use std::time::Instant;
 
@@ -17,15 +17,34 @@ use alpha_lines_game::mcts::search::{Evaluate, Search};
 use alpha_lines_game::mcts::variant::{Exp3, Exp3Stats, Puct, PuctStats, Variant};
 use alpha_lines_game::mcts::{Config, Node};
 
-/// Stands in for an untrained network: near-uniform priors, noisy values.
-struct Stub(Rng);
+/// Stands in for a network. Nothing is trained and nothing is updated.
+///
+/// `Flat` is an untrained net: near-uniform priors, so the search has no opinion and spreads
+/// over the whole legal set. `Peaked` stands in for a trained one by raising uniform draws to
+/// a power, which concentrates the mass on a few squares the way a confident policy would —
+/// the point being to read what the search does when its effective branching factor is small.
+struct Stub {
+    rng: Rng,
+    peaked: bool,
+}
 impl Evaluate for Stub {
     fn evaluate(&mut self, _pos: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]) {
-        for p in priors.iter_mut() {
-            *p = 1.0 + self.0.random() as f32 * 0.05;
+        if self.peaked {
+            // one dominant square per row, the rest near zero: a Dirichlet with alpha -> 0,
+            // and a sharper policy than a trained net is likely to produce
+            for row in priors.chunks_mut(SQUARES) {
+                let pick = self.rng.randint(SQUARES as u64) as usize;
+                for (k, p) in row.iter_mut().enumerate() {
+                    *p = if k == pick { 1.0 } else { 0.004 };
+                }
+            }
+        } else {
+            for p in priors.iter_mut() {
+                *p = 1.0 + self.rng.random() as f32 * 0.05;
+            }
         }
         for v in values.iter_mut() {
-            *v = self.0.random() as f32 * 2.0 - 1.0;
+            *v = self.rng.random() as f32 * 2.0 - 1.0;
         }
     }
 }
@@ -34,9 +53,9 @@ fn arg(args: &[String], key: &str, default: usize) -> usize {
     args.iter().position(|a| a == key).map(|i| args[i + 1].parse().expect("numeric")).unwrap_or(default)
 }
 
-fn go<V: Variant>(cfg: Config, cycles: usize, node_bytes: usize) {
+fn go<V: Variant>(cfg: Config, cycles: usize, node_bytes: usize, peaked: bool) {
     let mut search = Search::<V>::new(cfg.clone(), 0xA1FA);
-    let mut model = Stub(Rng::new(7));
+    let mut model = Stub { rng: Rng::new(7), peaked };
     let (mut moves, mut done) = (0usize, 0usize);
 
     let t = Instant::now();
@@ -63,7 +82,15 @@ fn go<V: Variant>(cfg: Config, cycles: usize, node_bytes: usize) {
     println!("  shared        {}  ({:.0}%)", d.duplicate_hits, 100.0 * d.duplicate_hits as f64 / d.descents.max(1) as f64);
     println!("  terminal      {}  ({:.0}%)", d.terminal_hits, 100.0 * d.terminal_hits as f64 / d.descents.max(1) as f64);
     println!("  root evals    {}   exhausted {}   max-descents {}", d.root_evals, d.exhausted, d.max_descents_hit);
-    println!("  buffer short  {:.1}% of rows   deepest slot {}", 100.0 * d.buffer_shortfall as f64 / (d.cycles * cfg.b as u64) as f64, d.deepest_slot);
+
+    println!("\nmodel calls (one per cycle)");
+    println!("  calls         {}   {:.2} ms of non-model work each", d.cycles,
+        (secs * 1e3 - d.t_evaluate as f64 / 1e6) / d.cycles.max(1) as f64);
+    println!("  short calls   {} of {}  ({} rows unfilled in total)", d.cycles_short, d.cycles, d.buffer_shortfall);
+    println!("  short at      first {:?}{}", d.short_cycles, if d.cycles_short > 64 { " ..." } else { "" });
+    println!("                last short cycle {} of {}", d.last_short_cycle, d.cycles);
+    println!("  walk reaches  slot {:.0} on average, {} at worst, of {}",
+        d.walk_end_total as f64 / d.cycles.max(1) as f64, d.deepest_slot, cfg.g - 1);
 
     println!("\ngames");
     println!("  steps {}   moves {moves}   games finished {done}", d.steps);
@@ -75,7 +102,13 @@ fn go<V: Variant>(cfg: Config, cycles: usize, node_bytes: usize) {
     println!("  created {}   deleted {}   id shifts {}", d.buffer_unique, d.nodes_deleted, search.arena.shifted);
     let (mean, worst) = search.arena.probe_lengths();
     println!("  probe {mean:.2} mean, {worst} worst   id overflows {}", search.arena.overflows);
-    println!("  id histogram {:?}  max {}", d.id_histogram, d.max_id_count);
+    println!("  id histogram (cumulative over sweeps) {:?}", d.id_histogram);
+    println!("  max ids seen {}   nodes that overflowed {} ({:.3}% of created)",
+        d.max_id_count, search.arena.overflow_nodes,
+        100.0 * search.arena.overflow_nodes as f64 / d.buffer_unique.max(1) as f64);
+    let ply: Vec<(usize, u64)> = search.arena.overflow_ply.iter().enumerate()
+        .filter(|(_, &c)| c > 0).map(|(p, &c)| (p, c)).collect();
+    println!("  overflows by ply {ply:?}");
 }
 
 fn main() {
@@ -86,9 +119,11 @@ fn main() {
         "G={} B={} T={} S={} capacity={}",
         cfg.g, cfg.b, cfg.t, cfg.s, cfg.node_capacity
     );
+    let peaked = a.iter().any(|x| x == "--peaked");
+    println!("model: {}", if peaked { "peaked (stands in for a trained net)" } else { "flat (untrained)" });
     if a.iter().any(|x| x == "--exp3") {
-        go::<Exp3>(cfg, cycles, std::mem::size_of::<Node<Exp3Stats>>());
+        go::<Exp3>(cfg, cycles, std::mem::size_of::<Node<Exp3Stats>>(), peaked);
     } else {
-        go::<Puct>(cfg, cycles, std::mem::size_of::<Node<PuctStats>>());
+        go::<Puct>(cfg, cycles, std::mem::size_of::<Node<PuctStats>>(), peaked);
     }
 }

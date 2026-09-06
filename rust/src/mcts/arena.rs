@@ -21,8 +21,8 @@
 //! probing is what the cache wants anyway, and nothing outside holds an index position —
 //! callers hold node slots, which never move.
 
-use crate::game::Game;
-use crate::mcts::config::{Config, K, PENDING};
+use crate::game::{Game, SQUARES};
+use crate::mcts::config::{Config, K, OVERFLOWED, PENDING};
 
 /// An index slot holding no node.
 const EMPTY: u32 = u32::MAX;
@@ -97,6 +97,9 @@ pub struct Arena<S> {
     pub overflows: u64,
     /// Diagnostics: index entries pulled back into a hole by a delete.
     pub shifted: u64,
+    /// Diagnostics: distinct nodes that have ever overflowed, and the ply they sit at.
+    pub overflow_nodes: u64,
+    pub overflow_ply: Vec<u64>,
 }
 
 impl<S> Arena<S> {
@@ -113,6 +116,8 @@ impl<S> Arena<S> {
             live: 0,
             overflows: 0,
             shifted: 0,
+            overflow_nodes: 0,
+            overflow_ply: vec![0; SQUARES + 1],
         }
     }
 
@@ -200,7 +205,14 @@ impl<S> Arena<S> {
             let displaced = n.ids[n.id_cursor as usize];
             n.ids[n.id_cursor as usize] = id;
             n.id_cursor = ((n.id_cursor as usize + 1) % K) as u8;
+            let first = n.flags & OVERFLOWED == 0;
+            n.flags |= OVERFLOWED;
+            let ply = (n.game.move_count as usize).min(SQUARES);
             self.overflows += 1;
+            if first {
+                self.overflow_nodes += 1;
+                self.overflow_ply[ply] += 1;
+            }
             IdWrite::Displaced(displaced)
         }
     }

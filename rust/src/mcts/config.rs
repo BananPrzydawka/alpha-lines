@@ -6,6 +6,8 @@ pub const K: usize = 16;
 /// Bits in `Node::flags`. Terminality is not a flag: a node owns its game, so it is
 /// `game.finished`, and a stored copy could only drift from it.
 pub const PENDING: u8 = 1 << 0;
+/// This node's id list has been full at least once, so some game's claim on it was dropped.
+pub const OVERFLOWED: u8 = 1 << 1;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {

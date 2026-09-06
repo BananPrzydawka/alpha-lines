@@ -57,6 +57,14 @@ pub struct Diagnostics {
     pub buffer_unique: u64,
     /// Rows the collection walk could not fill, summed over cycles.
     pub buffer_shortfall: u64,
+    /// Cycles that ran the model on a part-empty buffer.
+    pub cycles_short: u64,
+    /// Which cycles those were, up to the first 64, plus the last one seen — together they
+    /// separate a startup effect from one that recurs at every step.
+    pub short_cycles: Vec<u64>,
+    pub last_short_cycle: u64,
+    /// Last slot index the walk reached, summed over cycles, for the mean.
+    pub walk_end_total: u64,
     /// Descents that landed on a position already queued by another game.
     pub duplicate_hits: u64,
     pub terminal_hits: u64,
@@ -219,10 +227,12 @@ impl<V: Variant> Search<V> {
             s.descents = 0;
         }
 
+        let mut end = 0usize;
         for i in 0..self.slots.len() {
             if self.buffer.is_full() {
                 break;
             }
+            end = i;
             self.diag.deepest_slot = self.diag.deepest_slot.max(i);
             if !self.slots[i].collectable(&self.cfg) {
                 continue;
@@ -292,6 +302,14 @@ impl<V: Variant> Search<V> {
         }
         let short = self.cfg.b - self.buffer.len;
         self.diag.buffer_shortfall += short as u64;
+        if short > 0 {
+            self.diag.cycles_short += 1;
+            if self.diag.short_cycles.len() < 64 {
+                self.diag.short_cycles.push(self.diag.cycles);
+            }
+            self.diag.last_short_cycle = self.diag.cycles;
+        }
+        self.diag.walk_end_total += end as u64;
     }
 
     /// Undo a descent that produced a node the buffer has no room to ask about.
@@ -439,8 +457,9 @@ impl<V: Variant> Search<V> {
     /// Drop each node's claim from games that can no longer reach it, and delete the nodes
     /// nobody claims. A node is only ever tested against the games in its own id list.
     fn sweep(&mut self, stepping: &[bool], finished: &[bool]) {
+        // cumulative across sweeps, so it answers how much id pressure the search ever put
+        // on a node rather than what happened to survive the most recent step
         let hist = &mut self.diag.id_histogram;
-        hist.iter_mut().for_each(|c| *c = 0);
         let mut max_ids = 0u8;
 
         for slot in 0..self.arena.slot_count() as u32 {
