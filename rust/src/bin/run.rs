@@ -4,7 +4,11 @@
 //! a micro-benchmark of one call. The model is a stub, so the evaluate column is not a real
 //! GPU cost — everything else is.
 //!
-//! Usage: run [--games G] [--cycles N] [--sims S] [--exp3]
+//! The configuration is the spec's and is not adjustable: 8192 game slots, a 2048-wide
+//! buffer filled by walking the slots from 0, a step once 2048 games are ready, 100
+//! simulations per game per move.
+//!
+//! Usage: run [--cycles N] [--exp3]
 
 use std::time::Instant;
 
@@ -76,11 +80,12 @@ fn go<V: Variant>(cfg: Config, cycles: usize, node_bytes: usize) {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let g = arg(&a, "--games", 8192);
-    let cycles = arg(&a, "--cycles", 2000);
-    let s = arg(&a, "--sims", 100) as u32;
-    let cfg = Config { g, s, node_capacity: g * s as usize / 2 * 5 / 4, t: g / 4, ..Config::default() };
-    println!("G={g} B={} T={} S={} capacity={}", cfg.b, cfg.t, cfg.s, cfg.node_capacity);
+    let cycles = arg(&a, "--cycles", 16000);
+    let cfg = Config::default();
+    println!(
+        "G={} B={} T={} S={} capacity={}",
+        cfg.g, cfg.b, cfg.t, cfg.s, cfg.node_capacity
+    );
     if a.iter().any(|x| x == "--exp3") {
         go::<Exp3>(cfg, cycles, std::mem::size_of::<Node<Exp3Stats>>());
     } else {
