@@ -34,6 +34,7 @@ fn random_stats_puct(legal: [u64; LEGAL_WORDS], rng: &mut Rng) -> PuctStats {
         for sq in squares(legal) {
             s.prior[player][sq] = rng.random() as f32;
             s.visit[player][sq] = rng.randint(30) as u32;
+            s.total[player] += s.visit[player][sq];
             s.q[player][sq] = rng.random() as f32 * 2.0 - 1.0;
         }
     }
@@ -149,6 +150,7 @@ fn puct_backup_saturates_rather_than_wrapping() {
     let mut stats = PuctStats::default();
     stats.visit[0][5] = u32::MAX;
     stats.visit[1][5] = u32::MAX - 1;
+    stats.total = [u32::MAX, u32::MAX - 1];
     let choice = [Choice { action: 5, prob: 1.0 }, Choice { action: 5, prob: 1.0 }];
 
     Puct::backup(&mut stats, choice, [1.0, 1.0], [40, 40], &c);

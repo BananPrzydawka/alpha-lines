@@ -96,6 +96,10 @@ pub struct PuctStats {
     pub prior: [[f32; SQUARES]; 2],
     pub visit: [[u32; SQUARES]; 2],
     pub q: [[f32; SQUARES]; 2],
+    /// Sum of `visit` per player, maintained by backup so selection reads the arrays once
+    /// rather than twice. Over every square, not just the legal ones — the same number, since
+    /// an illegal square is never selected and so never accrues a visit.
+    pub total: [u32; 2],
     /// Backups dropped because an edge hit the `u32` visit ceiling. Unreachable in practice;
     /// it is here so that if it ever happens it is visible rather than silent.
     pub saturated: u32,
@@ -107,6 +111,7 @@ impl Default for PuctStats {
             prior: [[0.0; SQUARES]; 2],
             visit: [[0; SQUARES]; 2],
             q: [[0.0; SQUARES]; 2],
+            total: [0; 2],
             saturated: 0,
         }
     }
@@ -146,10 +151,14 @@ impl Variant for Puct {
         let mut out = [Choice { action: 0, prob: 1.0 }; 2];
         for player in 0..2 {
             let mask = legal[player];
+            let explore = cfg.c_puct * (stats.total[player] as f32).sqrt();
             let (q, visit, prior) =
                 (&stats.q[player], &stats.visit[player], &stats.prior[player]);
-            let total: u64 = squares(mask).map(|sq| u64::from(visit[sq])).sum();
-            let explore = cfg.c_puct * (total as f32).sqrt();
+            debug_assert_eq!(
+                stats.total[player],
+                visit.iter().sum::<u32>(),
+                "the cached visit total drifted from the counts it stands for"
+            );
 
             let mut best = f32::NEG_INFINITY;
             let mut action = usize::MAX;
@@ -183,6 +192,7 @@ impl Variant for Puct {
             let q = &mut stats.q[player][sq];
             *q = (*q * n as f32 + values[player]) / (n as f32 + 1.0);
             stats.visit[player][sq] = n + 1;
+            stats.total[player] += 1;
         }
     }
 }

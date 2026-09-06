@@ -99,7 +99,7 @@ pub struct Arena<S> {
     pub shifted: u64,
 }
 
-impl<S: Default + Clone> Arena<S> {
+impl<S> Arena<S> {
     pub fn new(cfg: &Config) -> Self {
         let capacity = cfg.node_capacity;
         // power of two, at least 2x capacity, so the table stays under half full
@@ -168,46 +168,6 @@ impl<S: Default + Clone> Arena<S> {
             return (0.0, 0);
         }
         (total as f64 / self.live as f64, worst)
-    }
-
-    /// Add a node for `key`. The caller must have checked it is absent.
-    ///
-    /// Returns `None` when the stack is full, which the caller has to treat as a search
-    /// budget being exhausted rather than an error.
-    pub fn insert(&mut self, key: u64, game: Game, flags: u8, id: u16) -> Option<u32> {
-        let slot = match self.free.pop() {
-            Some(s) => {
-                let n = &mut self.nodes[s as usize];
-                n.key = key;
-                n.game = game;
-                n.flags = flags;
-                n.ids[0] = id;
-                n.id_count = 1;
-                n.id_cursor = 0;
-                n.stats = S::default();
-                s
-            }
-            None => {
-                if self.nodes.len() >= self.capacity {
-                    return None;
-                }
-                let mut ids = [0u16; K];
-                ids[0] = id;
-                self.nodes.push(Node {
-                    key,
-                    game,
-                    flags,
-                    ids,
-                    id_count: 1,
-                    id_cursor: 0,
-                    stats: S::default(),
-                });
-                (self.nodes.len() - 1) as u32
-            }
-        };
-        self.index_insert(key, slot);
-        self.live += 1;
-        Some(slot)
     }
 
     /// Drop a node: repair its probe run and return the slot to the free list.
@@ -322,5 +282,48 @@ impl<S: Default + Clone> Arena<S> {
         }
         self.index[hole] = Entry::VACANT;
         true
+    }
+}
+
+/// `Default` is needed only to blank a new node's statistics.
+impl<S: Default> Arena<S> {
+    /// Add a node for `key`. The caller must have checked it is absent.
+    ///
+    /// Returns `None` when the stack is full, which the caller has to treat as a search
+    /// budget being exhausted rather than an error.
+    pub fn insert(&mut self, key: u64, game: Game, flags: u8, id: u16) -> Option<u32> {
+        let slot = match self.free.pop() {
+            Some(s) => {
+                let n = &mut self.nodes[s as usize];
+                n.key = key;
+                n.game = game;
+                n.flags = flags;
+                n.ids[0] = id;
+                n.id_count = 1;
+                n.id_cursor = 0;
+                n.stats = S::default();
+                s
+            }
+            None => {
+                if self.nodes.len() >= self.capacity {
+                    return None;
+                }
+                let mut ids = [0u16; K];
+                ids[0] = id;
+                self.nodes.push(Node {
+                    key,
+                    game,
+                    flags,
+                    ids,
+                    id_count: 1,
+                    id_cursor: 0,
+                    stats: S::default(),
+                });
+                (self.nodes.len() - 1) as u32
+            }
+        };
+        self.index_insert(key, slot);
+        self.live += 1;
+        Some(slot)
     }
 }
