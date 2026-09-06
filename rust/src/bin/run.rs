@@ -8,7 +8,7 @@
 //! buffer filled by walking the slots from 0, a step once 2048 games are ready, 100
 //! simulations per game per move.
 //!
-//! Usage: run [--cycles N] [--exp3] [--peaked]
+//! Usage: run [--cycles N] [--exp3] [--peaked] [--zero-values]
 
 use std::time::Instant;
 
@@ -26,6 +26,10 @@ use alpha_lines_game::mcts::{Config, Node};
 struct Stub {
     rng: Rng,
     peaked: bool,
+    /// Return zero for every value, so selection is driven by the policy alone. Random values
+    /// give every edge a noisy `q` in [-1, 1], which is the same size as the exploration term
+    /// and so competes with the prior for control of the argmax.
+    zero_values: bool,
 }
 impl Evaluate for Stub {
     fn evaluate(&mut self, _pos: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]) {
@@ -44,7 +48,7 @@ impl Evaluate for Stub {
             }
         }
         for v in values.iter_mut() {
-            *v = self.rng.random() as f32 * 2.0 - 1.0;
+            *v = if self.zero_values { 0.0 } else { self.rng.random() as f32 * 2.0 - 1.0 };
         }
     }
 }
@@ -53,9 +57,9 @@ fn arg(args: &[String], key: &str, default: usize) -> usize {
     args.iter().position(|a| a == key).map(|i| args[i + 1].parse().expect("numeric")).unwrap_or(default)
 }
 
-fn go<V: Variant>(cfg: Config, cycles: usize, node_bytes: usize, peaked: bool) {
+fn go<V: Variant>(cfg: Config, cycles: usize, node_bytes: usize, peaked: bool, zero_values: bool) {
     let mut search = Search::<V>::new(cfg.clone(), 0xA1FA);
-    let mut model = Stub { rng: Rng::new(7), peaked };
+    let mut model = Stub { rng: Rng::new(7), peaked, zero_values };
     let (mut moves, mut done) = (0usize, 0usize);
 
     let t = Instant::now();
@@ -78,6 +82,9 @@ fn go<V: Variant>(cfg: Config, cycles: usize, node_bytes: usize, peaked: bool) {
 
     println!("\nsearch");
     println!("  descents      {}  ({:.0}/s), mean depth {:.2}", d.descents, d.descents as f64 / secs, d.mean_depth());
+    let dh: Vec<(usize, String)> = d.depth_hist.iter().enumerate().filter(|(_, &c)| c > 0)
+        .map(|(k, &c)| (k, format!("{:.1}%", 100.0 * c as f64 / d.descents.max(1) as f64))).collect();
+    println!("  depth spread  {dh:?}");
     println!("  new nodes     {}  ({:.0}% of descents)", d.buffer_unique, 100.0 * d.buffer_unique as f64 / d.descents.max(1) as f64);
     println!("  shared        {}  ({:.0}%)", d.duplicate_hits, 100.0 * d.duplicate_hits as f64 / d.descents.max(1) as f64);
     println!("  terminal      {}  ({:.0}%)", d.terminal_hits, 100.0 * d.terminal_hits as f64 / d.descents.max(1) as f64);
@@ -89,6 +96,10 @@ fn go<V: Variant>(cfg: Config, cycles: usize, node_bytes: usize, peaked: bool) {
     println!("  short calls   {} of {}  ({} rows unfilled in total)", d.cycles_short, d.cycles, d.buffer_shortfall);
     println!("  short at      first {:?}{}", d.short_cycles, if d.cycles_short > 64 { " ..." } else { "" });
     println!("                last short cycle {} of {}", d.last_short_cycle, d.cycles);
+    println!("  on short cycles: {} descents, {} of them ({:.0}%) landed on a position another",
+        d.short_descents, d.short_duplicates,
+        100.0 * d.short_duplicates as f64 / d.short_descents.max(1) as f64);
+    println!("                   game had already queued, so they filled no row");
     println!("  walk reaches  slot {:.0} on average, {} at worst, of {}",
         d.walk_end_total as f64 / d.cycles.max(1) as f64, d.deepest_slot, cfg.g - 1);
 
@@ -109,6 +120,11 @@ fn go<V: Variant>(cfg: Config, cycles: usize, node_bytes: usize, peaked: bool) {
     let ply: Vec<(usize, u64)> = search.arena.overflow_ply.iter().enumerate()
         .filter(|(_, &c)| c > 0).map(|(p, &c)| (p, c)).collect();
     println!("  overflows by ply {ply:?}");
+    println!("  reach tests {} of which kept {} ({:.1}% hit rate)",
+        d.reach_tested, d.reach_kept, 100.0 * d.reach_kept as f64 / d.reach_tested.max(1) as f64);
+    let fns: Vec<(usize, u64)> = d.full_node_survivors.iter().enumerate()
+        .filter(|(_, &c)| c > 0).map(|(k, &c)| (k, c)).collect();
+    println!("  full (K-id) nodes at sweep, by ids surviving: {fns:?}");
 }
 
 fn main() {
@@ -120,10 +136,13 @@ fn main() {
         cfg.g, cfg.b, cfg.t, cfg.s, cfg.node_capacity
     );
     let peaked = a.iter().any(|x| x == "--peaked");
-    println!("model: {}", if peaked { "peaked (stands in for a trained net)" } else { "flat (untrained)" });
+    let zero = a.iter().any(|x| x == "--zero-values");
+    println!("model: {} policy, {} values",
+        if peaked { "peaked" } else { "flat" },
+        if zero { "zero" } else { "random" });
     if a.iter().any(|x| x == "--exp3") {
-        go::<Exp3>(cfg, cycles, std::mem::size_of::<Node<Exp3Stats>>(), peaked);
+        go::<Exp3>(cfg, cycles, std::mem::size_of::<Node<Exp3Stats>>(), peaked, zero);
     } else {
-        go::<Puct>(cfg, cycles, std::mem::size_of::<Node<PuctStats>>(), peaked);
+        go::<Puct>(cfg, cycles, std::mem::size_of::<Node<PuctStats>>(), peaked, zero);
     }
 }

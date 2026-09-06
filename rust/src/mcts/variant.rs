@@ -256,7 +256,9 @@ impl Variant for Puct {
         for player in 0..2 {
             let sq = choice[player].action as usize;
             let n = stats.visit[player][sq];
-            if n == u32::MAX {
+            // the total is the sum, so it hits the ceiling long before any single edge does;
+            // low-ply nodes are never flushed and run for the whole deployment
+            if n == u32::MAX || stats.total[player] == u32::MAX {
                 stats.saturated += 1;
                 continue;
             }

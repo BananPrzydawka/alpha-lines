@@ -16,6 +16,9 @@ use crate::mcts::slot::Slot;
 use crate::mcts::variant::{squares, Variant};
 use crate::{zobrist, Game};
 
+/// Depth buckets in the diagnostics; the last one is "this deep or deeper".
+pub const DEPTH_BUCKETS: usize = 24;
+
 /// The model. One call scores `positions`, both players at once.
 ///
 /// `priors` is `2 * width * SQUARES` long and `values` is `2 * width`: player `p`'s row for
@@ -63,6 +66,19 @@ pub struct Diagnostics {
     /// separate a startup effect from one that recurs at every step.
     pub short_cycles: Vec<u64>,
     pub last_short_cycle: u64,
+    /// Descents on short cycles that produced no buffer row because the position was already
+    /// queued by another game. This is what makes a cycle come up short: the walk uses slots
+    /// but they contribute nothing to the batch.
+    pub short_duplicates: u64,
+    /// Descents on short cycles in total, for the ratio.
+    pub short_descents: u64,
+    /// How many descents ended at each depth.
+    pub depth_hist: Vec<u64>,
+    /// Reach tests the sweep ran, and how many kept the id.
+    pub reach_tested: u64,
+    pub reach_kept: u64,
+    /// For nodes whose id list was full at sweep time, how many ids survived the sweep.
+    pub full_node_survivors: Vec<u64>,
     /// Last slot index the walk reached, summed over cycles, for the mean.
     pub walk_end_total: u64,
     /// Descents that landed on a position already queued by another game.
@@ -173,7 +189,12 @@ impl<V: Variant> Search<V> {
             buffer: Buffer::new(cfg.b),
             pending_roots: HashMap::new(),
             evaluated: HashMap::new(),
-            diag: Diagnostics { id_histogram: vec![0; crate::mcts::config::K + 1], ..Default::default() },
+            diag: Diagnostics {
+                id_histogram: vec![0; crate::mcts::config::K + 1],
+                full_node_survivors: vec![0; crate::mcts::config::K + 1],
+                depth_hist: vec![0; DEPTH_BUCKETS],
+                ..Default::default()
+            },
             cfg,
             arena,
             slots,
@@ -227,6 +248,7 @@ impl<V: Variant> Search<V> {
             s.descents = 0;
         }
 
+        let (dup_at_start, descents_at_start) = (self.diag.duplicate_hits, self.diag.descents);
         let mut end = 0usize;
         for i in 0..self.slots.len() {
             if self.buffer.is_full() {
@@ -264,7 +286,9 @@ impl<V: Variant> Search<V> {
                     &mut self.scratch,
                 );
                 self.diag.descents += 1;
-                self.diag.depth_total += self.slots[i].path.len() as u64;
+                let d = self.slots[i].path.len();
+                self.diag.depth_total += d as u64;
+                self.diag.depth_hist[d.min(DEPTH_BUCKETS - 1)] += 1;
                 self.slots[i].descents += 1;
                 match r {
                     Descent::Entry { node, fresh } => {
@@ -303,6 +327,8 @@ impl<V: Variant> Search<V> {
         let short = self.cfg.b - self.buffer.len;
         self.diag.buffer_shortfall += short as u64;
         if short > 0 {
+            self.diag.short_duplicates += self.diag.duplicate_hits - dup_at_start;
+            self.diag.short_descents += self.diag.descents - descents_at_start;
             self.diag.cycles_short += 1;
             if self.diag.short_cycles.len() < 64 {
                 self.diag.short_cycles.push(self.diag.cycles);
@@ -481,7 +507,11 @@ impl<V: Variant> Search<V> {
                 let stale = if finished[i] {
                     true
                 } else if stepping[i] {
-                    !self.arena.node(slot).game.reachable_from(&self.slots[i].root.game)
+                    let keep =
+                        self.arena.node(slot).game.reachable_from(&self.slots[i].root.game);
+                    self.diag.reach_tested += 1;
+                    self.diag.reach_kept += u64::from(keep);
+                    !keep
                 } else {
                     false // that game's root did not move, so everything it holds is still live
                 };
@@ -490,7 +520,13 @@ impl<V: Variant> Search<V> {
                 }
             }
 
-            if self.arena.is_unused(slot) {
+            let survivors = if self.arena.is_unused(slot) { 0 } else { self.arena.node(slot).ids().len() };
+            if count == crate::mcts::config::K {
+                // how close a full node came to being deleted: 1 means it was on the edge and
+                // more id slots would have kept it alive longer
+                self.diag.full_node_survivors[survivors] += 1;
+            }
+            if survivors == 0 {
                 self.arena.remove(slot);
                 self.diag.nodes_deleted += 1;
             }
