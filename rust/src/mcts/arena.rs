@@ -128,6 +128,10 @@ impl<S> Arena<S> {
     pub fn free_depth(&self) -> usize {
         self.free.len()
     }
+    /// Slots ever allocated, live or free — the range the sweep walks.
+    pub fn slot_count(&self) -> usize {
+        self.nodes.len()
+    }
 
     pub fn node(&self, i: u32) -> &Node<S> {
         &self.nodes[i as usize]

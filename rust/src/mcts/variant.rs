@@ -8,6 +8,7 @@
 
 use crate::game::{Rng, LEGAL_WORDS, SQUARES};
 use crate::mcts::config::Config;
+use crate::mcts::noise;
 
 /// A move and the probability it was drawn with. PUCT is deterministic and leaves `prob` at
 /// 1; EXP3 needs it for the importance weight in its backup.
@@ -42,6 +43,29 @@ pub trait Variant {
         cfg: &Config,
         rng: &mut Rng,
     ) -> [Choice; 2];
+
+    /// The training target for a root: a distribution per player over the legal squares.
+    ///
+    /// PUCT emits the visit distribution, EXP3 the average strategy. Both are read only from
+    /// roots, but both are accumulated everywhere, so promoting a node into a root keeps the
+    /// search already done at that state instead of restarting it.
+    fn target(
+        stats: &Self::Stats,
+        legal: [[u64; LEGAL_WORDS]; 2],
+        out: &mut [[f32; SQUARES]; 2],
+    );
+
+    /// Treat this statistic block as a root's.
+    ///
+    /// Called when a game adopts a position as its root: on a fresh seed, on promotion, and
+    /// when a pending root's evaluation lands. PUCT mixes in fresh Dirichlet noise — on an
+    /// all-zero prior that is pure noise, which is what §7 wants of an unevaluated root.
+    fn make_root(
+        stats: &mut Self::Stats,
+        legal: [[u64; LEGAL_WORDS]; 2],
+        cfg: &Config,
+        rng: &mut Rng,
+    );
 
     /// Fold `values` into the edges named by `choice`.
     ///
@@ -138,7 +162,7 @@ impl Variant for Puct {
         }
     }
 
-    /// `argmax(q + c * prior * sqrt(total) / (1 + visit))` over the legal squares.
+    /// `argmax(q + c * prior * sqrt(1 + total) / (1 + visit))` over the legal squares.
     ///
     /// `total` is the node's own edge counts and is never read from a parent or a child, so
     /// backups arriving from several games compose here.
@@ -151,7 +175,12 @@ impl Variant for Puct {
         let mut out = [Choice { action: 0, prob: 1.0 }; 2];
         for player in 0..2 {
             let mask = legal[player];
-            let explore = cfg.c_puct * (stats.total[player] as f32).sqrt();
+            // `1 +` deviates from `mcts_puct.py`, which uses sqrt(total) and so scores every
+            // square zero on a node's first visit — priors, and the root's Dirichlet noise,
+            // multiplied away. Sequentially that self-corrects after one backup; here
+            // thousands of games select at the same fresh root in one cycle and all choose
+            // the same square. The offset makes the first visit follow the priors.
+            let explore = cfg.c_puct * (1.0 + stats.total[player] as f32).sqrt();
             let (q, visit, prior) =
                 (&stats.q[player], &stats.visit[player], &stats.prior[player]);
             debug_assert_eq!(
@@ -173,6 +202,48 @@ impl Variant for Puct {
             out[player] = Choice { action: action as u8, prob: 1.0 };
         }
         out
+    }
+
+    /// `visit / sum(visit)` over the legal squares.
+    fn target(
+        stats: &PuctStats,
+        legal: [[u64; LEGAL_WORDS]; 2],
+        out: &mut [[f32; SQUARES]; 2],
+    ) {
+        for player in 0..2 {
+            out[player] = [0.0; SQUARES];
+            let total = stats.total[player] as f32;
+            if total == 0.0 {
+                // never searched: fall back to uniform rather than emit nothing
+                let n = count(legal[player]) as f32;
+                for sq in squares(legal[player]) {
+                    out[player][sq] = 1.0 / n;
+                }
+                continue;
+            }
+            for sq in squares(legal[player]) {
+                out[player][sq] = stats.visit[player][sq] as f32 / total;
+            }
+        }
+    }
+
+    /// Mix `epsilon` of a fresh Dirichlet sample into the priors, legal squares only.
+    fn make_root(
+        stats: &mut PuctStats,
+        legal: [[u64; LEGAL_WORDS]; 2],
+        cfg: &Config,
+        rng: &mut Rng,
+    ) {
+        let mut noise = [0.0f32; SQUARES];
+        for player in 0..2 {
+            let n = count(legal[player]) as usize;
+            debug_assert!(n > 0, "a root with no legal move");
+            noise::dirichlet(rng, cfg.alpha, &mut noise[..n]);
+            for (k, sq) in squares(legal[player]).enumerate() {
+                let p = &mut stats.prior[player][sq];
+                *p = (1.0 - cfg.epsilon) * *p + cfg.epsilon * noise[k];
+            }
+        }
     }
 
     fn backup(
@@ -315,6 +386,43 @@ impl Variant for Exp3 {
             out[player] = Choice { action: action as u8, prob };
         }
         out
+    }
+
+    /// `strategy_sum / sum` over the legal squares: the average strategy, which is what EXP3
+    /// converges on rather than its latest one.
+    fn target(
+        stats: &Exp3Stats,
+        legal: [[u64; LEGAL_WORDS]; 2],
+        out: &mut [[f32; SQUARES]; 2],
+    ) {
+        for player in 0..2 {
+            out[player] = [0.0; SQUARES];
+            let total: f32 = squares(legal[player]).map(|sq| stats.strategy_sum[player][sq]).sum();
+            if total <= 0.0 {
+                let n = count(legal[player]) as f32;
+                for sq in squares(legal[player]) {
+                    out[player][sq] = 1.0 / n;
+                }
+                continue;
+            }
+            for sq in squares(legal[player]) {
+                out[player][sq] = stats.strategy_sum[player][sq] / total;
+            }
+        }
+    }
+
+    /// Nothing to do.
+    ///
+    /// EXP3 has no priors to disturb — exploration is the `gamma / n` floor, which is already
+    /// in every mixed strategy. And the inherited `strategy_sum` is deliberately kept: it was
+    /// accumulated by searches through this very state, so a promoted node starts with a
+    /// target already part-built rather than from nothing.
+    fn make_root(
+        _stats: &mut Exp3Stats,
+        _legal: [[u64; LEGAL_WORDS]; 2],
+        _cfg: &Config,
+        _rng: &mut Rng,
+    ) {
     }
 
     /// `log_w[a] += gamma * (reward / prob) / num_legal`, with `reward = (value + 1) / 2`.

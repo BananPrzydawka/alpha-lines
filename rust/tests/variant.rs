@@ -41,7 +41,9 @@ fn random_stats_puct(legal: [u64; LEGAL_WORDS], rng: &mut Rng) -> PuctStats {
     s
 }
 
-/// `mcts_puct.py`'s `select`, transcribed.
+/// `mcts_puct.py`'s `select`, transcribed, with the one deliberate deviation: `sqrt(1 + total)`
+/// where the Python has `sqrt(total)`, so that a node's first visit follows its priors instead
+/// of scoring every square zero. See `Puct::select`.
 fn puct_reference(s: &PuctStats, legal: [u64; LEGAL_WORDS], player: usize, c: f64) -> usize {
     let total: f64 = (0..SQUARES).map(|sq| f64::from(s.visit[player][sq])).sum();
     let mut best = f64::NEG_INFINITY;
@@ -52,7 +54,7 @@ fn puct_reference(s: &PuctStats, legal: [u64; LEGAL_WORDS], player: usize, c: f6
             continue;
         }
         let score = f64::from(s.q[player][sq])
-            + c * f64::from(s.prior[player][sq]) * total.sqrt()
+            + c * f64::from(s.prior[player][sq]) * (1.0 + total).sqrt()
                 / (1.0 + f64::from(s.visit[player][sq]));
         if score > best {
             best = score;
