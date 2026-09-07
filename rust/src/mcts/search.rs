@@ -17,7 +17,7 @@ use crate::mcts::variant::{squares, Variant};
 use crate::{zobrist, Game};
 
 /// Depth buckets in the diagnostics; the last one is "this deep or deeper".
-pub const DEPTH_BUCKETS: usize = 24;
+pub const DEPTH_BUCKETS: usize = crate::mcts::slot::MAX_PLY + 1;
 
 /// The model. One call scores `positions`, both players at once.
 ///
@@ -72,8 +72,13 @@ pub struct Diagnostics {
     pub short_duplicates: u64,
     /// Descents on short cycles in total, for the ratio.
     pub short_descents: u64,
-    /// How many descents ended at each depth.
+    /// How many descents ended at each depth, split by why the descent ended: it built a new
+    /// node, it landed on one another game had queued, or it reached a terminal. Mixing them
+    /// hides which one sets the shape.
     pub depth_hist: Vec<u64>,
+    pub depth_new: Vec<u64>,
+    pub depth_dup: Vec<u64>,
+    pub depth_terminal: Vec<u64>,
     /// Reach tests the sweep ran, and how many kept the id.
     pub reach_tested: u64,
     pub reach_kept: u64,
@@ -193,6 +198,9 @@ impl<V: Variant> Search<V> {
                 id_histogram: vec![0; crate::mcts::config::K + 1],
                 full_node_survivors: vec![0; crate::mcts::config::K + 1],
                 depth_hist: vec![0; DEPTH_BUCKETS],
+                depth_new: vec![0; DEPTH_BUCKETS],
+                depth_dup: vec![0; DEPTH_BUCKETS],
+                depth_terminal: vec![0; DEPTH_BUCKETS],
                 ..Default::default()
             },
             cfg,
@@ -286,12 +294,13 @@ impl<V: Variant> Search<V> {
                     &mut self.scratch,
                 );
                 self.diag.descents += 1;
-                let d = self.slots[i].last_depth as usize;
+                let d = (self.slots[i].last_depth as usize).min(DEPTH_BUCKETS - 1);
                 self.diag.depth_total += d as u64;
-                self.diag.depth_hist[d.min(DEPTH_BUCKETS - 1)] += 1;
+                self.diag.depth_hist[d] += 1;
                 self.slots[i].descents += 1;
                 match r {
                     Descent::Entry { node, fresh } => {
+                        if fresh { self.diag.depth_new[d] += 1 } else { self.diag.depth_dup[d] += 1 }
                         if fresh {
                             if self.buffer.is_full() {
                                 // no room to ask: give the node back rather than leave it
@@ -308,6 +317,7 @@ impl<V: Variant> Search<V> {
                         break;
                     }
                     Descent::NoEntry => {
+                        self.diag.depth_terminal[d] += 1;
                         self.diag.terminal_hits += 1;
                         if self.slots[i].sim_count >= self.cfg.s {
                             break;
