@@ -233,6 +233,62 @@ fn backup_credits_the_whole_path() {
     }
 }
 
+/// The recorded depth must be the depth the descent actually reached, including for descents
+/// that back up on the way out. A terminal clears its path before returning, so anything that
+/// measures the path afterwards reads zero and silently loses every terminal from the profile.
+#[test]
+fn a_descent_records_the_depth_it_reached_even_when_it_backs_up() {
+    let c = cfg();
+    let mut arena = Arena::<PuctStats>::new(&c);
+    let mut rng = Rng::new(0xD3B7);
+    let mut scratch = Scratch::new();
+
+    // a root a few plies from the end, so descents actually reach terminals
+    let mut history = vec![Game::new().cells];
+    let mut g = Game::new();
+    let d = vec![1.0f32; SQUARES];
+    while !g.finished {
+        g.distribution_step(&d, &d, &mut rng, &mut scratch);
+        history.push(g.cells);
+    }
+    let near_end = history[history.len() - 4];
+
+    let mut slot = opening::<PuctStats>();
+    slot.root.game = Game::from_cells(near_end, &mut scratch);
+    slot.root.key = zobrist::hash(&slot.root.game.cells);
+    assert!(!slot.root.game.finished, "the chosen root is already over");
+
+    let (mut terminals, mut entries) = (0, 0);
+    for _ in 0..2000 {
+        match descend::<Puct>(0, &mut slot, &mut arena, &c, &mut rng, &mut scratch) {
+            Descent::Entry { .. } => {
+                // the path is still in flight, so it can be compared directly
+                assert_eq!(
+                    slot.last_depth as usize,
+                    slot.path.len(),
+                    "recorded depth disagrees with the path it came from"
+                );
+                assert!(slot.last_depth >= 1, "a descent selected at least at the root");
+                entries += 1;
+                resolve::<Puct>(&mut slot, &mut arena, [0.4, -0.4], &c, &mut rng);
+            }
+            Descent::NoEntry => {
+                assert!(slot.path.is_empty(), "a backed-up descent should have cleared its path");
+                assert!(
+                    slot.last_depth >= 1,
+                    "a terminal recorded depth {} -- it was measured after the backup cleared \
+                     the path",
+                    slot.last_depth
+                );
+                terminals += 1;
+            }
+            Descent::Exhausted => panic!("out of nodes"),
+        }
+    }
+    assert!(terminals > 0, "no terminal was reached, so the case is untested");
+    assert!(entries > 0);
+}
+
 /// A full node stack is a budget reached, not a fault: nothing is created, nothing is left
 /// in flight, and the search can carry on.
 #[test]
