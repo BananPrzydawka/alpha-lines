@@ -10,6 +10,7 @@
 use alpha_lines_game::game::{Rng, SQUARES};
 use alpha_lines_game::mcts::search::{Evaluate, Search};
 use alpha_lines_game::mcts::variant::{Exp3, Puct, Variant};
+use alpha_lines_game::mcts::search::Diagnostics;
 use alpha_lines_game::mcts::Config;
 use alpha_lines_game::zobrist;
 
@@ -80,11 +81,28 @@ fn main() {
         macro_rules! go {
             ($V:ty, $vis:expr) => {{
                 let mut s = Search::<$V>::new(cfg, 0xA1FA);
-                for _ in 0..(cfg.s - 1) { s.cycle(&mut model); }
+                let mut per_cycle = Vec::new();
+                let (mut pn, mut pd) = (0u64, 0u64);
+                for c in 0..(cfg.s - 1) {
+                    s.cycle(&mut model);
+                    let (n, dp) = (s.diag.buffer_unique, s.diag.duplicate_hits);
+                    if [0u32, 1, 2, 5, 10, 25, 50, 98].contains(&c) {
+                        per_cycle.push((c, n - pn, dp - pd));
+                    }
+                    pn = n; pd = dp;
+                }
                 let d = &s.diag;
                 let (w0, w1, kids) = root_width(&s, $vis);
                 println!("{name} = {k}");
-                println!("  descents {}  mean depth {:.2}  nodes {}", d.descents, d.mean_depth(), s.arena.len());
+                let (mn, cn) = Diagnostics::mean_of(&d.depth_new);
+                let (mp, cp) = Diagnostics::mean_of(&d.depth_dup);
+                println!("  descents {}  nodes {}", d.descents, s.arena.len());
+                println!("  mean depth: all {:.2} | at eval {mn:.2} (over {cn}) | pending {mp:.2} (over {cp})",
+                    d.mean_depth());
+                let line: Vec<String> = per_cycle.iter()
+                    .map(|(c, n, dp)| format!("c{c}:{}%", 100 * n / (n + dp).max(1)))
+                    .collect();
+                println!("  share of descents that built a node, by cycle: {}", line.join(" "));
                 println!("  root width: p0 {w0:.1} moves tried, p1 {w1:.1}, {kids:.1} joint children exist");
                 println!("  all      {}", spread(&d.depth_hist, d.descents));
                 println!("  new node {}", spread(&d.depth_new, d.descents));

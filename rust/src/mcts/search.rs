@@ -115,6 +115,14 @@ impl Diagnostics {
     pub fn mean_depth(&self) -> f64 {
         self.depth_total as f64 / self.descents.max(1) as f64
     }
+    /// Mean over one of the split histograms, and how many descents it is over. The overall
+    /// mean is dominated by whichever outcome is most common, which is rarely the one being
+    /// asked about.
+    pub fn mean_of(hist: &[u64]) -> (f64, u64) {
+        let n: u64 = hist.iter().sum();
+        let total: u64 = hist.iter().enumerate().map(|(d, &c)| d as u64 * c).sum();
+        (total as f64 / n.max(1) as f64, n)
+    }
 }
 
 /// The evaluation buffer: a fixed `B` rows, of which the first `len` are filled.
