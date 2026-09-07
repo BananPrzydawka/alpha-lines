@@ -90,6 +90,7 @@ pub fn descend<V: Variant>(
     loop {
         // A terminal needs no network: its values are the game's own, so back up and stop.
         if let Some(values) = outcome(view(slot, arena, cur).1) {
+            slot.last_depth = slot.path.len() as u8;
             back_up::<V>(slot, arena, values, cfg);
             return Descent::NoEntry;
         }
@@ -115,6 +116,7 @@ pub fn descend<V: Variant>(
                 // already queued by someone else: ride their entry rather than duplicating
                 // the work, and rather than re-rolling, which would let other games bend
                 // this one's search
+                slot.last_depth = slot.path.len() as u8;
                 slot.waiting_on = Some(child);
                 return Descent::Entry { node: child, fresh: false };
             }
@@ -129,14 +131,17 @@ pub fn descend<V: Variant>(
         // queueing behind an evaluation that will never come
         let flags = if game.finished { 0 } else { PENDING };
         let Some(child) = arena.insert(child_key, game, flags, id) else {
+            slot.last_depth = slot.path.len() as u8;
             slot.path.clear();
             return Descent::Exhausted;
         };
 
         if let Some(values) = outcome(&arena.node(child).game) {
+            slot.last_depth = slot.path.len() as u8;
             back_up::<V>(slot, arena, values, cfg);
             return Descent::NoEntry;
         }
+        slot.last_depth = slot.path.len() as u8;
         slot.waiting_on = Some(child);
         return Descent::Entry { node: child, fresh: true };
     }

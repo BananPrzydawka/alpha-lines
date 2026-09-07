@@ -495,3 +495,4 @@ network update, flush the node stack and mark every root `root_pending`.
 isssiues to raise later:
 - node lifetime counter for mem leak test
 - complete zero startup problem
+- ply 1 full allocation

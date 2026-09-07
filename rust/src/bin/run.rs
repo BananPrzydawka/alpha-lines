@@ -34,12 +34,14 @@ struct Stub {
 impl Evaluate for Stub {
     fn evaluate(&mut self, _pos: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]) {
         if self.peaked {
-            // one dominant square per row, the rest near zero: a Dirichlet with alpha -> 0,
-            // and a sharper policy than a trained net is likely to produce
+            // A power-law decay away from a random rank-0 square. Not a single spike: one
+            // spike lands on an illegal square often enough to leave a player flat, and an
+            // exponential decay underflows f32 within a few ranks with the same result. A
+            // power law keeps its shape whatever the legal mask removes.
             for row in priors.chunks_mut(SQUARES) {
-                let pick = self.rng.randint(SQUARES as u64) as usize;
-                for (k, p) in row.iter_mut().enumerate() {
-                    *p = if k == pick { 1.0 } else { 0.004 };
+                let o = self.rng.randint(SQUARES as u64) as usize;
+                for j in 0..SQUARES {
+                    row[(o + j) % SQUARES] = 1.0 / (1.0 + j as f32).powf(6.0);
                 }
             }
         } else {

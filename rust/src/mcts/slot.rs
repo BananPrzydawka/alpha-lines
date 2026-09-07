@@ -86,6 +86,9 @@ pub struct Slot<S> {
     pub waiting_on: Option<u32>,
     /// Descents run this cycle, against `Config::max_descents`.
     pub descents: u32,
+    /// Depth of the descent that just finished. Recorded here because a terminal descent
+    /// backs up and clears its path before the caller can measure it.
+    pub last_depth: u8,
 }
 
 impl<S: Default> Default for Slot<S> {
@@ -98,6 +101,7 @@ impl<S: Default> Default for Slot<S> {
             path: Path::default(),
             waiting_on: None,
             descents: 0,
+            last_depth: 0,
         }
     }
 }

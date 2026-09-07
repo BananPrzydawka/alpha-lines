@@ -286,7 +286,7 @@ impl<V: Variant> Search<V> {
                     &mut self.scratch,
                 );
                 self.diag.descents += 1;
-                let d = self.slots[i].path.len();
+                let d = self.slots[i].last_depth as usize;
                 self.diag.depth_total += d as u64;
                 self.diag.depth_hist[d.min(DEPTH_BUCKETS - 1)] += 1;
                 self.slots[i].descents += 1;
