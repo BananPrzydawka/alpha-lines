@@ -57,9 +57,9 @@ pub trait Variant {
 
     /// Treat this statistic block as a root's.
     ///
-    /// Called when a game adopts a position as its root: on a fresh seed, on promotion, and
-    /// when a pending root's evaluation lands. PUCT mixes in fresh Dirichlet noise — on an
-    /// all-zero prior that is pure noise, which is what §7 wants of an unevaluated root.
+    /// Called when a game adopts an evaluated position as its root: on promotion into an
+    /// existing node, and when a pending root's evaluation lands. PUCT mixes in fresh
+    /// Dirichlet noise.
     fn make_root(
         stats: &mut Self::Stats,
         legal: [[u64; LEGAL_WORDS]; 2],
@@ -124,9 +124,6 @@ pub struct PuctStats {
     /// rather than twice. Over every square, not just the legal ones — the same number, since
     /// an illegal square is never selected and so never accrues a visit.
     pub total: [u32; 2],
-    /// Backups dropped because an edge hit the `u32` visit ceiling. Unreachable in practice;
-    /// it is here so that if it ever happens it is visible rather than silent.
-    pub saturated: u32,
 }
 
 impl Default for PuctStats {
@@ -136,7 +133,6 @@ impl Default for PuctStats {
             visit: [[0; SQUARES]; 2],
             q: [[0.0; SQUARES]; 2],
             total: [0; 2],
-            saturated: 0,
         }
     }
 }
@@ -256,12 +252,6 @@ impl Variant for Puct {
         for player in 0..2 {
             let sq = choice[player].action as usize;
             let n = stats.visit[player][sq];
-            // the total is the sum, so it hits the ceiling long before any single edge does;
-            // low-ply nodes are never flushed and run for the whole deployment
-            if n == u32::MAX || stats.total[player] == u32::MAX {
-                stats.saturated += 1;
-                continue;
-            }
             let q = &mut stats.q[player][sq];
             *q = (*q * n as f32 + values[player]) / (n as f32 + 1.0);
             stats.visit[player][sq] = n + 1;

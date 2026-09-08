@@ -26,7 +26,7 @@ pub struct Root<S> {
     pub key: u64,
     pub game: Game,
     pub stats: S,
-    /// No priors yet, so selection here is noise-only until the evaluation lands (spec §7).
+    /// No priors yet: the game does not descend until the evaluation lands.
     pub pending: bool,
 }
 
@@ -84,11 +84,6 @@ pub struct Slot<S> {
     pub path: Path,
     /// The node whose evaluation this game's backup is blocked on.
     pub waiting_on: Option<u32>,
-    /// Descents run this cycle, against `Config::max_descents`.
-    pub descents: u32,
-    /// Depth of the descent that just finished. Recorded here because a terminal descent
-    /// backs up and clears its path before the caller can measure it.
-    pub last_depth: u8,
 }
 
 impl<S: Default> Default for Slot<S> {
@@ -100,8 +95,6 @@ impl<S: Default> Default for Slot<S> {
             sim_count: 0,
             path: Path::default(),
             waiting_on: None,
-            descents: 0,
-            last_depth: 0,
         }
     }
 }
@@ -109,18 +102,14 @@ impl<S: Default> Default for Slot<S> {
 impl<S> Slot<S> {
     /// Has done its share of simulations and is waiting for a step.
     ///
-    /// `>=` rather than `==`: a game one short of `S` can hit two terminals in a single cycle
-    /// and land past the threshold.
+    /// `==` holds exactly: one descent per cycle completes at most one simulation, and a
+    /// ready game stops descending, so `sim_count` lands on `s` rather than past it.
     pub fn ready(&self, cfg: &Config) -> bool {
-        self.occupied && !self.game_over && self.sim_count >= cfg.s
+        self.occupied && !self.game_over && self.sim_count == cfg.s
     }
 
-    /// Eligible for descents this cycle: playing, not already waiting, still under budget.
+    /// Eligible for a descent this cycle: playing, not already waiting, still short of sims.
     pub fn collectable(&self, cfg: &Config) -> bool {
-        self.occupied
-            && !self.game_over
-            && self.waiting_on.is_none()
-            && self.sim_count < cfg.s
-            && self.descents < cfg.max_descents
+        self.occupied && !self.game_over && self.waiting_on.is_none() && self.sim_count < cfg.s
     }
 }

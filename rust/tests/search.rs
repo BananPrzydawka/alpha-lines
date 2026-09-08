@@ -34,7 +34,7 @@ fn check<V: Variant>(s: &Search<V>) {
         assert!(slot.occupied, "slot {i} went unoccupied");
         assert_eq!(slot.waiting_on, None, "slot {i} still holds an unresolved path");
         assert!(slot.path.is_empty(), "slot {i} left a path behind");
-        assert!(slot.sim_count <= s.cfg.s + 4, "slot {i} overran S at {}", slot.sim_count);
+        assert!(slot.sim_count <= s.cfg.s, "slot {i} overran S at {}", slot.sim_count);
         assert!(!slot.game_over, "a finished game was not reseeded");
     }
     // §9 leak assertion: the sweep deletes every node nobody claims
@@ -91,12 +91,15 @@ fn identical_roots_cost_one_evaluation() {
     }
 }
 
-/// The first cycle has to fan out. If selection ignores priors when nothing is visited, every
-/// game picks the same square and the search never widens.
+/// The first cycle queues the roots; the second has to fan out. If selection ignores
+/// priors when nothing is visited, every game picks the same square and the search
+/// never widens.
 #[test]
 fn the_first_cycle_does_not_collapse_onto_one_move() {
     let mut s = Search::<Puct>::new(cfg(), 0x33);
     let mut model = Stub(Rng::new(4));
+    s.cycle(&mut model);
+    assert_eq!(s.arena.len(), 0, "cycle 0 queues roots, it builds nothing");
     s.cycle(&mut model);
     assert!(s.arena.len() > 8, "only {} distinct children from 64 games", s.arena.len());
 }

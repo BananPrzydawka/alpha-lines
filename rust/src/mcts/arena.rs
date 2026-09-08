@@ -21,7 +21,7 @@
 //! probing is what the cache wants anyway, and nothing outside holds an index position —
 //! callers hold node slots, which never move.
 
-use crate::game::{Game, SQUARES};
+use crate::game::Game;
 use crate::mcts::config::{Config, K, OVERFLOWED, PENDING};
 
 /// An index slot holding no node.
@@ -75,16 +75,6 @@ impl<S> Node<S> {
     }
 }
 
-/// What an id write did, for the diagnostics in spec section 9.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum IdWrite {
-    /// The game was already listed.
-    Present,
-    /// Appended into a free slot.
-    Appended,
-    /// The list was full; this id displaced another, which is named.
-    Displaced(u16),
-}
 
 pub struct Arena<S> {
     nodes: Vec<Node<S>>,
@@ -93,13 +83,6 @@ pub struct Arena<S> {
     mask: usize,
     capacity: usize,
     live: usize,
-    /// Diagnostics: id writes that displaced an existing id.
-    pub overflows: u64,
-    /// Diagnostics: index entries pulled back into a hole by a delete.
-    pub shifted: u64,
-    /// Diagnostics: distinct nodes that have ever overflowed, and the ply they sit at.
-    pub overflow_nodes: u64,
-    pub overflow_ply: Vec<u64>,
 }
 
 impl<S> Arena<S> {
@@ -114,10 +97,6 @@ impl<S> Arena<S> {
             mask: slots - 1,
             capacity,
             live: 0,
-            overflows: 0,
-            shifted: 0,
-            overflow_nodes: 0,
-            overflow_ply: vec![0; SQUARES + 1],
         }
     }
 
@@ -160,25 +139,6 @@ impl<S> Arena<S> {
         }
     }
 
-    /// Mean and worst probe distance over the live entries. A diagnostic, walked on demand
-    /// rather than counted on every lookup, so it costs the hot path nothing.
-    pub fn probe_lengths(&self) -> (f64, usize) {
-        let (mut total, mut worst) = (0usize, 0usize);
-        for (b, e) in self.index.iter().enumerate() {
-            if e.slot == EMPTY {
-                continue;
-            }
-            let home = e.key as usize & self.mask;
-            let d = (b.wrapping_sub(home)) & self.mask;
-            total += d + 1;
-            worst = worst.max(d + 1);
-        }
-        if self.live == 0 {
-            return (0.0, 0);
-        }
-        (total as f64 / self.live as f64, worst)
-    }
-
     /// Drop a node: repair its probe run and return the slot to the free list.
     pub fn remove(&mut self, i: u32) {
         let key = self.nodes[i as usize].key;
@@ -191,29 +151,20 @@ impl<S> Arena<S> {
         self.live -= 1;
     }
 
-    /// Record that game `id` has used node `i`, per the spec's id-write rule.
-    pub fn touch(&mut self, i: u32, id: u16) -> IdWrite {
+    /// Record that game `id` has used node `i`. Once the list is full, the new id
+    /// displaces the oldest one, round-robin.
+    pub fn touch(&mut self, i: u32, id: u16) {
         let n = &mut self.nodes[i as usize];
         if n.ids[..n.id_count as usize].contains(&id) {
-            return IdWrite::Present;
+            return;
         }
         if (n.id_count as usize) < K {
             n.ids[n.id_count as usize] = id;
             n.id_count += 1;
-            IdWrite::Appended
         } else {
-            let displaced = n.ids[n.id_cursor as usize];
             n.ids[n.id_cursor as usize] = id;
             n.id_cursor = ((n.id_cursor as usize + 1) % K) as u8;
-            let first = n.flags & OVERFLOWED == 0;
             n.flags |= OVERFLOWED;
-            let ply = (n.game.move_count as usize).min(SQUARES);
-            self.overflows += 1;
-            if first {
-                self.overflow_nodes += 1;
-                self.overflow_ply[ply] += 1;
-            }
-            IdWrite::Displaced(displaced)
         }
     }
 
@@ -293,7 +244,6 @@ impl<S> Arena<S> {
             if j.wrapping_sub(home) & mask >= j.wrapping_sub(hole) & mask {
                 self.index[hole] = e;
                 hole = j;
-                self.shifted += 1;
             }
         }
         self.index[hole] = Entry::VACANT;
