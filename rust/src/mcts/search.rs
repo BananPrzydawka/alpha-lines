@@ -11,13 +11,39 @@ use std::time::Instant;
 use crate::game::{Rng, Scratch, LEGAL_WORDS, SQUARES};
 use crate::mcts::arena::Arena;
 use crate::mcts::config::{Config, PENDING};
-use crate::mcts::descent::{back_up, descend, Descent};
+use crate::mcts::descent::{back_up, descend, descend_traced, Descent, Selection};
 use crate::mcts::slot::Slot;
 use crate::mcts::variant::{squares, Variant};
 use crate::{zobrist, Game};
 
 /// Depth buckets in the diagnostics; the last one is "this deep or deeper".
 pub const DEPTH_BUCKETS: usize = crate::mcts::slot::MAX_PLY + 1;
+
+/// What one descent inside a traced [`Search::collect_traced`] did, in slot order.
+///
+/// `selections` are the nodes the descent selected on, in path order, with the stats
+/// snapshots running alongside in the returned snapshot list. `fresh` names a new
+/// node this descent created (still pending — the evaluation has not landed yet);
+/// `duplicate_of` names the pending node a dup-hit landed on instead.
+pub struct Collected {
+    pub slot: usize,
+    pub outcome: Descent,
+    pub selections: Vec<(u32, [crate::mcts::variant::Choice; 2])>,
+    pub fresh: Option<u32>,
+    pub duplicate_of: Option<u32>,
+    pub abandoned: bool,
+}
+
+/// A stats snapshot taken at one selection: the node's cloned statistics plus the
+/// legal masks at that position, so the caller can render the PUCT scores later.
+/// Root snapshots carry `node = ROOT`. Generic over the statistic block.
+#[derive(Clone)]
+pub struct Snapshot<S> {
+    pub slot: usize,
+    pub node: u32,
+    pub stats: S,
+    pub legal: [[u64; crate::game::LEGAL_WORDS]; 2],
+}
 
 /// The model. One call scores `positions`, both players at once.
 ///
@@ -30,7 +56,7 @@ pub trait Evaluate {
 
 /// Where an evaluated row belongs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Target {
+pub enum Target {
     /// A node in the arena, named by slot.
     Node(u32),
     /// A root state, named by key — several games may be waiting on the same one.
@@ -224,6 +250,46 @@ impl<V: Variant> Search<V> {
         self.slots.iter().filter(|s| s.ready(&self.cfg)).count()
     }
 
+    /// Run the model's evaluate step plus scatter and backup, for a traced cycle: the
+    /// caller ran [`Self::collect_traced`], inspected the descents, and now wants the
+    /// same evaluate → scatter → backup sequence [`Self::cycle`] runs. Returns the eval
+    /// line items: per buffer row, the cells evaluated and a label for what it resolves.
+    /// Labels need the caller's node names; pass a lookup.
+    pub fn evaluate_scatter_backup<E: Evaluate>(
+        &mut self,
+        model: &mut E,
+        name: impl Fn(u32) -> String,
+    ) -> Vec<(usize, [u8; SQUARES], String)> {
+        use std::time::Instant;
+        let t = Instant::now();
+        model.evaluate(&self.buffer.positions, &mut self.buffer.priors, &mut self.buffer.values);
+        self.diag.t_evaluate += t.elapsed().as_nanos();
+
+        // label rows before scatter consumes the target lists
+        let mut rows = Vec::new();
+        for (row, target) in self.buffer.targets.iter().enumerate() {
+            let cells = self.buffer.positions[row];
+            let label = match *target {
+                Target::Node(node) => format!("node {}", name(node)),
+                Target::Root(key) => {
+                    let n = self.pending_roots.get(&key).map(|w| w.len()).unwrap_or(0);
+                    format!("root key={key} ({n} waiters)")
+                }
+            };
+            rows.push((row, cells, label));
+        }
+
+        let t = Instant::now();
+        self.scatter();
+        self.diag.t_scatter += t.elapsed().as_nanos();
+
+        let t = Instant::now();
+        self.back_up_waiters();
+        self.diag.t_backup += t.elapsed().as_nanos();
+        self.diag.cycles += 1;
+        rows
+    }
+
     /// One model call: collect, evaluate, scatter, back up, and step if enough games are
     /// ready. Returns the training records from the step, if one happened.
     pub fn cycle<E: Evaluate>(&mut self, model: &mut E) -> Vec<StepRecord> {
@@ -257,6 +323,54 @@ impl<V: Variant> Search<V> {
     /// Walk the slots from 0, descending each eligible game until it produces a buffer entry
     /// or runs out of descents, and stop when the buffer is full.
     fn collect(&mut self) {
+        self.collect_inner(None);
+    }
+
+    /// Traced variant of the collection walk: snapshots the stats at every selection,
+    /// after the choice is made but before the child is looked up, so they are what
+    /// `select` just saw. Returns one [`Collected`] per descent that ran, in slot order,
+    /// plus all snapshots in selection order.
+    pub fn collect_traced(&mut self) -> (Vec<Collected>, Vec<Snapshot<V::Stats>>) {
+        let mut out = Vec::new();
+        let mut snaps: Vec<Snapshot<V::Stats>> = Vec::new();
+        // borrow discipline: the hook reads stats out of `self` while the walk holds
+        // `&mut self`. Both go through raw pointers; the hook only reads the node it is
+        // shown (which the walk is not mutating at that point — select takes `&mut`
+        // only on the node it is selecting on, and releases it before the hook runs).
+        let self_ptr: *mut Self = self;
+        let snaps_ptr: *mut Vec<Snapshot<V::Stats>> = &mut snaps;
+        self.collect_inner(Some((&mut out, &mut |slot: usize, sel: Selection| {
+            // SAFETY: see above; `snaps` is touched only by this hook.
+            let this = unsafe { &*self_ptr };
+            let snaps = unsafe { &mut *snaps_ptr };
+            if sel.node == crate::mcts::slot::ROOT {
+                let st = this.slots[slot].root.stats.clone();
+                let g = &this.slots[slot].root.game;
+                snaps.push(Snapshot {
+                    slot,
+                    node: sel.node,
+                    stats: st,
+                    legal: [g.legal_moves(0), g.legal_moves(1)],
+                });
+            } else {
+                let n = this.arena.node(sel.node);
+                snaps.push(Snapshot {
+                    slot,
+                    node: sel.node,
+                    stats: n.stats.clone(),
+                    legal: [n.game.legal_moves(0), n.game.legal_moves(1)],
+                });
+            }
+        })));
+        (out, snaps)
+    }
+
+    /// The collection walk. When `trace` is `Some`, every descent is recorded and
+    /// `snapshot(slot, selection)` is called at each selection inside it.
+    fn collect_inner(
+        &mut self,
+        mut trace: Option<(&mut Vec<Collected>, &mut dyn FnMut(usize, Selection))>,
+    ) {
         self.buffer.clear();
         self.pending_roots.clear();
         self.evaluated.clear();
@@ -293,19 +407,50 @@ impl<V: Variant> Search<V> {
             }
 
             loop {
-                let r = descend::<V>(
-                    i as u16,
-                    &mut self.slots[i],
-                    &mut self.arena,
-                    &self.cfg,
-                    &mut self.rng,
-                    &mut self.scratch,
-                );
+                // when tracing, selections are recorded per descent so the caller can pair
+                // them with the snapshots its hook took
+                let mut selections: Vec<(u32, [crate::mcts::variant::Choice; 2])> = Vec::new();
+                let r = if let Some((_, ref mut snap)) = trace {
+                    // borrow the hook for this descent only; the borrow ends with the call
+                    let hook: &mut dyn FnMut(usize, Selection) = &mut **snap;
+                    // wrap it with the slot index fixed, recording selections alongside
+                    let mut wrapped = |sel: Selection| {
+                        selections.push((sel.node, sel.choice));
+                        hook(i, sel);
+                    };
+                    descend_traced::<V>(
+                        i as u16,
+                        &mut self.slots[i],
+                        &mut self.arena,
+                        &self.cfg,
+                        &mut self.rng,
+                        &mut self.scratch,
+                        Some(&mut wrapped),
+                    )
+                } else {
+                    descend::<V>(
+                        i as u16,
+                        &mut self.slots[i],
+                        &mut self.arena,
+                        &self.cfg,
+                        &mut self.rng,
+                        &mut self.scratch,
+                    )
+                };
                 self.diag.descents += 1;
                 let d = (self.slots[i].last_depth as usize).min(DEPTH_BUCKETS - 1);
                 self.diag.depth_total += d as u64;
                 self.diag.depth_hist[d] += 1;
                 self.slots[i].descents += 1;
+                // traced record for this descent, filled in by the match below
+                let mut rec = trace.as_ref().map(|_| Collected {
+                    slot: i,
+                    outcome: r,
+                    selections,
+                    fresh: None,
+                    duplicate_of: None,
+                    abandoned: false,
+                });
                 match r {
                     Descent::Entry { node, fresh } => {
                         if fresh { self.diag.depth_new[d] += 1 } else { self.diag.depth_dup[d] += 1 }
@@ -314,19 +459,34 @@ impl<V: Variant> Search<V> {
                                 // no room to ask: give the node back rather than leave it
                                 // pending with nobody queued to evaluate it
                                 self.abandon(i, node);
+                                if let Some(ref mut c) = rec {
+                                    c.abandoned = true;
+                                }
                             } else {
                                 let cells = self.arena.node(node).game.cells;
                                 self.buffer.push(cells, Target::Node(node));
                                 self.diag.buffer_unique += 1;
+                                if let Some(ref mut c) = rec {
+                                    c.fresh = Some(node);
+                                }
                             }
                         } else {
                             self.diag.duplicate_hits += 1;
+                            if let Some(ref mut c) = rec {
+                                c.duplicate_of = Some(node);
+                            }
+                        }
+                        if let Some((ref mut out, _)) = trace {
+                            out.push(rec.unwrap());
                         }
                         break;
                     }
                     Descent::NoEntry => {
                         self.diag.depth_terminal[d] += 1;
                         self.diag.terminal_hits += 1;
+                        if let Some((ref mut out, _)) = trace {
+                            out.push(rec.unwrap());
+                        }
                         if self.slots[i].sim_count >= self.cfg.s {
                             break;
                         }
@@ -337,6 +497,9 @@ impl<V: Variant> Search<V> {
                     }
                     Descent::Exhausted => {
                         self.diag.exhausted += 1;
+                        if let Some((ref mut out, _)) = trace {
+                            out.push(rec.unwrap());
+                        }
                         break;
                     }
                 }

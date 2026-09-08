@@ -13,8 +13,8 @@ pub mod slot;
 pub mod variant;
 
 pub use arena::{Arena, Node};
-pub use descent::{back_up, descend, Descent};
+pub use descent::{back_up, descend, descend_traced, Descent, Selection};
 pub use slot::{Path, Root, Slot, MAX_PLY, ROOT};
 pub use config::{Config, K, PENDING};
-pub use search::{Diagnostics, Evaluate, Search, StepRecord};
+pub use search::{Collected, Diagnostics, Evaluate, Search, StepRecord, Target};
 pub use variant::{Choice, Exp3, Exp3Stats, Puct, PuctStats, Variant};
