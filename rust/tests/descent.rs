@@ -212,7 +212,7 @@ fn backup_credits_the_whole_path() {
     assert!(matches!(got, Descent::Entry { .. }));
     assert!(slot.path.len() >= 2, "need a path with an interior node");
 
-    let before: Vec<u32> = (0..slot.path.len())
+    let before: Vec<u64> = (0..slot.path.len())
         .map(|k| {
             let s = slot.path.step(k);
             let a = s.choice[0].action as usize;

@@ -15,7 +15,7 @@ use crate::mcts::noise;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Choice {
     pub action: u8,
-    pub prob: f32,
+    pub prob: f64,
 }
 
 pub trait Variant {
@@ -118,12 +118,12 @@ fn count(legal: [u64; LEGAL_WORDS]) -> u32 {
 #[derive(Clone, Debug)]
 pub struct PuctStats {
     pub prior: [[f32; SQUARES]; 2],
-    pub visit: [[u32; SQUARES]; 2],
-    pub q: [[f32; SQUARES]; 2],
+    pub visit: [[u64; SQUARES]; 2],
+    pub q: [[f64; SQUARES]; 2],
     /// Sum of `visit` per player, maintained by backup so selection reads the arrays once
     /// rather than twice. Over every square, not just the legal ones — the same number, since
     /// an illegal square is never selected and so never accrues a visit.
-    pub total: [u32; 2],
+    pub total: [u64; 2],
 }
 
 impl Default for PuctStats {
@@ -176,19 +176,19 @@ impl Variant for Puct {
             // multiplied away. Sequentially that self-corrects after one backup; here
             // thousands of games select at the same fresh root in one cycle and all choose
             // the same square. The offset makes the first visit follow the priors.
-            let explore = cfg.c_puct * (1.0 + stats.total[player] as f32).sqrt();
+            let explore = cfg.c_puct as f64 * (1.0 + stats.total[player] as f64).sqrt();
             let (q, visit, prior) =
                 (&stats.q[player], &stats.visit[player], &stats.prior[player]);
             debug_assert_eq!(
                 stats.total[player],
-                visit.iter().sum::<u32>(),
+                visit.iter().sum::<u64>(),
                 "the cached visit total drifted from the counts it stands for"
             );
 
-            let mut best = f32::NEG_INFINITY;
+            let mut best = f64::NEG_INFINITY;
             let mut action = usize::MAX;
             for sq in squares(mask) {
-                let score = q[sq] + explore * prior[sq] / (1.0 + visit[sq] as f32);
+                let score = q[sq] + explore * prior[sq] as f64 / (1.0 + visit[sq] as f64);
                 if score > best {
                     best = score;
                     action = sq;
@@ -208,7 +208,7 @@ impl Variant for Puct {
     ) {
         for player in 0..2 {
             out[player] = [0.0; SQUARES];
-            let total = stats.total[player] as f32;
+            let total = stats.total[player] as f64;
             if total == 0.0 {
                 // never searched: fall back to uniform rather than emit nothing
                 let n = count(legal[player]) as f32;
@@ -218,7 +218,7 @@ impl Variant for Puct {
                 continue;
             }
             for sq in squares(legal[player]) {
-                out[player][sq] = stats.visit[player][sq] as f32 / total;
+                out[player][sq] = (stats.visit[player][sq] as f64 / total) as f32;
             }
         }
     }
@@ -253,9 +253,11 @@ impl Variant for Puct {
             let sq = choice[player].action as usize;
             let n = stats.visit[player][sq];
             let q = &mut stats.q[player][sq];
-            *q = (*q * n as f32 + values[player]) / (n as f32 + 1.0);
-            stats.visit[player][sq] = n + 1;
-            stats.total[player] += 1;
+            let next = n.checked_add(1).expect("PUCT edge visits exhausted u64");
+            let total = stats.total[player].checked_add(1).expect("PUCT total visits exhausted u64");
+            *q += (values[player] as f64 - *q) / next as f64;
+            stats.visit[player][sq] = next;
+            stats.total[player] = total;
         }
     }
 }
@@ -264,14 +266,14 @@ impl Variant for Puct {
 
 #[derive(Clone, Debug)]
 pub struct Exp3Stats {
-    pub log_w: [[f32; SQUARES]; 2],
+    pub log_w: [[f64; SQUARES]; 2],
     /// Every mixed strategy this node has played, summed. Normalised, it is the average
     /// strategy — the training target a root emits.
     ///
     /// Carried on interior nodes, not only roots, because promotion turns an interior node
     /// into a root: the sum it built up while interior is exactly the search work that would
     /// otherwise be thrown away when the game steps into it.
-    pub strategy_sum: [[f32; SQUARES]; 2],
+    pub strategy_sum: [[f64; SQUARES]; 2],
 }
 
 impl Default for Exp3Stats {
@@ -291,8 +293,8 @@ impl Exp3 {
     /// The largest log weight over the legal squares, which the softmax is shifted by so a
     /// large weight cannot overflow.
     #[inline]
-    fn top(log_w: &[f32; SQUARES], legal: [u64; LEGAL_WORDS]) -> f32 {
-        let mut top = f32::NEG_INFINITY;
+    fn top(log_w: &[f64; SQUARES], legal: [u64; LEGAL_WORDS]) -> f64 {
+        let mut top = f64::NEG_INFINITY;
         for sq in squares(legal) {
             if log_w[sq] > top {
                 top = log_w[sq];
@@ -301,29 +303,27 @@ impl Exp3 {
         top
     }
 
-    /// The full mixed strategy for `player`, written into `out` at the legal squares.
-    ///
-    /// Only a root needs this, for its `strategy_sum`; [`Variant::select`] samples without
-    /// materialising the vector.
+    /// The mixed strategy for `player`, written at the legal squares.
     pub fn mixed(
         stats: &Exp3Stats,
         legal: [u64; LEGAL_WORDS],
         player: usize,
         gamma: f32,
-        out: &mut [f32; SQUARES],
+        out: &mut [f64; SQUARES],
     ) {
         let log_w = &stats.log_w[player];
         let n = count(legal);
         debug_assert!(n > 0, "mixed strategy over an empty legal set");
         let top = Self::top(log_w, legal);
 
-        let mut sum = 0.0f32;
+        let mut sum = 0.0f64;
         for sq in squares(legal) {
             let e = (log_w[sq] - top).exp();
             out[sq] = e;
             sum += e;
         }
-        let floor = gamma / n as f32;
+        let gamma = gamma as f64;
+        let floor = gamma / n as f64;
         for sq in squares(legal) {
             out[sq] = (1.0 - gamma) * (out[sq] / sum) + floor;
         }
@@ -338,9 +338,9 @@ impl Variant for Exp3 {
     fn set_priors(stats: &mut Exp3Stats, priors: &[f32], legal: [u64; LEGAL_WORDS], player: usize) {
         debug_assert!(priors.len() >= SQUARES);
         let dst = &mut stats.log_w[player];
-        *dst = [f32::NEG_INFINITY; SQUARES];
+        *dst = [f64::NEG_INFINITY; SQUARES];
         for sq in squares(legal) {
-            dst[sq] = priors[sq].max(1e-8).ln();
+            dst[sq] = (priors[sq].max(1e-8) as f64).ln();
         }
     }
 
@@ -353,7 +353,7 @@ impl Variant for Exp3 {
         rng: &mut Rng,
     ) -> [Choice; 2] {
         // one buffer for both players: `mixed` writes only the squares it is about to read
-        let mut probs = [0.0f32; SQUARES];
+        let mut probs = [0.0f64; SQUARES];
         let mut out = [Choice { action: 0, prob: 0.0 }; 2];
 
         for player in 0..2 {
@@ -361,10 +361,10 @@ impl Variant for Exp3 {
             Self::mixed(stats, mask, player, cfg.exp3_gamma, &mut probs);
 
             let sum = &mut stats.strategy_sum[player];
-            let threshold = rng.random() as f32; // the strategy sums to 1 by construction
-            let mut cum = 0.0f32;
+            let threshold = rng.random(); // the strategy sums to 1 by construction
+            let mut cum = 0.0f64;
             let mut chosen = None;
-            let mut last = (0usize, 0.0f32);
+            let mut last = (0usize, 0.0f64);
             for sq in squares(mask) {
                 sum[sq] += probs[sq];
                 last = (sq, probs[sq]);
@@ -389,7 +389,7 @@ impl Variant for Exp3 {
     ) {
         for player in 0..2 {
             out[player] = [0.0; SQUARES];
-            let total: f32 = squares(legal[player]).map(|sq| stats.strategy_sum[player][sq]).sum();
+            let total: f64 = squares(legal[player]).map(|sq| stats.strategy_sum[player][sq]).sum();
             if total <= 0.0 {
                 let n = count(legal[player]) as f32;
                 for sq in squares(legal[player]) {
@@ -398,7 +398,7 @@ impl Variant for Exp3 {
                 continue;
             }
             for sq in squares(legal[player]) {
-                out[player][sq] = stats.strategy_sum[player][sq] / total;
+                out[player][sq] = (stats.strategy_sum[player][sq] / total) as f32;
             }
         }
     }
@@ -434,9 +434,17 @@ impl Variant for Exp3 {
             // drawn move never has probability zero
             debug_assert!(prob > 0.0, "a move was drawn with probability zero");
             debug_assert!(legal_counts[player] > 0, "a move was drawn from an empty set");
-            let reward = (values[player] + 1.0) / 2.0;
-            stats.log_w[player][action as usize] +=
-                cfg.exp3_gamma * (reward / prob) / legal_counts[player] as f32;
+            let weights = &mut stats.log_w[player];
+            // Recenter only occasionally; a common offset does not change the policy.
+            if weights[action as usize] >= 1024.0 {
+                let top = weights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                for weight in weights.iter_mut() {
+                    if weight.is_finite() { *weight -= top; }
+                }
+            }
+            let reward = (values[player] as f64 + 1.0) / 2.0;
+            weights[action as usize] +=
+                cfg.exp3_gamma as f64 * (reward / prob) / legal_counts[player] as f64;
         }
     }
 }

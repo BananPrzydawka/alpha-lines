@@ -33,9 +33,9 @@ fn random_stats_puct(legal: [u64; LEGAL_WORDS], rng: &mut Rng) -> PuctStats {
     for player in 0..2 {
         for sq in squares(legal) {
             s.prior[player][sq] = rng.random() as f32;
-            s.visit[player][sq] = rng.randint(30) as u32;
+            s.visit[player][sq] = rng.randint(30) as u64;
             s.total[player] += s.visit[player][sq];
-            s.q[player][sq] = rng.random() as f32 * 2.0 - 1.0;
+            s.q[player][sq] = rng.random() * 2.0 - 1.0;
         }
     }
     s
@@ -45,7 +45,7 @@ fn random_stats_puct(legal: [u64; LEGAL_WORDS], rng: &mut Rng) -> PuctStats {
 /// where the Python has `sqrt(total)`, so that a node's first visit follows its priors instead
 /// of scoring every square zero. See `Puct::select`.
 fn puct_reference(s: &PuctStats, legal: [u64; LEGAL_WORDS], player: usize, c: f64) -> usize {
-    let total: f64 = (0..SQUARES).map(|sq| f64::from(s.visit[player][sq])).sum();
+    let total: f64 = (0..SQUARES).map(|sq| s.visit[player][sq] as f64).sum();
     let mut best = f64::NEG_INFINITY;
     let mut action = usize::MAX;
     for sq in 0..SQUARES {
@@ -55,7 +55,7 @@ fn puct_reference(s: &PuctStats, legal: [u64; LEGAL_WORDS], player: usize, c: f6
         }
         let score = f64::from(s.q[player][sq])
             + c * f64::from(s.prior[player][sq]) * (1.0 + total).sqrt()
-                / (1.0 + f64::from(s.visit[player][sq]));
+                / (1.0 + s.visit[player][sq] as f64);
         if score > best {
             best = score;
             action = sq;
@@ -142,26 +142,19 @@ fn puct_backup_keeps_a_running_mean() {
             stats.q[player][sq]
         );
     }
-    assert_eq!(stats.saturated, 0);
 }
 
-/// The `u16` visit ceiling must degrade quietly and be counted, not wrap.
 #[test]
-fn puct_backup_saturates_rather_than_wrapping() {
-    let c = cfg();
+fn puct_backup_crosses_the_old_u32_limit() {
     let mut stats = PuctStats::default();
-    stats.visit[0][5] = u32::MAX;
-    stats.visit[1][5] = u32::MAX - 1;
-    stats.total = [u32::MAX, u32::MAX - 1];
-    let choice = [Choice { action: 5, prob: 1.0 }, Choice { action: 5, prob: 1.0 }];
-
-    Puct::backup(&mut stats, choice, [1.0, 1.0], [40, 40], &c);
-    assert_eq!(stats.visit[0][5], u32::MAX, "must not wrap");
-    assert_eq!(stats.visit[1][5], u32::MAX);
-    assert_eq!(stats.saturated, 1, "the dropped backup is counted");
-
-    Puct::backup(&mut stats, choice, [1.0, 1.0], [40, 40], &c);
-    assert_eq!(stats.saturated, 3);
+    stats.visit[0][5] = u32::MAX as u64;
+    stats.visit[1][5] = u32::MAX as u64 - 1;
+    stats.total = [u32::MAX as u64, u32::MAX as u64 - 1];
+    let choice = [Choice { action: 5, prob: 1.0 }; 2];
+    for _ in 0..2 { Puct::backup(&mut stats, choice, [1.0; 2], [40; 2], &cfg()); }
+    assert_eq!(stats.visit[0][5], u32::MAX as u64 + 2);
+    assert_eq!(stats.visit[1][5], u32::MAX as u64 + 1);
+    assert_eq!(stats.total, [stats.visit[0][5], stats.visit[1][5]]);
 }
 
 /// `mcts_exp3.py`'s `_mixed_strategy`, transcribed.
@@ -198,12 +191,12 @@ fn the_exp3_mixed_strategy_matches_the_python_formula() {
         let mut stats = Exp3Stats::default();
         for player in 0..2 {
             for sq in squares(g.legal_moves(player)) {
-                stats.log_w[player][sq] = rng.random() as f32 * 8.0 - 4.0;
+                stats.log_w[player][sq] = rng.random() * 8.0 - 4.0;
             }
         }
         for player in 0..2 {
             let legal = g.legal_moves(player);
-            let mut got = [0.0f32; SQUARES];
+            let mut got = [0.0f64; SQUARES];
             Exp3::mixed(&stats, legal, player, c.exp3_gamma, &mut got);
             let want = exp3_reference(&stats, legal, player, gamma);
 
@@ -234,12 +227,12 @@ fn the_exp3_softmax_survives_extreme_weights() {
     stats.log_w[0][live[0]] = 1e30;
     stats.log_w[0][live[1]] = -1e30;
 
-    let mut out = [0.0f32; SQUARES];
+    let mut out = [0.0f64; SQUARES];
     Exp3::mixed(&stats, legal, 0, c.exp3_gamma, &mut out);
-    let total: f32 = live.iter().map(|&sq| out[sq]).sum();
+    let total: f64 = live.iter().map(|&sq| out[sq]).sum();
     assert!(total.is_finite(), "the strategy went non-finite");
     assert!((total - 1.0).abs() < 1e-3, "strategy sums to {total}");
-    let floor = c.exp3_gamma / live.len() as f32;
+    let floor = c.exp3_gamma as f64 / live.len() as f64;
     for &sq in &live {
         assert!(out[sq] >= floor * 0.999, "square {sq} fell below the exploration floor");
     }
@@ -257,9 +250,9 @@ fn exp3_sampling_follows_the_mixed_strategy() {
 
     let mut stats = Exp3Stats::default();
     for (k, &sq) in live.iter().enumerate() {
-        stats.log_w[0][sq] = (k % 5) as f32;
+        stats.log_w[0][sq] = (k % 5) as f64;
     }
-    let mut want = [0.0f32; SQUARES];
+    let mut want = [0.0f64; SQUARES];
     Exp3::mixed(&stats, legal, 0, c.exp3_gamma, &mut want);
 
     let draws = 400_000;
@@ -347,15 +340,15 @@ fn priors_are_adopted_the_way_each_variant_documents() {
                 let want = f64::from(priors[sq].max(1e-8)).ln();
                 assert!((f64::from(e.log_w[player][sq]) - want).abs() < 1e-5);
             } else {
-                assert_eq!(e.log_w[player][sq], f32::NEG_INFINITY, "square {sq} not masked");
+                assert_eq!(e.log_w[player][sq], f64::NEG_INFINITY, "square {sq} not masked");
             }
         }
         // and the resulting strategy is the priors, renormalised, mixed with the floor
-        let mut mixed = [0.0f32; SQUARES];
+        let mut mixed = [0.0f64; SQUARES];
         Exp3::mixed(&e, legal, player, 0.0, &mut mixed);
         for sq in squares(legal) {
             assert!(
-                (mixed[sq] - p.prior[player][sq]).abs() < 1e-5,
+                (mixed[sq] - p.prior[player][sq] as f64).abs() < 1e-5,
                 "square {sq}: exp3 gives {} where puct gives {}",
                 mixed[sq],
                 p.prior[player][sq]
@@ -372,8 +365,8 @@ fn default_exp3_weights_give_the_uniform_strategy() {
     let stats = Exp3Stats::default();
     for player in 0..2 {
         let legal = g.legal_moves(player);
-        let n = g.legal_count(player) as f32;
-        let mut out = [0.0f32; SQUARES];
+        let n = g.legal_count(player) as f64;
+        let mut out = [0.0f64; SQUARES];
         Exp3::mixed(&stats, legal, player, c.exp3_gamma, &mut out);
         for sq in squares(legal) {
             assert!((out[sq] - 1.0 / n).abs() < 1e-6, "square {sq} is not uniform");
@@ -392,7 +385,7 @@ fn exp3_selection_accumulates_the_average_strategy() {
     let legal = g.legal_moves(0);
     let mut stats = Exp3Stats::default();
 
-    let mut want = [0.0f32; SQUARES];
+    let mut want = [0.0f64; SQUARES];
     Exp3::mixed(&stats, legal, 0, c.exp3_gamma, &mut want);
 
     let draws = 500;
@@ -415,7 +408,7 @@ fn exp3_selection_accumulates_the_average_strategy() {
     assert!(off.all(|sq| stats.strategy_sum[1][sq] == 0.0));
 
     // normalised, the sum is the strategy back again — which is what the target is
-    let total: f32 = squares(legal).map(|sq| stats.strategy_sum[0][sq]).sum();
+    let total: f64 = squares(legal).map(|sq| stats.strategy_sum[0][sq]).sum();
     for sq in squares(legal) {
         assert!((stats.strategy_sum[0][sq] / total - want[sq]).abs() < 1e-4);
     }
@@ -444,14 +437,14 @@ fn the_average_strategy_lags_the_current_one() {
         Exp3::backup(&mut stats, choice, [1.0, 1.0], counts, &c);
     }
 
-    let mut current = [0.0f32; SQUARES];
+    let mut current = [0.0f64; SQUARES];
     Exp3::mixed(&stats, legal, 0, c.exp3_gamma, &mut current);
-    let total: f32 = squares(legal).map(|sq| stats.strategy_sum[0][sq]).sum();
+    let total: f64 = squares(legal).map(|sq| stats.strategy_sum[0][sq]).sum();
     let average = stats.strategy_sum[0][favourite] / total;
 
     // the mixture caps any square at (1 - gamma) + gamma / n, so it can never reach 1
-    let uniform = 1.0 / counts[0] as f32;
-    let ceiling = 1.0 - c.exp3_gamma + c.exp3_gamma * uniform;
+    let uniform = 1.0 / counts[0] as f64;
+    let ceiling = 1.0 - c.exp3_gamma as f64 + c.exp3_gamma as f64 * uniform;
     assert!(
         current[favourite] > 5.0 * uniform && current[favourite] <= ceiling,
         "the rewarded square is at {} against uniform {uniform} and a ceiling of {ceiling}",
@@ -462,5 +455,5 @@ fn the_average_strategy_lags_the_current_one() {
         "the average ({average}) should lag the current strategy ({})",
         current[favourite]
     );
-    assert!(average > 1.0 / counts[0] as f32, "but it should still have moved off uniform");
+    assert!(average > 1.0 / counts[0] as f64, "but it should still have moved off uniform");
 }

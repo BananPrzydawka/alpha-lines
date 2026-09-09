@@ -35,14 +35,16 @@ pub struct Collected {
 }
 
 /// A stats snapshot taken at one selection: the node's cloned statistics plus the
-/// legal masks at that position, so the caller can render the PUCT scores later.
-/// Root snapshots carry `node = ROOT`. Generic over the statistic block.
+/// position it was taken at, so the caller can render the board and the PUCT scores
+/// later. Root snapshots carry `node = ROOT`. Generic over the statistic block.
 #[derive(Clone)]
 pub struct Snapshot<S> {
     pub slot: usize,
     pub node: u32,
     pub stats: S,
     pub legal: [[u64; crate::game::LEGAL_WORDS]; 2],
+    pub cells: [u8; SQUARES],
+    pub scores: [i32; 2],
 }
 
 /// The model. One call scores `positions`, both players at once.
@@ -160,6 +162,26 @@ impl<V: Variant> Search<V> {
         }
     }
 
+    /// Discard all model-dependent search state when adopting new inference weights.
+    /// Call between cycles, then resume with the new model. Game positions, slot
+    /// identities and RNG state are preserved; unfinished simulations are discarded.
+    /// Any previously collected trace/evaluation must also be discarded by the caller.
+    pub fn flush_for_model_update(&mut self) {
+        self.arena.clear();
+        self.buffer.clear();
+        self.buffer.priors.fill(0.0);
+        self.buffer.values.fill(0.0);
+        self.pending_roots.clear();
+        self.evaluated.clear();
+        for slot in &mut self.slots {
+            slot.root.stats = V::Stats::default();
+            slot.root.pending = slot.occupied && !slot.game_over && !slot.root.game.finished;
+            slot.sim_count = 0;
+            slot.path.clear();
+            slot.waiting_on = None;
+        }
+    }
+
     /// Games that have done their share of simulations and are waiting to move.
     pub fn ready(&self) -> usize {
         self.slots.iter().filter(|s| s.ready(&self.cfg)).count()
@@ -168,16 +190,17 @@ impl<V: Variant> Search<V> {
     /// Run the model's evaluate step plus scatter and backup, for a traced cycle: the
     /// caller ran [`Self::collect_traced`], inspected the descents, and now wants the
     /// same evaluate → scatter → backup sequence [`Self::cycle`] runs. Returns the eval
-    /// line items: per buffer row, the cells evaluated and a label for what it resolves.
-    /// Labels need the caller's node names; pass a lookup.
+    /// line items: per buffer row, the cells evaluated, a label for what it resolves,
+    /// and the values the model returned. Labels need the caller's node names; pass a
+    /// lookup. Values are read out before scatter, since scatter only stores priors.
     pub fn evaluate_scatter_backup<E: Evaluate>(
         &mut self,
         model: &mut E,
         name: impl Fn(u32) -> String,
-    ) -> Vec<(usize, [u8; SQUARES], String)> {
+    ) -> Vec<(usize, [u8; SQUARES], String, [f32; 2])> {
         model.evaluate(&self.buffer.positions, &mut self.buffer.priors, &mut self.buffer.values);
 
-        // label rows before scatter consumes the target lists
+        // label rows and read values before scatter consumes the target lists
         let mut rows = Vec::new();
         for (row, target) in self.buffer.targets.iter().enumerate() {
             let cells = self.buffer.positions[row];
@@ -188,7 +211,8 @@ impl<V: Variant> Search<V> {
                     format!("root key={key} ({n} waiters)")
                 }
             };
-            rows.push((row, cells, label));
+            let values = [self.buffer.value(row, 0), self.buffer.value(row, 1)];
+            rows.push((row, cells, label, values));
         }
 
         self.scatter();
@@ -242,6 +266,8 @@ impl<V: Variant> Search<V> {
                     node: sel.node,
                     stats: st,
                     legal: [g.legal_moves(0), g.legal_moves(1)],
+                    cells: g.cells,
+                    scores: g.scores,
                 });
             } else {
                 let n = this.arena.node(sel.node);
@@ -250,6 +276,8 @@ impl<V: Variant> Search<V> {
                     node: sel.node,
                     stats: n.stats.clone(),
                     legal: [n.game.legal_moves(0), n.game.legal_moves(1)],
+                    cells: n.game.cells,
+                    scores: n.game.scores,
                 });
             }
         })));
@@ -547,6 +575,9 @@ impl<V: Variant> Search<V> {
 
             if self.arena.is_unused(slot) {
                 self.arena.remove(slot);
+            } else {
+                let node = self.arena.node_mut(slot);
+                node.sweep_age = node.sweep_age.saturating_add(1);
             }
         }
     }
@@ -581,4 +612,89 @@ fn draw(policy: &[f32; SQUARES], legal: [u64; LEGAL_WORDS], rng: &mut Rng) -> us
         }
     }
     last
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::*;
+    use crate::mcts::variant::{Exp3, Puct};
+
+    struct Model;
+    impl Evaluate for Model {
+        fn evaluate(&mut self, _: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]) {
+            priors.fill(1.0);
+            values.fill(0.5);
+        }
+    }
+
+    fn check_flush<V: Variant>(assert_blank: impl Fn(&V::Stats)) {
+        for in_flight in [false, true] {
+            let cfg = Config { g: 8, b: 4, t: 4, s: 8, node_capacity: 4096, ..Config::default() };
+            let mut search = Search::<V>::new(cfg, 123);
+            let mut model = Model;
+            let mut advanced = false;
+            for _ in 0..100 {
+                if !search.cycle(&mut model).is_empty() { advanced = true; break; }
+            }
+            assert!(advanced);
+            search.cfg.t = usize::MAX;
+            for _ in 0..3 { search.cycle(&mut model); }
+            if in_flight {
+                search.collect();
+                assert!(search.buffer.len > 0);
+            }
+            assert!(!search.arena.is_empty());
+            let games: Vec<_> = search.slots.iter().map(|s| (s.root.game.clone(), s.root.key, s.occupied, s.game_over)).collect();
+            let mut rng_before = search.rng.clone();
+            search.flush_for_model_update();
+            search.flush_for_model_update(); // Also safe on an already empty search.
+            let mut rng_after = search.rng.clone();
+            assert_eq!(rng_before.random(), rng_after.random());
+            assert_eq!(search.arena.len(), 0);
+            assert_eq!(search.arena.slot_count(), 0);
+            assert_eq!(search.arena.free_depth(), 0);
+            assert_eq!(search.arena.capacity(), cfg.node_capacity);
+            assert!(search.pending_roots.is_empty() && search.evaluated.is_empty());
+            assert_eq!(search.buffer.len, 0);
+            assert!(search.buffer.targets.is_empty());
+            assert!(search.buffer.priors.iter().all(|&v| v == 0.0));
+            assert!(search.buffer.values.iter().all(|&v| v == 0.0));
+            for (slot, (game, key, occupied, game_over)) in search.slots.iter().zip(games) {
+                assert!(slot.root.game == game);
+                assert_eq!(slot.root.key, key);
+                assert_eq!(slot.occupied, occupied);
+                assert_eq!(slot.game_over, game_over);
+                assert!(slot.root.pending);
+                assert_eq!(slot.sim_count, 0);
+                assert!(slot.path.is_empty() && slot.waiting_on.is_none());
+                assert_blank(&slot.root.stats);
+            }
+            search.cycle(&mut model);
+            assert!(search.slots.iter().any(|s| !s.root.pending));
+            assert!(search.slots.iter().all(|s| s.sim_count == 0));
+            for _ in 0..100 {
+                if search.ready() >= cfg.t { break; }
+                search.cycle(&mut model);
+            }
+            assert!(!search.step().is_empty());
+        }
+    }
+
+    #[test]
+    fn flush_puct_preserves_games_and_resumes() {
+        check_flush::<Puct>(|s| {
+            assert_eq!(s.total, [0; 2]);
+            assert!(s.visit.iter().flatten().all(|&v| v == 0));
+            assert!(s.q.iter().flatten().all(|&v| v == 0.0));
+            assert!(s.prior.iter().flatten().all(|&v| v == 0.0));
+        });
+    }
+
+    #[test]
+    fn flush_exp3_preserves_games_and_resumes() {
+        check_flush::<Exp3>(|s| {
+            assert!(s.log_w.iter().flatten().all(|&v| v == 0.0));
+            assert!(s.strategy_sum.iter().flatten().all(|&v| v == 0.0));
+        });
+    }
 }

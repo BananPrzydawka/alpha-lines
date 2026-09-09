@@ -6,9 +6,8 @@
 //! touching it.
 //!
 //! The index stores the key beside the slot, so probing never reads a node. That matters
-//! because a node is ~2 KB and the array of them is close to a gigabyte: dereferencing one
-//! just to compare a key would be a cache miss on every step of every probe, on the hottest
-//! path in the search. Index entries are 16 bytes, four to a cache line.
+//! because each node is ~2 KB: probing the compact index avoids loading nodes just to
+//! compare keys. Index entries are 16 bytes, four to a cache line.
 //!
 //! Deleting repairs the probe run instead of marking it. Linear probing puts a key at the
 //! first free slot at or after its home, so emptying a slot can strand a later key that had
@@ -56,6 +55,8 @@ pub struct Node<S> {
     pub id_count: u8,
     pub id_cursor: u8,
     pub stats: S,
+    /// Completed sweeps survived; reset whenever this slot is reused.
+    pub sweep_age: u32,
 }
 
 impl<S> Node<S> {
@@ -268,6 +269,7 @@ impl<S: Default> Arena<S> {
                 n.id_count = 1;
                 n.id_cursor = 0;
                 n.stats = S::default();
+                n.sweep_age = 0;
                 s
             }
             None => {
@@ -284,6 +286,7 @@ impl<S: Default> Arena<S> {
                     id_count: 1,
                     id_cursor: 0,
                     stats: S::default(),
+                    sweep_age: 0,
                 });
                 (self.nodes.len() - 1) as u32
             }

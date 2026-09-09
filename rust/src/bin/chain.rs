@@ -21,9 +21,10 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use alpha_lines_game::game::{Rng, SQUARES};
+use alpha_lines_game::game::{
+    Rng, HEIGHT, PLAYER_0_MARK, PLAYER_1_MARK, PLAYABLE_SQUARE, SQUARES, WIDTH,
+};
 use alpha_lines_game::mcts::descent::Descent;
-use alpha_lines_game::mcts::noise::dirichlet;
 use alpha_lines_game::mcts::search::{Evaluate, Search};
 use alpha_lines_game::mcts::slot::ROOT;
 use alpha_lines_game::mcts::variant::{squares, Choice, Exp3, Exp3Stats, Puct, PuctStats, Variant};
@@ -49,8 +50,58 @@ fn normal(rng: &mut Rng) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
+/// Prior decay base: square s has weight R^s, so the field spans 80 squares without
+/// underflowing and peaks visibly at the target corner.
+const GRADIENT_R: f32 = 0.9;
+/// Per-eval noise: lognormal jitter on priors (sigma in log space), Gaussian on
+/// values. Keeps the gradient direction but stops the stub being a perfect oracle —
+/// same position reads slightly differently every eval, like a real model.
+const PRIOR_NOISE: f64 = 0.75;
+const VALUE_NOISE: f32 = 0.3;
+
+/// Gradient weight table plus prefix sums: GRAD[s] = R^s, TOP_K[k] = sum of the k
+/// largest weights (R^0 + ... + R^(k-1)), the denominator of the coverage ratio.
+struct Gradient {
+    w: [f32; SQUARES],
+    top_k: [f32; SQUARES + 1],
+}
+
+impl Gradient {
+    fn build() -> Self {
+        let mut w = [0.0f32; SQUARES];
+        let mut acc = 1.0f32;
+        for s in 0..SQUARES {
+            w[s] = acc;
+            acc *= GRADIENT_R;
+        }
+        let mut top_k = [0.0f32; SQUARES + 1];
+        for k in 1..=SQUARES {
+            top_k[k] = top_k[k - 1] + w[k - 1];
+        }
+        Gradient { w, top_k }
+    }
+}
+
+/// Coverage ratio for one player: gradient mass on their marks over the best
+/// achievable mass with that many marks. Empty board reads 0.5 (a draw).
+fn coverage(cells: &[u8; SQUARES], mark: u8, g: &Gradient, flip: bool) -> f32 {
+    let mut num = 0.0f32;
+    let mut k = 0usize;
+    for sq in 0..SQUARES {
+        if cells[sq] == mark {
+            let d = if flip { SQUARES - 1 - sq } else { sq };
+            num += g.w[d];
+            k += 1;
+        }
+    }
+    if k == 0 {
+        return 0.5;
+    }
+    num / g.top_k[k].max(1e-8)
+}
+
 impl Evaluate for Stub {
-    fn evaluate(&mut self, _positions: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]) {
+    fn evaluate(&mut self, positions: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]) {
         match self.kind {
             // One-hot is kept only for the old onehot trace files; the grounded stub
             // below is the realistic one. Roots go through evaluate like any node.
@@ -66,115 +117,153 @@ impl Evaluate for Stub {
                 }
             }
             StubKind::Grounded => {
-                // concentrated priors: one Dirichlet(0.2) draw per row
-                let mut draw = [0.0f32; SQUARES];
-                for row in priors.chunks_mut(SQUARES) {
-                    dirichlet(&mut self.rng, 0.2, &mut draw);
-                    row.copy_from_slice(&draw);
-                }
-                // mostly positive values: Normal(0.15, 0.2), clipped into [-1, 1]
-                for v in values.iter_mut() {
-                    let x = 0.15 + 0.2 * normal(&mut self.rng);
-                    *v = (x as f32).clamp(-1.0, 1.0);
+                let g = Gradient::build();
+                // player rows come in pairs: rows [2r] is P0's view of position r,
+                // rows [2r+1] P1's. P0's corner is square 0, P1's square 79.
+                // Noise is drawn fresh every eval (not hashed from the position): a
+                // real model jitters between calls, and dup-hits sharing one eval row
+                // stay consistent regardless.
+                let npos = positions.len().min(priors.len() / SQUARES / 2);
+                let (p0_half, p1_half) = priors.split_at_mut(npos * SQUARES);
+                for (r, cells) in positions.iter().enumerate().take(npos) {
+                    let p0_row = &mut p0_half[r * SQUARES..][..SQUARES];
+                    let p1_row = &mut p1_half[r * SQUARES..][..SQUARES];
+                    for sq in 0..SQUARES {
+                        let j0 = (-0.5 * PRIOR_NOISE * PRIOR_NOISE
+                            + PRIOR_NOISE * normal(&mut self.rng))
+                        .exp() as f32;
+                        let j1 = (-0.5 * PRIOR_NOISE * PRIOR_NOISE
+                            + PRIOR_NOISE * normal(&mut self.rng))
+                        .exp() as f32;
+                        p0_row[sq] = g.w[sq] * j0;
+                        p1_row[sq] = g.w[SQUARES - 1 - sq] * j1;
+                    }
+                    let n0 = VALUE_NOISE * normal(&mut self.rng) as f32;
+                    let n1 = VALUE_NOISE * normal(&mut self.rng) as f32;
+                    values[0 * npos + r] = (((coverage(cells, PLAYER_0_MARK, &g, false) - 0.5)
+                        * 2.5)
+                        .tanh()
+                        + n0)
+                        .clamp(-1.0, 1.0);
+                    values[1 * npos + r] = (((coverage(cells, PLAYER_1_MARK, &g, true) - 0.5)
+                        * 2.5)
+                        .tanh()
+                        + n1)
+                        .clamp(-1.0, 1.0);
                 }
             }
         }
     }
 }
 
-/// Readable dump of one node's stats: per player, the legal squares ranked by
-/// PUCT score, so the eye can check the argmax. Untouched zero-q squares collapse
-/// into one "(N more)" line. The choice is marked with `*`; nothing else is printed
-/// about it, since the table already shows why it won.
+/// Board art in the `print_state` style, one neutral view per node: `00`/`11` for the
+/// marks, `--` playable, `xx` removed, blank unplayable.
+fn board_art(out: &mut String, indent: &str, cells: &[u8; SQUARES]) {
+    let border = format!("{indent}+{}+", "-".repeat(WIDTH * 2));
+    let _ = writeln!(out, "{border}");
+    for r in 0..HEIGHT {
+        let mut line = String::from("|");
+        for c in 0..WIDTH {
+            if (r + c) % 2 != 0 {
+                line.push_str("  ");
+                continue;
+            }
+            // square index of board cell (r, c): row r holds WIDTH/2 playable cells
+            let sq = r * (WIDTH / 2) + (c - (r & 1)) / 2;
+            let v = cells[sq];
+            line.push_str(if v == PLAYER_0_MARK {
+                "00"
+            } else if v == PLAYER_1_MARK {
+                "11"
+            } else if v == PLAYABLE_SQUARE {
+                "--"
+            } else {
+                "xx"
+            });
+        }
+        line.push('|');
+        let _ = writeln!(out, "{indent}{line}");
+    }
+    let _ = writeln!(out, "{border}");
+}
+
+/// Readable dump of one node's stats: the board once, then per player the top-10
+/// squares by prior, with q/visit/score beside them so the eye can check the argmax.
+/// The choice is marked with `*` and named in the player header; `depth` indents the
+/// node one level deeper per ply.
 fn dump_node(
     out: &mut String,
     label: &str,
     stats: &PuctStats,
+    cells: &[u8; SQUARES],
     legal0: [u64; 2],
     legal1: [u64; 2],
     choice: [u8; 2],
     c_puct: f32,
+    depth: usize,
 ) {
-    let _ = writeln!(out, "    node {label}:");
+    let pad = "    ".repeat(2 + depth);
+    let inner = "    ".repeat(3 + depth);
+    let _ = writeln!(out, "{pad}node {label}:");
+    board_art(out, &inner, cells);
     for player in 0..2 {
         let legal = if player == 0 { legal0 } else { legal1 };
-        let explore = c_puct * (1.0 + stats.total[player] as f32).sqrt();
-        // (square, score); sort best first, ties by square
-        let mut rows: Vec<(usize, f32)> = squares(legal)
+        let explore = c_puct as f64 * (1.0 + stats.total[player] as f64).sqrt();
+        let _ = writeln!(out, "{inner}player {player} picked {}:", choice[player]);
+        // (square, prior, score); top 10 by prior, ties by square
+        let mut rows: Vec<(usize, f32, f64)> = squares(legal)
             .map(|sq| {
                 let score = stats.q[player][sq]
-                    + explore * stats.prior[player][sq]
-                        / (1.0 + stats.visit[player][sq] as f32);
-                (sq, score)
+                    + explore * stats.prior[player][sq] as f64
+                        / (1.0 + stats.visit[player][sq] as f64);
+                (sq, stats.prior[player][sq], score)
             })
             .collect();
         rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
-        let _ = writeln!(out, "      player {player}:");
-        let _ = writeln!(out, "        sq     q      prior   visit   score");
-        let mut hidden = 0usize;
-        for (sq, score) in rows {
+        let _ = writeln!(out, "{inner}sq     q      prior   visit   score");
+        for (sq, p, score) in rows.into_iter().take(10) {
             let q = stats.q[player][sq];
-            let p = stats.prior[player][sq];
             let v = stats.visit[player][sq];
-            // the eye cares about visited squares, the prior peak, and the choice;
-            // untouched zero-q squares collapse into one line
-            let interesting =
-                sq as u8 == choice[player] || q != 0.0 || v != 0 || p >= 0.01;
-            if !interesting {
-                hidden += 1;
-                continue;
-            }
             let mark = if sq as u8 == choice[player] { "*" } else { " " };
-            let _ = writeln!(out, "       {sq:>3}{mark}  {q:.4}  {p:.4}  {v:>5}  {score:.4}");
-        }
-        if hidden > 0 {
-            let _ = writeln!(out, "        (... {hidden} more: q=0, visit=0, prior<0.01)");
+            let _ = writeln!(out, "{inner}{sq:>3}{mark}  {q:.4}  {p:.4}  {v:>5}  {score:.4}");
         }
     }
 }
 
-/// Readable dump of one EXP3 node's stats: per player, the legal squares ranked by
-/// mixed-strategy probability, with the log-weight beside it. The sampled choice is
-/// marked with `*`; the `prob` column is what the importance weight in backup uses.
+/// Readable dump of one EXP3 node's stats: the board once, then per player the top-10
+/// squares by mixed-strategy probability, with the log-weight beside them. The sampled
+/// choice is marked with `*` and named in the player header; the `prob` column is what
+/// the importance weight in backup uses. `depth` indents the node one level per ply.
 fn dump_node_exp3(
     out: &mut String,
     label: &str,
     stats: &Exp3Stats,
+    cells: &[u8; SQUARES],
     legal0: [u64; 2],
     legal1: [u64; 2],
     choice: [Choice; 2],
     gamma: f32,
+    depth: usize,
 ) {
-    let _ = writeln!(out, "    node {label}:");
-    let mut probs = [0.0f32; SQUARES];
+    let pad = "    ".repeat(2 + depth);
+    let inner = "    ".repeat(3 + depth);
+    let _ = writeln!(out, "{pad}node {label}:");
+    board_art(out, &inner, cells);
+    let mut probs = [0.0f64; SQUARES];
     for player in 0..2 {
         let legal = if player == 0 { legal0 } else { legal1 };
         Exp3::mixed(stats, legal, player, gamma, &mut probs);
-        // (square, prob); sort best first, ties by square
-        let mut rows: Vec<(usize, f32)> =
+        // (square, prob); top 10 by prob, ties by square
+        let mut rows: Vec<(usize, f64)> =
             squares(legal).map(|sq| (sq, probs[sq])).collect();
         rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
-        let _ = writeln!(out, "      player {player}:");
-        let _ = writeln!(out, "        sq     log_w    prob");
-        let mut hidden = 0usize;
-        for (sq, prob) in rows {
+        let _ = writeln!(out, "{inner}player {player} picked {}:", choice[player].action);
+        let _ = writeln!(out, "{inner}sq     log_w    prob");
+        for (sq, prob) in rows.into_iter().take(10) {
             let w = stats.log_w[player][sq];
-            // the eye cares about the sampled square, moved weights, and the peak;
-            // untouched near-uniform squares collapse into one line
-            let interesting =
-                choice[player].action as usize == sq || w != 0.0 || prob >= 0.05;
-            if !interesting {
-                hidden += 1;
-                continue;
-            }
             let mark = if choice[player].action as usize == sq { "*" } else { " " };
-            let _ = writeln!(out, "       {sq:>3}{mark}  {w:.4}  {prob:.4}");
+            let _ = writeln!(out, "{inner}{sq:>3}{mark}  {w:.4}  {prob:.4}");
         }
-        if hidden > 0 {
-            let _ = writeln!(out, "        (... {hidden} more: log_w=0, prob<0.05)");
-        }
-        let (a, p) = (choice[player].action, choice[player].prob);
-        let _ = writeln!(out, "        sampled {a} at prob {p:.4}");
     }
 }
 
@@ -190,7 +279,7 @@ fn run<V: Variant>(
     stub_name: &str,
     fname_mid: &str,
     model: &mut Stub,
-    dump: impl Fn(&mut String, &str, &V::Stats, [u64; 2], [u64; 2], [Choice; 2], &Config),
+    dump: impl Fn(&mut String, &str, &V::Stats, &[u8; SQUARES], [u64; 2], [u64; 2], [Choice; 2], &Config, usize),
 ) {
     // Roots start pending, exactly as Search::new leaves them: cycle 0 can only queue
     // the roots (buffer underfill by construction), the stub evaluates them through
@@ -203,10 +292,7 @@ fn run<V: Variant>(
     let mut counter = 0u32;
 
     let mut out = String::new();
-    let _ = writeln!(out, "chain: G={games} B={buf} {tag} {stub_name} sims={sims}/game");
-    let _ = writeln!(out, "batched: collect in slot order until B rows fill or slots run out, one eval, backups land together");
-    let _ = writeln!(out, "stats snapshotted at selection time, before the child lookup — what `select` saw");
-    let _ = writeln!(out, "path names: r = game root, nK = K-th arena node built (shared across games)\n");
+    let _ = writeln!(out, "chain: G={games} B={buf} {tag} {stub_name} sims={sims}/game\n");
 
     let mut cycle = 0usize;
     let mut step_done = 0usize;
@@ -216,15 +302,17 @@ fn run<V: Variant>(
                 break;
             }
             // like Search::cycle: step when enough games are ready, then keep tracing
+            let before = s.arena.len();
             let records = s.step();
             step_done += 1;
-            let _ = writeln!(out, "step {step_done}:");
+            let _ = writeln!(out, "step {step_done}: arena nodes before={before} after={} (sweep dropped {})",
+                s.arena.len(), before.saturating_sub(s.arena.len()));
             if records.is_empty() {
-                let _ = writeln!(out, "  (no games ready — trace ends here)");
+                let _ = writeln!(out, "    (no games ready — trace ends here)");
                 break;
             }
             for r in &records {
-                let _ = writeln!(out, "  game {}: played ({},{}) finished={} values={:?}",
+                let _ = writeln!(out, "    game {}: played ({},{}) finished={} values={:?}",
                     r.id, r.played[0], r.played[1], r.finished, r.values);
             }
             let _ = writeln!(out, "");
@@ -256,12 +344,12 @@ fn run<V: Variant>(
         let _ = writeln!(out, "cycle {cycle}:");
         for c in &collected {
             if c.queued_root {
-                let why = if c.queued_root_shared {
-                    "shares the queued row"
+                let _ = writeln!(out, "    game {}:", c.slot);
+                if c.queued_root_shared {
+                    let _ = writeln!(out, "        node r already in buffer");
                 } else {
-                    "queued its own row"
-                };
-                let _ = writeln!(out, "  game {}: root unevaluated, queued for eval ({why}); no descent", c.slot);
+                    let _ = writeln!(out, "        queued node r for eval");
+                }
                 continue;
             }
             // rebuild the named path from the slot's stored path (still in flight)
@@ -296,16 +384,7 @@ fn run<V: Variant>(
             }
             match c.outcome {
                 Descent::Entry { fresh, .. } => {
-                    if fresh {
-                        let nm = c.fresh.map(&name_of).unwrap_or_else(|| "(abandoned)".to_string());
-                        let extra = if c.abandoned { " (abandoned: buffer full, node given back)" } else { "" };
-                        let _ = writeln!(out, "  game {}: {path}  (fresh -> {nm}, depth={}){extra}",
-                            c.slot, slot.path.len());
-                    } else {
-                        let nm = c.duplicate_of.map(&name_of).unwrap_or_else(|| "?".to_string());
-                        let _ = writeln!(out, "  game {}: {path}  (dup-hit on {nm}, rides its eval, depth={})",
-                            c.slot, slot.path.len());
-                    }
+                    let _ = writeln!(out, "    game {slot}:", slot = c.slot);
                     for (k, (node, choice)) in c.selections.iter().enumerate() {
                         let key = (c.slot, *node);
                         let at = snap_cursor.entry(key).or_insert(0);
@@ -313,33 +392,40 @@ fn run<V: Variant>(
                             *at += 1;
                             let sn = &snapshots[si];
                             let lb = labels.get(k).cloned().unwrap_or_else(|| "?".into());
-                            dump(&mut out, &lb, &sn.stats, sn.legal[0], sn.legal[1], *choice, &cfg);
+                            dump(&mut out, &lb, &sn.stats, &sn.cells, sn.legal[0], sn.legal[1], *choice, &cfg, k);
                         }
                     }
-                    if c.fresh.is_some() && !c.abandoned {
-                        let nm = c.fresh.map(&name_of).unwrap_or_default();
-                        let _ = writeln!(out, "    leaf {nm} fresh — no stats yet, owes this cycle's eval");
+                    let _ = writeln!(out, "");
+                    if fresh {
+                        if c.abandoned {
+                            let _ = writeln!(out, "        (abandoned: buffer full, node given back)");
+                        } else {
+                            let nm = c.fresh.map(&name_of).unwrap_or_else(|| "(abandoned)".to_string());
+                            let _ = writeln!(out, "        queued node {nm} for eval");
+                        }
+                    } else {
+                        let nm = c.duplicate_of.map(&name_of).unwrap_or_else(|| "?".to_string());
+                        let _ = writeln!(out, "        node {nm} already in buffer");
                     }
+                    let _ = writeln!(out, "");
                 }
                 Descent::NoEntry => {
-                    let _ = writeln!(out, "  game {}: terminal at depth {} (backed up on the spot, sim_count={})",
-                        c.slot, c.selections.len(), slot.sim_count);
+                    let _ = writeln!(out, "    game {}: terminal at depth {} (backed up on the spot)",
+                        c.slot, c.selections.len());
                 }
                 Descent::Exhausted => {
-                    let _ = writeln!(out, "  game {}: EXHAUSTED (node stack full)", c.slot);
+                    let _ = writeln!(out, "    game {}: EXHAUSTED (node stack full)", c.slot);
                 }
             }
         }
-        // the model call + scatter + backups, with row labels
+        // the model call + scatter + backups, with row labels and returned values
         let name_lookup = |node: u32| names.get(&node).cloned().unwrap_or_else(|| format!("?{node}"));
         let rows = s.evaluate_scatter_backup(model, name_lookup);
-        let _ = writeln!(out, "  eval: {} row(s)", rows.len());
-        for (row, _, label) in &rows {
-            let _ = writeln!(out, "    row {row}: {label}");
+        let _ = writeln!(out, "    eval: {} of {} rows", rows.len(), buf);
+        for (row, _, label, values) in &rows {
+            let _ = writeln!(out, "        row {row}: {label} values=[{:.4}, {:.4}]", values[0], values[1]);
         }
-        let counts: Vec<String> =
-            s.slots.iter().enumerate().map(|(i, sl)| format!("g{i}={}", sl.sim_count)).collect();
-        let _ = writeln!(out, "  sim_counts after backup: {}\n", counts.join(" "));
+        let _ = writeln!(out, "");
         cycle += 1;
         if cycle > 100_000 {
             let _ = writeln!(out, "STOP: 100k cycles without finishing {sims} sims/game — aborting");
@@ -388,7 +474,7 @@ fn main() {
         cfg.epsilon = 1.0;
     }
     let stub_name = if grounded {
-        "Dirichlet(0.2) priors, Normal(0.15,0.2)-clipped values"
+        "exp-gradient priors (r=0.9), tanh coverage values"
     } else {
         "one-hot priors, values=+0.5"
     };
@@ -397,13 +483,13 @@ fn main() {
         let tag = format!("EXP3 gamma={gamma}");
         let mid = format!("exp3_g{gamma}{}", if grounded { "_grounded" } else { "" });
         run::<Exp3>(cfg, games, buf, sims, steps, &tag, stub_name, &mid, &mut model,
-            |o, lb, st, l0, l1, ch, c| dump_node_exp3(o, lb, st, l0, l1, ch, c.exp3_gamma));
+            |o, lb, st, cells, l0, l1, ch, c, d| dump_node_exp3(o, lb, st, cells, l0, l1, ch, c.exp3_gamma, d));
     } else {
         let tag = format!("PUCT eps={eps} alpha={alpha} c_puct={}", cfg.c_puct);
         let mid = format!("eps{eps}_al{alpha}{}", if grounded { "_grounded" } else { "" });
         run::<Puct>(cfg, games, buf, sims, steps, &tag, stub_name, &mid, &mut model,
-            |o, lb, st, l0, l1, ch, c| {
-                dump_node(o, lb, st, l0, l1, [ch[0].action, ch[1].action], c.c_puct)
+            |o, lb, st, cells, l0, l1, ch, c, d| {
+                dump_node(o, lb, st, cells, l0, l1, [ch[0].action, ch[1].action], c.c_puct, d)
             });
     }
 }

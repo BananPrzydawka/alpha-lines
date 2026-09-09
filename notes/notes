@@ -566,13 +566,3 @@ sim 0 game 1: r -(0,4)-> n1 -(1,1)-> n2  (fresh=true depth=2)
 
 
 
-
-
-
-isssiues to raise later:
-- why are evals so fucking shallow?
-- node lifetime counter, prevent node stat overflow, ply 1 full allocation, complete zero startup problem - only on step 1, node game id array increase
-- calibrate arena size
-
-
-
