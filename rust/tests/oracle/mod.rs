@@ -1,4 +1,6 @@
-//! The oracle: a port of `main/game_kernels.py`, used only by the tests.
+//! The oracle: a port of the old `main/game_kernels.py` (deleted in the Rust port;
+//! only `python/config.py`, `python/model.py`, `python/export_mcts.py`,
+//! `python/modal_harness.py`, `python/modal_mcts.py` remain), used only by the tests.
 //!
 //! This is the reference the incremental engine is checked against. It lives in `tests/`
 //! rather than `src/` because it is not part of the product — the engine ships alone — but
@@ -9,7 +11,7 @@
 //! RNG. Two implementations that agree are only interesting if they are actually two.
 //!
 //! Same algorithms, same iteration order, same quirks — no improvements. The numba kernels
-//! are compiled with `parallel=game_kernels_parralel`, which is `False` in `main/config.py`,
+//! `parallel` flag, which was `False` in the old `main/config.py`,
 //! so every loop here is serial too.
 //!
 //! Array layouts match the numpy shapes, flattened row-major:

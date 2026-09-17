@@ -1,5 +1,5 @@
-//! Both search rules against naive transcriptions of `main/mcts_puct.py` and
-//! `main/mcts_exp3.py`, plus the properties each rule is supposed to have.
+//! Both search rules against naive transcriptions of the deleted `main/mcts_puct.py`
+//! and `main/mcts_exp3.py`, plus the properties each rule is supposed to have.
 //!
 //! The references here compute in `f64` over dense arrays, the way numpy does, and share no
 //! code with the engine's versions — which is what makes agreeing with them evidence.

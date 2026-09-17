@@ -11,7 +11,7 @@ use crate::game::{Game, Rng, Scratch};
 use crate::mcts::arena::Arena;
 use crate::mcts::config::{Config, PENDING};
 use crate::mcts::slot::{Slot, ROOT};
-use crate::mcts::variant::{Choice, Variant};
+use crate::mcts::variant::Variant;
 use crate::zobrist;
 
 /// How a descent ended.
@@ -73,18 +73,7 @@ pub fn back_up<V: Variant>(
     slot.waiting_on = None;
 }
 
-/// One selection step, for the trace hook: which node was selected on, and what
-/// the selection chose there. Snapshots are taken by the caller before calling this.
-#[derive(Clone, Copy)]
-pub struct Selection {
-    pub node: u32,
-    pub choice: [Choice; 2],
-}
-
 /// Run one simulation from `slot`'s root. `id` is the slot's own index.
-///
-/// When `trace` is `Some`, it is called once per selection, after the choice is made but
-/// before the child is looked up — so the caller can snapshot the stats `select` just saw.
 pub fn descend<V: Variant>(
     id: u16,
     slot: &mut Slot<V::Stats>,
@@ -92,19 +81,6 @@ pub fn descend<V: Variant>(
     cfg: &Config,
     rng: &mut Rng,
     scratch: &mut Scratch,
-) -> Descent {
-    descend_traced::<V>(id, slot, arena, cfg, rng, scratch, None)
-}
-
-/// Traced variant of [`descend`]; see [`Selection`].
-pub fn descend_traced<V: Variant>(
-    id: u16,
-    slot: &mut Slot<V::Stats>,
-    arena: &mut Arena<V::Stats>,
-    cfg: &Config,
-    rng: &mut Rng,
-    scratch: &mut Scratch,
-    mut trace: Option<&mut dyn FnMut(Selection)>,
 ) -> Descent {
     debug_assert!(slot.occupied && !slot.game_over, "descent from a slot that is not playing");
     debug_assert!(!slot.root.pending, "descent from an unevaluated root: queue it, do not select on it");
@@ -128,9 +104,6 @@ pub fn descend_traced<V: Variant>(
         } else {
             V::select(&mut arena.node_mut(cur).stats, legal, cfg, rng)
         };
-        if let Some(ref mut t) = trace {
-            t(Selection { node: cur, choice });
-        }
         let (a0, a1) = (choice[0].action as usize, choice[1].action as usize);
 
         // the child's key without the child's board

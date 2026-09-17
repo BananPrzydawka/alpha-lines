@@ -13,7 +13,7 @@ use alpha_lines_game::Game;
 /// An untrained network: near-uniform priors, noisy values.
 struct Stub(Rng);
 impl Evaluate for Stub {
-    fn evaluate(&mut self, _positions: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]) {
+    fn evaluate(&mut self, _positions: &[[u8; SQUARES]], _scores: &[[i32; 2]], priors: &mut [f32], values: &mut [f32]) {
         for p in priors.iter_mut() {
             *p = 1.0 + self.0.random() as f32 * 0.05;
         }

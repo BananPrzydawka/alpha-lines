@@ -10,8 +10,17 @@
 //! [`zobrist`] hashes a position, and updates the hash across a move without playing it, so a
 //! search can look up a child before deciding to build one.
 
+/// Defaults generated from the repository's config.json at build time.
+pub mod config {
+    include!(concat!(env!("OUT_DIR"), "/config.rs"));
+}
+
 pub mod game;
+pub mod score_batch;
 pub mod mcts;
 pub mod zobrist;
 
 pub use game::{Game, Scratch, HEIGHT, HW, ROW, SQUARES, WIDTH};
+
+#[cfg(feature = "compiled-model")]
+pub mod inference;

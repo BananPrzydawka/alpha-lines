@@ -10,50 +10,19 @@ use std::collections::HashMap;
 use crate::game::{Rng, Scratch, LEGAL_WORDS, SQUARES};
 use crate::mcts::arena::Arena;
 use crate::mcts::config::{Config, PENDING};
-use crate::mcts::descent::{back_up, descend, descend_traced, Descent, Selection};
+use crate::mcts::descent::{back_up, descend, Descent};
 use crate::mcts::slot::Slot;
 use crate::mcts::variant::{squares, Variant};
 use crate::{zobrist, Game};
 
-/// What one descent inside a traced [`Search::collect_traced`] did, in slot order.
-///
-/// `selections` are the nodes the descent selected on, in path order, with the stats
-/// snapshots running alongside in the returned snapshot list. `fresh` names a new
-/// node this descent created (still pending — the evaluation has not landed yet);
-/// `duplicate_of` names the pending node a dup-hit landed on instead.
-pub struct Collected {
-    pub slot: usize,
-    pub outcome: Descent,
-    pub selections: Vec<(u32, [crate::mcts::variant::Choice; 2])>,
-    pub fresh: Option<u32>,
-    pub duplicate_of: Option<u32>,
-    pub abandoned: bool,
-    /// The game queued its pending root and sat out. `shared` when the root state was
-    /// already queued by another game, so this slot cost no buffer row of its own.
-    pub queued_root: bool,
-    pub queued_root_shared: bool,
-}
-
-/// A stats snapshot taken at one selection: the node's cloned statistics plus the
-/// position it was taken at, so the caller can render the board and the PUCT scores
-/// later. Root snapshots carry `node = ROOT`. Generic over the statistic block.
-#[derive(Clone)]
-pub struct Snapshot<S> {
-    pub slot: usize,
-    pub node: u32,
-    pub stats: S,
-    pub legal: [[u64; crate::game::LEGAL_WORDS]; 2],
-    pub cells: [u8; SQUARES],
-    pub scores: [i32; 2],
-}
-
 /// The model. One call scores `positions`, both players at once.
+/// `scores` carries the matching games' incremental scores for the input score planes.
 ///
 /// `priors` is `2 * width * SQUARES` long and `values` is `2 * width`: player `p`'s row for
 /// position `r` starts at `(p * width + r) * SQUARES`, matching the `(2B, 80)` the training
 /// side produces. Rows past the ones filled this cycle are zero and their output is ignored.
 pub trait Evaluate {
-    fn evaluate(&mut self, positions: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]);
+    fn evaluate(&mut self, positions: &[[u8; SQUARES]], scores: &[[i32; 2]], priors: &mut [f32], values: &mut [f32]);
 }
 
 /// Where an evaluated row belongs.
@@ -82,6 +51,7 @@ pub struct StepRecord {
 /// The evaluation buffer: a fixed `B` rows, of which the first `len` are filled.
 struct Buffer {
     positions: Vec<[u8; SQUARES]>,
+    scores: Vec<[i32; 2]>,
     targets: Vec<Target>,
     priors: Vec<f32>,
     values: Vec<f32>,
@@ -93,6 +63,7 @@ impl Buffer {
     fn new(width: usize) -> Self {
         Buffer {
             positions: vec![[0u8; SQUARES]; width],
+            scores: vec![[0; 2]; width],
             targets: Vec::with_capacity(width),
             priors: vec![0.0; 2 * width * SQUARES],
             values: vec![0.0; 2 * width],
@@ -105,15 +76,17 @@ impl Buffer {
         for p in self.positions[..self.len].iter_mut() {
             *p = [0u8; SQUARES];
         }
+        self.scores[..self.len].fill([0; 2]);
         self.targets.clear();
         self.len = 0;
     }
     fn is_full(&self) -> bool {
         self.len == self.width
     }
-    fn push(&mut self, cells: [u8; SQUARES], target: Target) {
+    fn push(&mut self, cells: [u8; SQUARES], scores: [i32; 2], target: Target) {
         debug_assert!(!self.is_full(), "pushed into a full buffer");
         self.positions[self.len] = cells;
+        self.scores[self.len] = scores;
         self.targets.push(target);
         self.len += 1;
     }
@@ -165,7 +138,6 @@ impl<V: Variant> Search<V> {
     /// Discard all model-dependent search state when adopting new inference weights.
     /// Call between cycles, then resume with the new model. Game positions, slot
     /// identities and RNG state are preserved; unfinished simulations are discarded.
-    /// Any previously collected trace/evaluation must also be discarded by the caller.
     pub fn flush_for_model_update(&mut self) {
         self.arena.clear();
         self.buffer.clear();
@@ -187,44 +159,11 @@ impl<V: Variant> Search<V> {
         self.slots.iter().filter(|s| s.ready(&self.cfg)).count()
     }
 
-    /// Run the model's evaluate step plus scatter and backup, for a traced cycle: the
-    /// caller ran [`Self::collect_traced`], inspected the descents, and now wants the
-    /// same evaluate → scatter → backup sequence [`Self::cycle`] runs. Returns the eval
-    /// line items: per buffer row, the cells evaluated, a label for what it resolves,
-    /// and the values the model returned. Labels need the caller's node names; pass a
-    /// lookup. Values are read out before scatter, since scatter only stores priors.
-    pub fn evaluate_scatter_backup<E: Evaluate>(
-        &mut self,
-        model: &mut E,
-        name: impl Fn(u32) -> String,
-    ) -> Vec<(usize, [u8; SQUARES], String, [f32; 2])> {
-        model.evaluate(&self.buffer.positions, &mut self.buffer.priors, &mut self.buffer.values);
-
-        // label rows and read values before scatter consumes the target lists
-        let mut rows = Vec::new();
-        for (row, target) in self.buffer.targets.iter().enumerate() {
-            let cells = self.buffer.positions[row];
-            let label = match *target {
-                Target::Node(node) => format!("node {}", name(node)),
-                Target::Root(key) => {
-                    let n = self.pending_roots.get(&key).map(|w| w.len()).unwrap_or(0);
-                    format!("root key={key} ({n} waiters)")
-                }
-            };
-            let values = [self.buffer.value(row, 0), self.buffer.value(row, 1)];
-            rows.push((row, cells, label, values));
-        }
-
-        self.scatter();
-        self.back_up_waiters();
-        rows
-    }
-
     /// One model call: collect, evaluate, scatter, back up, and step if enough games are
     /// ready. Returns the training records from the step, if one happened.
     pub fn cycle<E: Evaluate>(&mut self, model: &mut E) -> Vec<StepRecord> {
         self.collect();
-        model.evaluate(&self.buffer.positions, &mut self.buffer.priors, &mut self.buffer.values);
+        model.evaluate(&self.buffer.positions, &self.buffer.scores, &mut self.buffer.priors, &mut self.buffer.values);
         self.scatter();
         self.back_up_waiters();
 
@@ -238,58 +177,6 @@ impl<V: Variant> Search<V> {
     /// Walk the slots from 0, queueing pending roots and descending each other eligible
     /// game once, and stop when the buffer is full.
     fn collect(&mut self) {
-        self.collect_inner(None);
-    }
-
-    /// Traced variant of the collection walk: snapshots the stats at every selection,
-    /// after the choice is made but before the child is looked up, so they are what
-    /// `select` just saw. Returns one [`Collected`] per descent that ran, in slot order,
-    /// plus all snapshots in selection order.
-    pub fn collect_traced(&mut self) -> (Vec<Collected>, Vec<Snapshot<V::Stats>>) {
-        let mut out = Vec::new();
-        let mut snaps: Vec<Snapshot<V::Stats>> = Vec::new();
-        // borrow discipline: the hook reads stats out of `self` while the walk holds
-        // `&mut self`. Both go through raw pointers; the hook only reads the node it is
-        // shown (which the walk is not mutating at that point — select takes `&mut`
-        // only on the node it is selecting on, and releases it before the hook runs).
-        let self_ptr: *mut Self = self;
-        let snaps_ptr: *mut Vec<Snapshot<V::Stats>> = &mut snaps;
-        self.collect_inner(Some((&mut out, &mut |slot: usize, sel: Selection| {
-            // SAFETY: see above; `snaps` is touched only by this hook.
-            let this = unsafe { &*self_ptr };
-            let snaps = unsafe { &mut *snaps_ptr };
-            if sel.node == crate::mcts::slot::ROOT {
-                let st = this.slots[slot].root.stats.clone();
-                let g = &this.slots[slot].root.game;
-                snaps.push(Snapshot {
-                    slot,
-                    node: sel.node,
-                    stats: st,
-                    legal: [g.legal_moves(0), g.legal_moves(1)],
-                    cells: g.cells,
-                    scores: g.scores,
-                });
-            } else {
-                let n = this.arena.node(sel.node);
-                snaps.push(Snapshot {
-                    slot,
-                    node: sel.node,
-                    stats: n.stats.clone(),
-                    legal: [n.game.legal_moves(0), n.game.legal_moves(1)],
-                    cells: n.game.cells,
-                    scores: n.game.scores,
-                });
-            }
-        })));
-        (out, snaps)
-    }
-
-    /// The collection walk. When `trace` is `Some`, every descent is recorded and
-    /// `snapshot(slot, selection)` is called at each selection inside it.
-    fn collect_inner(
-        &mut self,
-        mut trace: Option<(&mut Vec<Collected>, &mut dyn FnMut(usize, Selection))>,
-    ) {
         self.buffer.clear();
         self.pending_roots.clear();
         self.evaluated.clear();
@@ -307,108 +194,29 @@ impl<V: Variant> Search<V> {
             // evaluation lands: cycle 0 queues the roots, cycle 1 descends from them.
             if self.slots[i].root.pending {
                 let key = self.slots[i].root.key;
-                let shared = self.pending_roots.contains_key(&key);
                 if let Some(waiters) = self.pending_roots.get_mut(&key) {
                     waiters.push(i as u16);
                 } else {
                     let cells = self.slots[i].root.game.cells;
-                    self.buffer.push(cells, Target::Root(key));
+                    self.buffer.push(cells, self.slots[i].root.game.scores, Target::Root(key));
                     self.pending_roots.insert(key, vec![i as u16]);
-                }
-                if let Some((ref mut out, _)) = trace {
-                    out.push(Collected {
-                        slot: i,
-                        outcome: Descent::NoEntry,
-                        selections: Vec::new(),
-                        fresh: None,
-                        duplicate_of: None,
-                        abandoned: false,
-                        queued_root: true,
-                        queued_root_shared: shared,
-                    });
                 }
                 continue;
             }
 
             // One descent per game per cycle, whatever its outcome: a terminal backs up
             // inline and the game simply waits for the next cycle rather than retrying.
-            // When tracing, selections are recorded so the caller can pair them with the
-            // snapshots its hook took.
-            let mut selections: Vec<(u32, [crate::mcts::variant::Choice; 2])> = Vec::new();
-            let r = if let Some((_, ref mut snap)) = trace {
-                // borrow the hook for this descent only; the borrow ends with the call
-                let hook: &mut dyn FnMut(usize, Selection) = &mut **snap;
-                // wrap it with the slot index fixed, recording selections alongside
-                let mut wrapped = |sel: Selection| {
-                    selections.push((sel.node, sel.choice));
-                    hook(i, sel);
-                };
-                descend_traced::<V>(
-                    i as u16,
-                    &mut self.slots[i],
-                    &mut self.arena,
-                    &self.cfg,
-                    &mut self.rng,
-                    &mut self.scratch,
-                    Some(&mut wrapped),
-                )
-            } else {
-                descend::<V>(
-                    i as u16,
-                    &mut self.slots[i],
-                    &mut self.arena,
-                    &self.cfg,
-                    &mut self.rng,
-                    &mut self.scratch,
-                )
-            };
-            // traced record for this descent, filled in by the match below
-            let mut rec = trace.as_ref().map(|_| Collected {
-                slot: i,
-                outcome: r,
-                selections,
-                fresh: None,
-                duplicate_of: None,
-                abandoned: false,
-                queued_root: false,
-                queued_root_shared: false,
-            });
-            match r {
-                Descent::Entry { node, fresh } => {
-                    if fresh {
-                        if self.buffer.is_full() {
-                            // no room to ask: give the node back rather than leave it
-                            // pending with nobody queued to evaluate it
-                            self.abandon(i, node);
-                            if let Some(ref mut c) = rec {
-                                c.abandoned = true;
-                            }
-                        } else {
-                            let cells = self.arena.node(node).game.cells;
-                            self.buffer.push(cells, Target::Node(node));
-                            if let Some(ref mut c) = rec {
-                                c.fresh = Some(node);
-                            }
-                        }
-                    } else if let Some(ref mut c) = rec {
-                        c.duplicate_of = Some(node);
-                    }
-                }
-                Descent::NoEntry => {}
-                Descent::Exhausted => {}
+            if let Descent::Entry { node, fresh: true } = descend::<V>(
+                i as u16,
+                &mut self.slots[i],
+                &mut self.arena,
+                &self.cfg,
+                &mut self.rng,
+                &mut self.scratch,
+            ) {
+                let cells = self.arena.node(node).game.cells;
+                self.buffer.push(cells, self.arena.node(node).game.scores, Target::Node(node));
             }
-            if let Some((ref mut out, _)) = trace {
-                out.push(rec.unwrap());
-            }
-        }
-    }
-
-    /// Undo a descent that produced a node the buffer has no room to ask about.
-    fn abandon(&mut self, slot: usize, node: u32) {
-        self.slots[slot].waiting_on = None;
-        self.slots[slot].path.clear();
-        if self.arena.drop_id(node, slot as u16) && self.arena.is_unused(node) {
-            self.arena.remove(node);
         }
     }
 
@@ -575,9 +383,6 @@ impl<V: Variant> Search<V> {
 
             if self.arena.is_unused(slot) {
                 self.arena.remove(slot);
-            } else {
-                let node = self.arena.node_mut(slot);
-                node.sweep_age = node.sweep_age.saturating_add(1);
             }
         }
     }
@@ -612,89 +417,4 @@ fn draw(policy: &[f32; SQUARES], legal: [u64; LEGAL_WORDS], rng: &mut Rng) -> us
         }
     }
     last
-}
-
-#[cfg(test)]
-mod flush_tests {
-    use super::*;
-    use crate::mcts::variant::{Exp3, Puct};
-
-    struct Model;
-    impl Evaluate for Model {
-        fn evaluate(&mut self, _: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]) {
-            priors.fill(1.0);
-            values.fill(0.5);
-        }
-    }
-
-    fn check_flush<V: Variant>(assert_blank: impl Fn(&V::Stats)) {
-        for in_flight in [false, true] {
-            let cfg = Config { g: 8, b: 4, t: 4, s: 8, node_capacity: 4096, ..Config::default() };
-            let mut search = Search::<V>::new(cfg, 123);
-            let mut model = Model;
-            let mut advanced = false;
-            for _ in 0..100 {
-                if !search.cycle(&mut model).is_empty() { advanced = true; break; }
-            }
-            assert!(advanced);
-            search.cfg.t = usize::MAX;
-            for _ in 0..3 { search.cycle(&mut model); }
-            if in_flight {
-                search.collect();
-                assert!(search.buffer.len > 0);
-            }
-            assert!(!search.arena.is_empty());
-            let games: Vec<_> = search.slots.iter().map(|s| (s.root.game.clone(), s.root.key, s.occupied, s.game_over)).collect();
-            let mut rng_before = search.rng.clone();
-            search.flush_for_model_update();
-            search.flush_for_model_update(); // Also safe on an already empty search.
-            let mut rng_after = search.rng.clone();
-            assert_eq!(rng_before.random(), rng_after.random());
-            assert_eq!(search.arena.len(), 0);
-            assert_eq!(search.arena.slot_count(), 0);
-            assert_eq!(search.arena.free_depth(), 0);
-            assert_eq!(search.arena.capacity(), cfg.node_capacity);
-            assert!(search.pending_roots.is_empty() && search.evaluated.is_empty());
-            assert_eq!(search.buffer.len, 0);
-            assert!(search.buffer.targets.is_empty());
-            assert!(search.buffer.priors.iter().all(|&v| v == 0.0));
-            assert!(search.buffer.values.iter().all(|&v| v == 0.0));
-            for (slot, (game, key, occupied, game_over)) in search.slots.iter().zip(games) {
-                assert!(slot.root.game == game);
-                assert_eq!(slot.root.key, key);
-                assert_eq!(slot.occupied, occupied);
-                assert_eq!(slot.game_over, game_over);
-                assert!(slot.root.pending);
-                assert_eq!(slot.sim_count, 0);
-                assert!(slot.path.is_empty() && slot.waiting_on.is_none());
-                assert_blank(&slot.root.stats);
-            }
-            search.cycle(&mut model);
-            assert!(search.slots.iter().any(|s| !s.root.pending));
-            assert!(search.slots.iter().all(|s| s.sim_count == 0));
-            for _ in 0..100 {
-                if search.ready() >= cfg.t { break; }
-                search.cycle(&mut model);
-            }
-            assert!(!search.step().is_empty());
-        }
-    }
-
-    #[test]
-    fn flush_puct_preserves_games_and_resumes() {
-        check_flush::<Puct>(|s| {
-            assert_eq!(s.total, [0; 2]);
-            assert!(s.visit.iter().flatten().all(|&v| v == 0));
-            assert!(s.q.iter().flatten().all(|&v| v == 0.0));
-            assert!(s.prior.iter().flatten().all(|&v| v == 0.0));
-        });
-    }
-
-    #[test]
-    fn flush_exp3_preserves_games_and_resumes() {
-        check_flush::<Exp3>(|s| {
-            assert!(s.log_w.iter().flatten().all(|&v| v == 0.0));
-            assert!(s.strategy_sum.iter().flatten().all(|&v| v == 0.0));
-        });
-    }
 }

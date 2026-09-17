@@ -4,9 +4,16 @@ version = "0.1.0"
 edition = "2021"
 description = "The alpha-lines game: one board, scored incrementally"
 
-# Deliberately zero dependencies: the engine is one self-contained file and must build and
-# run identically anywhere, without a crates.io fetch.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+# The core needs no external crates. The optional compiled-model feature links the
+# local PyTorch installation through a small C++ AOTInductor loader.
 [dependencies]
+
+# Read the shared config at build time; the engine has no runtime dependencies.
+[build-dependencies]
+serde_json = "1"
 
 [profile.release]
 opt-level = 3
@@ -17,3 +24,14 @@ codegen-units = 1
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[features]
+compiled-model = []
+
+[[example]]
+name = "speed"
+required-features = ["compiled-model"]
+
+[[example]]
+name = "model_speed"
+required-features = ["compiled-model"]

@@ -1,6 +1,6 @@
 //! The engine against the oracle, bit for bit, at every move, in every observable field.
 //!
-//! The oracle (`tests/oracle`) is a port of `main/game_kernels.py`, itself verified against
+//! The oracle (`tests/oracle`) is a port of the deleted `main/game_kernels.py`, itself verified against
 //! the Python by `xcheck/xcheck.py`, so parity here is parity with the Python transitively.
 //!
 //! It is batch-shaped and board-shaped because the numba kernels were; the engine is neither,

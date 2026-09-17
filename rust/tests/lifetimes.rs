@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 struct Uniform;
 impl Evaluate for Uniform {
-    fn evaluate(&mut self, _: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]) {
+    fn evaluate(&mut self, _: &[[u8; SQUARES]], _scores: &[[i32; 2]], priors: &mut [f32], values: &mut [f32]) {
         priors.fill(1.0);
         values.fill(0.0);
     }

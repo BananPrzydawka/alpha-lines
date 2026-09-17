@@ -21,7 +21,7 @@
 //! callers hold node slots, which never move.
 
 use crate::game::Game;
-use crate::mcts::config::{Config, K, OVERFLOWED, PENDING};
+use crate::mcts::config::{Config, K, PENDING};
 
 /// An index slot holding no node.
 const EMPTY: u32 = u32::MAX;
@@ -55,8 +55,6 @@ pub struct Node<S> {
     pub id_count: u8,
     pub id_cursor: u8,
     pub stats: S,
-    /// Completed sweeps survived; reset whenever this slot is reused.
-    pub sweep_age: u32,
 }
 
 impl<S> Node<S> {
@@ -165,7 +163,6 @@ impl<S> Arena<S> {
         } else {
             n.ids[n.id_cursor as usize] = id;
             n.id_cursor = ((n.id_cursor as usize + 1) % K) as u8;
-            n.flags |= OVERFLOWED;
         }
     }
 
@@ -269,7 +266,6 @@ impl<S: Default> Arena<S> {
                 n.id_count = 1;
                 n.id_cursor = 0;
                 n.stats = S::default();
-                n.sweep_age = 0;
                 s
             }
             None => {
@@ -286,7 +282,6 @@ impl<S: Default> Arena<S> {
                     id_count: 1,
                     id_cursor: 0,
                     stats: S::default(),
-                    sweep_age: 0,
                 });
                 (self.nodes.len() - 1) as u32
             }

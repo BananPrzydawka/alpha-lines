@@ -14,11 +14,11 @@
 //! and indexes; see [`SQUARES`].
 //!
 //! [`Game`] is the public surface. Everything above it is the scorer it sits on. The module
-//! has no dependencies on the rest of the crate and can be lifted out as a single file.
+//! uses board dimensions from the shared project configuration.
 
 /// Board shape. Every square with `(r + c)` even is playable — 80 of the 160.
-pub const HEIGHT: usize = 10;
-pub const WIDTH: usize = 16;
+pub const HEIGHT: usize = crate::config::GAME_HEIGHT;
+pub const WIDTH: usize = crate::config::GAME_WIDTH;
 
 /// Cells on the `HEIGHT x WIDTH` board, half of which can never hold anything.
 pub const HW: usize = HEIGHT * WIDTH;

@@ -14,3 +14,6 @@ logs/
 *.pt
 cuda/build/
 cuda/out/
+
+# Rust build artifacts
+/rust/target/
