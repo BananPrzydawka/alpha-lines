@@ -3,14 +3,61 @@
     "height": 10,
     "width": 16
   },
-  "model": {
+  "modal": {
+    "gpu": "H100",
+    "timeout": 1200
+  },
+  "klent": {
+    "n": 2048,
+    "m": 2097152,
+    "max_ply": 80,
+    "alpha": 0.03,
+    "beta": 0.1,
+    "lambda": 0.8824969025845955,
+    "train_minibatch": 8192,
+    "lr": 0.0003,
+    "test_games": 2048,
+    "optimizer": "adamw",
+    "weight_decay": 0.01,
+    "seed": 1,
+    "model": "katago"
+  },
+  "resnet_model": {
     "filters": 128,
-    "bottleneck": 32,
-    "resblock_number": 20,
-    "policy_filters": 60,
-    "value_fc": 256,
-    "error_fc": 128,
-    "point_fc": 256
+    "blocks": 8,
+    "se_hidden": 32,
+    "score_embed_hidden": 128,
+    "policy_filters": 64,
+    "action_value_filters": 64,
+    "group_norm": {
+      "groups": 8,
+      "eps": 1e-05,
+      "affine": true
+    }
+  },
+  "katago_model": {
+    "filters": 128,
+    "blocks": 8,
+    "se_hidden": 32,
+    "score_embed_hidden": 128,
+    "policy_filters": 64,
+    "action_value_filters": 64,
+    "group_norm": {
+      "groups": 8,
+      "eps": 1e-05,
+      "affine": true
+    }
+  },
+  "maia_model": {
+    "dim": 192,
+    "layers": 8,
+    "head_dim": 32,
+    "mlp_ratio": 2,
+    "gab_dim": 64,
+    "score_head": {
+      "square_features": 32,
+      "hidden_dim": 256
+    }
   },
   "mcts": {
     "k": 64,
@@ -24,32 +71,15 @@
     "epsilon": 0.25,
     "exp3_gamma": 0.1
   },
-  "benchmark": {
-    "searches": "1,2,3,4,5,6",
-    "seconds": 30.0,
-    "repeats": 2,
-    "warmup_steps": 3,
-    "warmup": 5,
-    "steps": 10,
-    "seed": 1,
-    "variant": "puct",
-    "device": "cuda",
-    "output": "logs/mcts-speed"
-  },
-  "modal": {
-    "gpu": "H100",
-    "cpus": 16,
-    "memory_gib": 64,
-    "timeout": 1200
-  },
   "score_training": {
-    "seconds": 600,
+    "seconds": 100,
     "batch": 256,
+    "validation_batch": 256,
     "steps": 100000,
-    "lr": 0.001,
-    "eval_every": 100,
+    "lr": 0.0003,
+    "eval_every": 200,
     "validation_steps": 64,
     "seed": 1,
-    "output": "logs/score-demo"
+    "output": "logs/score-symmetry"
   }
 }

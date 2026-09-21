@@ -43,6 +43,15 @@ class RandomScoreBatch:
         self.close()
 
 
+def both_perspectives(inputs, targets):
+    """Original B rows followed by B rows with player identities exchanged."""
+    swapped = inputs[:, [0, 1, 2, 4, 3]]
+    return (
+        torch.cat((inputs, swapped), dim=0).contiguous(memory_format=torch.channels_last),
+        torch.cat((targets, targets.flip(1)), dim=0),
+    )
+
+
 class ScoreEncoder(torch.nn.Module):
     """Five board planes in the existing encoder's order, fixed player 0 view.
 

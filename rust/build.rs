@@ -16,10 +16,6 @@ fn generate_config() {
         ("mcts", "s", "u32"), ("mcts", "node_capacity_factor", "usize"),
         ("mcts", "c_puct", "f32"), ("mcts", "alpha", "f32"),
         ("mcts", "epsilon", "f32"), ("mcts", "exp3_gamma", "f32"),
-        ("benchmark", "steps", "u64"), ("benchmark", "seed", "u64"),
-        ("benchmark", "warmup", "usize"), ("benchmark", "warmup_steps", "u64"),
-        ("benchmark", "seconds", "f64"),
-        ("benchmark", "variant", "&str"), ("benchmark", "device", "&str"),
     ] {
         let value = &config[section][key];
         let literal = match ty {
@@ -37,7 +33,6 @@ fn generate_config() {
 fn main() {
     generate_config();
     println!("cargo:rerun-if-changed=native/inference.cpp");
-    println!("cargo:rerun-if-changed=native/encode.h");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PYTHON");
     println!("cargo:rerun-if-env-changed=CXX");

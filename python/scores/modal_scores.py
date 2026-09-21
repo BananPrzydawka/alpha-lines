@@ -19,10 +19,9 @@ app = modal.App("alphalines-score-demo")
 
 
 @app.function(image=score_image, volumes={"/outputs": volume}, gpu=resources["gpu"],
-              cpu=resources["cpus"], memory=resources["memory_gib"] * 1024,
               timeout=resources["timeout"])
 def run_training(options: dict):
-    from train_scores import train
+    from scores.train import train
 
     cache = Path("/outputs/score-demo-build")
     cache.mkdir(parents=True, exist_ok=True)
@@ -49,13 +48,17 @@ def run_training(options: dict):
 def main(batch: int = training["batch"], steps: int = training["steps"],
          lr: float = training["lr"], eval_every: int = training["eval_every"],
          validation_steps: int = training["validation_steps"], seed: int = training["seed"],
-         output: str = training["output"], seconds: float = training["seconds"]):
-    from train_scores import validate_options
+         output: str = training["output"], seconds: float = training["seconds"],
+         validation_batch: int = training["validation_batch"], model: str = "maia"):
+    from scores.train import validate_options, validate_model
 
-    validate_options(batch, steps, lr, eval_every, validation_steps, seed, seconds)
+    validate_model(model)
+
+    validate_options(batch, steps, lr, eval_every, validation_steps, seed, seconds, validation_batch)
     result = run_training.remote(dict(batch=batch, steps=steps, lr=lr, eval_every=eval_every,
-                                      validation_steps=validation_steps, seed=seed, seconds=seconds))
-    path = Path(output)
+                                      validation_steps=validation_steps, seed=seed, seconds=seconds,
+                                      validation_batch=validation_batch, model=model))
+    path = Path(output) / Path(result["remote_output"]).name
     path.mkdir(parents=True, exist_ok=True)
     (path / "results.json").write_text(json.dumps(result, indent=2) + "\n")
     remote_dir = Path(result["remote_output"]).relative_to("/outputs")

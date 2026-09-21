@@ -24,3 +24,5 @@ pub use game::{Game, Scratch, HEIGHT, HW, ROW, SQUARES, WIDTH};
 
 #[cfg(feature = "compiled-model")]
 pub mod inference;
+
+pub mod klent;

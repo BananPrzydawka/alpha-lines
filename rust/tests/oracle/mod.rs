@@ -1,5 +1,5 @@
 //! The oracle: a port of the old `main/game_kernels.py` (deleted in the Rust port;
-//! only `python/config.py`, `python/model.py`, `python/export_mcts.py`,
+//! only `python/config.py`, `python/models/resnet.py`, `python/export_mcts.py`,
 //! `python/modal_harness.py`, `python/modal_mcts.py` remain), used only by the tests.
 //!
 //! This is the reference the incremental engine is checked against. It lives in `tests/`

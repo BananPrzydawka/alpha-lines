@@ -17,3 +17,7 @@ cuda/out/
 
 # Rust build artifacts
 /rust/target/
+
+# Local training artifacts
+/checkpoints/
+*.pt.tmp

@@ -34,7 +34,7 @@ impl ScoreBatch {
     }
 }
 
-// Private-to-this-project C ABI, used by python/score_data.py. The Python wrapper
+// Private-to-this-project C ABI, used by python/scores/data.py. The Python wrapper
 // owns the handle and allocates contiguous CPU tensors of precisely these sizes.
 #[no_mangle]
 pub extern "C" fn score_batch_new(batch: usize, seed: u64) -> *mut ScoreBatch {

@@ -10,7 +10,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include "encode.h"
 
 namespace {
 thread_local std::string error;
@@ -18,7 +17,7 @@ std::mutex loader_mutex;
 struct Model {
     torch::inductor::AOTIModelPackageLoader loader;
     at::Device device;
-    at::Tensor boards, scores, planes;
+    at::Tensor boards, scores;
 #ifdef ALPHA_CUDA
     std::optional<c10::cuda::CUDAStream> stream;
 #endif
@@ -52,17 +51,6 @@ void* alpha_model_load(const char* path, size_t width, bool cuda) {
     }
     catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
-void* alpha_model_load_zeros(const char* path, size_t width, bool cuda) {
-    auto* m = static_cast<Model*>(alpha_model_load(path, width, cuda));
-    if (!m) return nullptr;
-    try {
-        m->planes = at::empty({static_cast<int64_t>(2 * width), 7, 10, 16},
-            at::TensorOptions().dtype(at::kBFloat16).device(at::kCPU)
-                .pinned_memory(cuda).memory_format(at::MemoryFormat::ChannelsLast));
-        m->planes.zero_(); // Prepare once, outside warmup and timing.
-        return m;
-    } catch (const std::exception& e) { error = e.what(); delete m; return nullptr; }
-}
 void alpha_model_free(void* model) { delete static_cast<Model*>(model); }
 int alpha_model_eval(void* model, const uint8_t* boards, const int32_t* scores,
                      float* priors, float* values) {
@@ -78,19 +66,10 @@ int alpha_model_eval(void* model, const uint8_t* boards, const int32_t* scores,
         }
 #endif
         const auto b = m.boards.size(0);
-        std::vector<at::Tensor> inputs;
-        if (m.planes.defined()) {
-            // Null boards are the model-only benchmark's prefilled zero-input mode.
-            // MCTS encodes directly into this worker's reusable pinned CPU buffer.
-            if (boards) encode_planes(boards, scores, b, m.planes.data_ptr<at::BFloat16>());
-            inputs = {m.planes.to(m.device, /*non_blocking=*/true)};
-        } else {
-            std::memcpy(m.boards.data_ptr(), boards, b * 80);
-            std::memcpy(m.scores.data_ptr(), scores, b * 2 * sizeof(int32_t));
-            inputs = {m.boards.to(m.device, /*non_blocking=*/true),
-                      m.scores.to(m.device, /*non_blocking=*/true)};
-        }
-        auto result = m.loader.run(inputs, stream_handle);
+        std::memcpy(m.boards.data_ptr(), boards, b * 80);
+        std::memcpy(m.scores.data_ptr(), scores, b * 2 * sizeof(int32_t));
+        auto result = m.loader.run({m.boards.to(m.device, /*non_blocking=*/true),
+                                    m.scores.to(m.device, /*non_blocking=*/true)}, stream_handle);
         TORCH_CHECK(result.size() == 2, "expected policy and value outputs");
         auto p = result[0].to(at::kCPU).contiguous();
         auto v = result[1].to(at::kCPU).contiguous();
