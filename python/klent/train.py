@@ -29,7 +29,7 @@ def validate(options):
         raise ValueError('test_games must be even for balanced sides')
     if options['train_minibatch'] % 2:
         raise ValueError('train_minibatch counts perspectives and must be even')
-    for key in ('alpha','beta','lambda','lr','weight_decay'):
+    for key in ('alpha','beta','lambda','lr','weight_decay','immediate_score_weight'):
         if not math.isfinite(options[key]) or options[key] < 0:
             raise ValueError(f'klent.{key} must be nonnegative and finite')
     if options['alpha']+options['beta'] <= 0 or options['lambda'] > 1 or options['lr'] <= 0:
@@ -62,17 +62,33 @@ def mark_class_loss(logits, target, valid):
     return (per_cell * occupied).sum() / occupied.sum().clamp_min(1)
 
 
-def restore_optimizer(optimizer, saved):
-    """Preserve existing AdamW moments when a new output head is appended."""
+def immediate_score_loss(logits, scores, valid):
+    """Cross-entropy for both perspective-relative scores; ignore padded rows."""
+    targets = scores.long()
+    per_player = F.cross_entropy(logits.float().flatten(0, 1),
+                                 targets.clamp(0, 80).flatten(), reduction='none')
+    per_row = per_player.reshape(-1, 2).mean(1)
+    return (per_row * valid).sum() / valid.sum().clamp_min(1)
+
+
+def restore_optimizer(optimizer, saved, saved_model, model):
+    """Restore moments by parameter name when heads are added or score input removed."""
     current = optimizer.state_dict()
     if len(saved['param_groups']) != len(current['param_groups']):
         raise ValueError('Checkpoint optimizer groups do not match the model')
+    old_ids = [key for group in saved['param_groups'] for key in group['params']]
+    old_names = list(saved_model)
+    new_ids = [key for group in current['param_groups'] for key in group['params']]
+    new_names = [name for name, _ in model.named_parameters()]
+    if len(old_ids) != len(old_names) or len(new_ids) != len(new_names):
+        raise ValueError('Checkpoint optimizer parameters cannot be matched to model weights')
+    old_by_name = dict(zip(old_names, old_ids))
+    for name, new_id in zip(new_names, new_ids):
+        old_id = old_by_name.get(name)
+        if old_id in saved['state']:
+            current['state'][new_id] = saved['state'][old_id]
     for old_group, new_group in zip(saved['param_groups'], current['param_groups']):
-        old_ids, new_ids = old_group['params'], new_group['params']
         new_group.update({k: v for k, v in old_group.items() if k != 'params'})
-        for old_id, new_id in zip(old_ids, new_ids):
-            if old_id in saved['state']:
-                current['state'][new_id] = saved['state'][old_id]
     optimizer.load_state_dict(current)
 
 
@@ -136,7 +152,10 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             raise ValueError('Resume requires an FP32 checkpoint')
         # Architecture must match the weights; runtime training settings are current.
         options['model'] = restored['options']['model']
-        settings[options['model']+'_model'] = dict(restored['model_config'])
+        model_key = options['model']+'_model'
+        model_config = dict(restored['model_config'])
+        model_config.setdefault('immediate_score_filters', settings[model_key]['immediate_score_filters'])
+        settings[model_key] = model_config
     options['cycles'] = cycles
     validate(options)
     if type(cycles) is not int or cycles < 0:
@@ -151,9 +170,9 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     optimizer = torch.optim.AdamW(model.parameters(),lr=options['lr'],weight_decay=options['weight_decay'])
     if restored is not None:
         missing, unexpected = model.load_state_dict(restored['model'], strict=False)
-        if any(not key.startswith('mark_class_head.') for key in unexpected) or any(not key.startswith('mark_class_head.') for key in missing):
+        if any(not key.startswith(('mark_class_head.', 'score_embed.')) for key in unexpected) or any(not key.startswith(('mark_class_head.', 'immediate_score_head.')) for key in missing):
             raise ValueError(f'Checkpoint model mismatch: missing={missing}, unexpected={unexpected}')
-        restore_optimizer(optimizer, restored['optimizer'])
+        restore_optimizer(optimizer, restored['optimizer'], restored['model'], model)
         # Loading AdamW also restores param-group settings: apply current config.
         for group in optimizer.param_groups:
             group['lr'] = options['lr']
@@ -175,10 +194,10 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     summaries = []
     history = ModelHistory()
 
-    def infer(net, boards, scores):
+    def infer(net, boards):
         with torch.no_grad(), torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
-            b,s = dev.transfer((boards,scores))
-            pi,q,_ = net(b.contiguous(memory_format=torch.channels_last),s)
+            b, = dev.transfer((boards,))
+            pi,q,_,_ = net(b.contiguous(memory_format=torch.channels_last))
             # Blocking CPU copies also prevent reuse of compiled output storage
             # before the native consumer finishes with the result.
             return (pi.flatten(1)[:,indices].float().cpu().contiguous(),
@@ -205,12 +224,12 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 output.emit(f"\nCycle {completed+1} / Self-play")
             arena_step += 1
             t = perf_counter()
-            boards,scores = arena.inputs()
+            boards,_ = arena.inputs()
             encoding_time = perf_counter()-t
             model.eval()
             torch.compiler.cudagraph_mark_step_begin()
             dev.sync(); t = perf_counter()
-            pi,q = infer(network,boards,scores)
+            pi,q = infer(network,boards)
             dev.sync(); model_ms = (perf_counter()-t)*1000
             model_time += model_ms/1000
             t = perf_counter()
@@ -230,7 +249,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             dev.sync(); training_start = perf_counter()
             history.remember(model)
             model.train()
-            loss_sum = policy_sum = value_sum = mark_sum = 0.0
+            loss_sum = policy_sum = value_sum = mark_sum = immediate_score_sum = 0.0
             scoring_processing_time = 0.0
             timing_sum = [0.0, 0.0, 0.0]
             for start in range(0,count,batch.rows//2):
@@ -249,10 +268,12 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 torch.compiler.cudagraph_mark_step_begin()
                 forward_start = dev.stamp()
                 with torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
-                    logits,values,mark_logits = network(b,s)
+                    logits,values,mark_logits,score_logits = network(b)
                     policy_loss,value_loss = losses(logits,values,target,actions,returns,valid)
                     mark_loss = mark_class_loss(mark_logits,class_target,valid) if use_mark_classes else None
+                    score_loss = immediate_score_loss(score_logits,s,valid)
                     loss = policy_loss+value_loss+(mark_loss if use_mark_classes else 0)
+                    loss = loss + options['immediate_score_weight'] * score_loss
                 forward_end = dev.stamp()
                 loss.backward()
                 backward_end = dev.stamp()
@@ -268,6 +289,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 value_sum += value_loss.item()*valid_positions
                 if use_mark_classes:
                     mark_sum += mark_loss.item()*valid_positions
+                immediate_score_sum += score_loss.item()*valid_positions
                 for j, (first, second) in enumerate(((forward_start,forward_end),
                         (forward_end,backward_end),(backward_end,optimizer_end))):
                     timing_sum[j] += dev.elapsed(first,second)
@@ -275,7 +297,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 f"  Forward {timing_sum[0]/batch_number:.3f} | Backward {timing_sum[1]/batch_number:.3f}"
                 f" | Optimizer {timing_sum[2]/batch_number:.3f}",
                 f"  Position-weighted loss {loss_sum/count:.4f} | Policy {policy_sum/count:.4f}"
-                f" | Q {value_sum/count:.4f} | Mark {mark_sum/count:.4f}")
+                f" | Q {value_sum/count:.4f} | Mark {mark_sum/count:.4f}"
+                f" | Score {immediate_score_sum/count:.4f} (weight {options['immediate_score_weight']:g})")
             arena.clear()
             dev.sync(); training_time = perf_counter()-training_start
             output.strength_header(options['test_games'])
@@ -293,8 +316,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                     while True:
                         b,s = test.inputs()
                         torch.compiler.cudagraph_mark_step_begin()
-                        p0,q0 = infer(previous,b[old_rows],s[old_rows])
-                        p1,q1 = infer(network,b[new_rows],s[new_rows])
+                        p0,q0 = infer(previous,b[old_rows])
+                        p1,q1 = infer(network,b[new_rows])
                         pi = torch.empty((2*test.n,80))
                         q = torch.empty_like(pi)
                         pi[old_rows], pi[new_rows] = p0, p1
@@ -323,7 +346,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                            mean_forward_ms=timing_sum[0]/batch_number,
                            mean_backward_ms=timing_sum[1]/batch_number,
                            mean_optimizer_ms=timing_sum[2]/batch_number,
-                           policy_loss=policy_sum/count,q_loss=value_sum/count,mark_class_loss=mark_sum/count)
+                           policy_loss=policy_sum/count,q_loss=value_sum/count,mark_class_loss=mark_sum/count,
+                           immediate_score_loss=immediate_score_sum/count)
             summary.update(timestamp=datetime.now(timezone.utc).isoformat(),
                            elapsed_seconds=perf_counter()-run_start,
                            win_rate=latest['win_rate'], score_rate=latest['score_rate'])

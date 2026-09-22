@@ -20,6 +20,7 @@
     "test_games": 1024,
     "optimizer": "adamw",
     "weight_decay": 0.01,
+    "immediate_score_weight": 0.1,
     "seed": 1,
     "model": "katago"
   },
@@ -27,10 +28,10 @@
     "filters": 128,
     "blocks": 8,
     "se_hidden": 32,
-    "score_embed_hidden": 128,
     "policy_filters": 64,
     "action_value_filters": 64,
     "mark_class_filters": 64,
+    "immediate_score_filters": 32,
     "group_norm": {
       "groups": 8,
       "eps": 1e-05,
@@ -41,10 +42,10 @@
     "filters": 128,
     "blocks": 8,
     "se_hidden": 32,
-    "score_embed_hidden": 128,
     "policy_filters": 64,
     "action_value_filters": 64,
     "mark_class_filters": 64,
+    "immediate_score_filters": 32,
     "group_norm": {
       "groups": 8,
       "eps": 1e-05,

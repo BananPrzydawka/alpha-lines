@@ -4,13 +4,14 @@ import io
 import json
 import unittest
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
 from config import settings
 from klent.native import Arena, Batch
-from klent.train import losses, run, validate, evaluation_rows, ModelHistory, mark_class_targets, mark_class_loss
+from klent.train import losses, run, validate, evaluation_rows, ModelHistory, mark_class_targets, mark_class_loss, immediate_score_loss, restore_optimizer
 
 LIBRARY = Path(__file__).resolve().parents[2]/'rust/target/release/libalpha_lines_game.so'
 
@@ -51,6 +52,17 @@ class KlentTests(unittest.TestCase):
         self.assertAlmostEqual(loss.item(),torch.tensor(6.).log().item())
         self.assertEqual(logits.grad[1].count_nonzero().item(),0)
         self.assertEqual(logits.grad[0,:,0,1].count_nonzero().item(),0)
+
+    def test_immediate_score_loss_both_players_and_padding(self):
+        logits = torch.zeros(3,2,81,requires_grad=True)
+        scores = torch.tensor([[0,80],[15,20],[80,80]])
+        valid = torch.tensor([1.,1.,0.])
+        loss = immediate_score_loss(logits,scores,valid)
+        self.assertAlmostEqual(loss.item(),torch.tensor(81.).log().item(),places=5)
+        loss.backward()
+        self.assertEqual(logits.grad[2].count_nonzero().item(),0)
+        self.assertLess(logits.grad[0,0,0].item(),0)
+        self.assertLess(logits.grad[0,1,80].item(),0)
 
     def test_native_batch_reproducibility_and_perspectives(self):
         with Arena(LIBRARY,self.options) as a, Arena(LIBRARY,self.options) as other:
@@ -96,7 +108,7 @@ class KlentTests(unittest.TestCase):
         for name in ('katago','resnet'):
             key = name+'_model'
             small = dict(settings[key],filters=8,blocks=1,se_hidden=4,
-                         score_embed_hidden=8,policy_filters=4,action_value_filters=4)
+                         policy_filters=4,action_value_filters=4)
             options = dict(self.options,model=name)
             with patch.dict(settings,{key:small}),contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
                 summaries = run(LIBRARY,options,cycles=2,device='cpu',compile_model=False)
@@ -108,6 +120,7 @@ class KlentTests(unittest.TestCase):
                 self.assertGreaterEqual(summary['shuffle_seconds'],0)
                 self.assertGreaterEqual(summary['scoring_head_processing_seconds'],0)
                 self.assertGreaterEqual(summary['mark_class_loss'],0)
+                self.assertGreater(summary['immediate_score_loss'],0)
 
     def test_history_is_independent_bounded_and_correctly_aged(self):
         model = torch.nn.Linear(1,1)
@@ -127,7 +140,7 @@ class KlentTests(unittest.TestCase):
 
     def test_33_cycles_evaluate_available_history(self):
         small = dict(settings['resnet_model'],filters=8,blocks=1,se_hidden=4,
-                     score_embed_hidden=8,policy_filters=4,action_value_filters=4)
+                     policy_filters=4,action_value_filters=4)
         with patch.dict(settings,{'resnet_model':small}),contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
             summaries = run(LIBRARY,dict(self.options,model='resnet'),
                             cycles=33,device='cpu',compile_model=False)
@@ -141,7 +154,7 @@ class KlentTests(unittest.TestCase):
     def test_resume_restores_architecture_but_uses_current_training_settings(self):
         from klent.checkpoint import save
         small = dict(settings['resnet_model'],filters=8,blocks=1,se_hidden=4,
-                     score_embed_hidden=8,policy_filters=4,action_value_filters=4)
+                     policy_filters=4,action_value_filters=4)
         with tempfile.TemporaryDirectory() as directory, patch.dict(settings,{'resnet_model':small}), contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
             def checkpoint(model,optimizer,options,summary):
                 save(directory,model,optimizer,options,summary)
@@ -191,23 +204,42 @@ class KlentTests(unittest.TestCase):
     def test_resume_adds_head_to_legacy_checkpoint(self):
         from models.resnet import ResNet
         small = dict(settings['resnet_model'],filters=8,blocks=1,se_hidden=4,
-                     score_embed_hidden=8,policy_filters=4,action_value_filters=4)
+                     policy_filters=4,action_value_filters=4)
         with tempfile.TemporaryDirectory() as directory, patch.dict(settings,{'resnet_model':small}), contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
-            legacy = ResNet(mark_classes=False)
-            optimizer = torch.optim.AdamW(legacy.parameters())
-            board = torch.zeros(2,5,10,16)
-            scores = torch.zeros(2,2)
-            pi,q,_ = legacy(board,scores)
-            (pi.square().mean()+q.square().mean()).backward()
-            optimizer.step()
-            path = Path(directory)/'legacy.pt'
-            torch.save(dict(format_version=1,model=legacy.state_dict(),optimizer=optimizer.state_dict(),
-                            options=dict(self.options,model='resnet'),model_config=small,
-                            summary=dict(cycle=1),torch_rng=torch.get_rng_state(),cuda_rng=[]),path)
-            results = run(LIBRARY,dict(self.options,model='resnet'),cycles=1,
-                          device='cpu',compile_model=False,resume=path)
-            self.assertEqual(results[0]['cycle'],2)
-            self.assertGreater(results[0]['mark_class_loss'],0)
+            for has_mark_head in (False, True):
+                with self.subTest(has_mark_head=has_mark_head):
+                    legacy = ResNet(mark_classes=has_mark_head)
+                    legacy.score_embed = torch.nn.Sequential(torch.nn.Linear(2,8),torch.nn.SiLU(),torch.nn.Linear(8,8))
+                    modules = list(legacy._modules.items())
+                    legacy._modules = OrderedDict(modules[:2]+[modules[-1]]+modules[2:-1])
+                    optimizer = torch.optim.AdamW(p for name,p in legacy.named_parameters()
+                                                   if not name.startswith('immediate_score_head.'))
+                    board = torch.zeros(2,5,10,16)
+                    scores = torch.zeros(2,2)
+                    pi,q,mark,_ = legacy(board)
+                    loss = pi.square().mean()+q.square().mean()+legacy.score_embed(scores).square().mean()
+                    if mark is not None:
+                        loss = loss+mark.square().mean()
+                    loss.backward()
+                    optimizer.step()
+                    path = Path(directory)/f'legacy-{has_mark_head}.pt'
+                    old_weights = {k:v for k,v in legacy.state_dict().items()
+                                   if not k.startswith('immediate_score_head.')}
+                    current = ResNet(mark_classes=True)
+                    current.load_state_dict(old_weights,strict=False)
+                    migrated = torch.optim.AdamW(current.parameters())
+                    restore_optimizer(migrated,optimizer.state_dict(),old_weights,current)
+                    old_tower = dict(legacy.named_parameters())['tower.0.conv1.weight']
+                    new_tower = dict(current.named_parameters())['tower.0.conv1.weight']
+                    torch.testing.assert_close(migrated.state[new_tower]['exp_avg'],optimizer.state[old_tower]['exp_avg'])
+                    torch.save(dict(format_version=1,model=old_weights,optimizer=optimizer.state_dict(),
+                                    options=dict(self.options,model='resnet'),model_config=small,
+                                    summary=dict(cycle=1),torch_rng=torch.get_rng_state(),cuda_rng=[]),path)
+                    results = run(LIBRARY,dict(self.options,model='resnet'),cycles=1,
+                                  device='cpu',compile_model=False,resume=path)
+                    self.assertEqual(results[0]['cycle'],2)
+                    self.assertGreater(results[0]['mark_class_loss'],0)
+                    self.assertGreater(results[0]['immediate_score_loss'],0)
 
     def test_balanced_assignment(self):
         old,new = evaluation_rows(8)

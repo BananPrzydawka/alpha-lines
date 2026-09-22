@@ -16,8 +16,8 @@ board_size = height * width
 
 for name in ("resnet_model", "katago_model"):
     options = settings[name]
-    for key in ("filters", "blocks", "se_hidden", "score_embed_hidden",
-                "policy_filters", "action_value_filters"):
+    for key in ("filters", "blocks", "se_hidden",
+                "policy_filters", "action_value_filters", "immediate_score_filters"):
         if type(options[key]) is not int or options[key] < 1:
             raise ValueError(f"{name}.{key} must be a positive integer")
     norm = options["group_norm"]

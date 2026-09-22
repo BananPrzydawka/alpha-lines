@@ -1,9 +1,9 @@
-"""Score-conditioned ResNet with spatial policy logits and action values."""
+"""ResNet with shared spatial policy, action-value, mark and score heads."""
 import torch.nn as nn
 import torch.nn.functional as F
 
 from config import settings
-from models.common import group_norm, spatial_head, score_embedding, prepare_inputs
+from models.common import group_norm, spatial_head, immediate_score_head, prepare_inputs
 
 
 class se_block(nn.Module):
@@ -42,10 +42,9 @@ class res_block(nn.Module):
         return self.silu(out)
 
 class ResNet(nn.Module):
-    """forward(board, scores) -> policy, action values, mark classes (B, 6, 10, 16).
+    """forward(board) -> policy, action values, mark classes, current scores (B, 2, 81).
 
-    Scores are raw values in [0, 80], ordered current player then opponent;
-    board player planes must use the same perspective. Outputs are unbounded.
+    Score logits are ordered current player then opponent. Outputs are unbounded.
     """
     def __init__(self, mark_classes=True):
         super().__init__()
@@ -54,7 +53,6 @@ class ResNet(nn.Module):
         norm = options["group_norm"]
         self.conv_input = nn.Conv2d(5, channels, 3, padding=1, bias=False)
         self.norm_input = group_norm(channels, norm)
-        self.score_embed = score_embedding(channels, options["score_embed_hidden"])
         self.tower = nn.Sequential(*(
             res_block(channels, options["se_hidden"], norm)
             for _ in range(options["blocks"])
@@ -63,12 +61,13 @@ class ResNet(nn.Module):
         self.action_value_head = spatial_head(channels, options["action_value_filters"], norm)
         self.mark_class_head = (spatial_head(channels, options.get("mark_class_filters", options["action_value_filters"]), norm, 6)
                                 if mark_classes else None)
+        self.immediate_score_head = immediate_score_head(channels, options.get("immediate_score_filters", 32), norm)
 
-    def forward(self, board, scores):
-        board, scores = prepare_inputs(board, scores)
-        features = self.norm_input(self.conv_input(board))
-        features = F.silu(features + self.score_embed(scores)[:, :, None, None])
+    def forward(self, board):
+        board = prepare_inputs(board)
+        features = F.silu(self.norm_input(self.conv_input(board)))
         features = self.tower(features)
         return (self.policy_head(features).squeeze(1),
                 self.action_value_head(features).squeeze(1),
-                self.mark_class_head(features) if self.mark_class_head is not None else None)
+                self.mark_class_head(features) if self.mark_class_head is not None else None,
+                self.immediate_score_head(features).reshape(-1, 2, 81))

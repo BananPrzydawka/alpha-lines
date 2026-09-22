@@ -1,4 +1,4 @@
-"""Contracts and score conditioning for spatial action models."""
+"""Contracts for spatial action models and their shared score head."""
 import copy
 import unittest
 from unittest.mock import patch
@@ -15,34 +15,34 @@ class ActionModelTests(unittest.TestCase):
         torch.set_num_threads(1)
         torch.manual_seed(7)
 
-    def test_outputs_conditioning_gradients_and_compile(self):
+    def test_outputs_shared_gradients_and_compile(self):
         for model_class in (ResNet, KataGoNet):
             with self.subTest(model=model_class.__name__):
                 net = model_class()
                 board = torch.randn(2, 5, 10, 16)
-                scores = torch.tensor([[0, 80], [41, 40]])
-                outputs = net(board, scores)
-                changed = net(board, scores.flip(1))
-                for i, (output, other) in enumerate(zip(outputs, changed)):
-                    self.assertEqual(output.shape, (2, 6, 10, 16) if i == 2 else (2, 10, 16))
+                outputs = net(board)
+                for i, output in enumerate(outputs):
+                    self.assertEqual(output.shape, [(2, 10, 16), (2, 10, 16),
+                                                    (2, 6, 10, 16), (2, 2, 81)][i])
                     self.assertTrue(torch.isfinite(output).all())
-                    self.assertFalse(torch.allclose(output, other))
                 sum(x.square().mean() for x in outputs).backward()
                 for name, parameter in net.named_parameters():
                     self.assertIsNotNone(parameter.grad, name)
                     self.assertTrue(torch.isfinite(parameter.grad).all(), name)
-                self.assertGreater(net.score_embed[0].weight.grad.abs().sum(), 0)
+                net.zero_grad(set_to_none=True)
+                net(board)[3].square().mean().backward()
+                self.assertGreater(next(net.tower.parameters()).grad.abs().sum(), 0)
                 net.eval()
-                alone = net(board[0], scores[0])
+                alone = net(board[0])
                 for full, single in zip(outputs, alone):
                     torch.testing.assert_close(full[:1], single, atol=1e-5, rtol=1e-4)
                 compiled = torch.compile(net, backend="aot_eager", fullgraph=True)
-                for actual, expected in zip(compiled(board, scores), outputs):
+                for actual, expected in zip(compiled(board), outputs):
                     torch.testing.assert_close(actual, expected)
-                bf16 = net.to(torch.bfloat16)(board.to(torch.bfloat16), scores)
+                bf16 = net.to(torch.bfloat16)(board.to(torch.bfloat16))
                 self.assertTrue(all(x.dtype == torch.bfloat16 for x in bf16))
-                with self.assertRaisesRegex(ValueError, "scores must"):
-                    net(board, scores[:1])
+                with self.assertRaisesRegex(ValueError, "board must"):
+                    net(board[:, :4])
 
     def test_independent_configuration(self):
         baseline = copy.deepcopy(settings)
@@ -52,7 +52,7 @@ class ActionModelTests(unittest.TestCase):
         ):
             original_other = sum(p.numel() for p in other_class().parameters())
             options = copy.deepcopy(baseline[key])
-            options.update(filters=16, blocks=1, score_embed_hidden=7,
+            options.update(filters=16, blocks=1,
                            policy_filters=8, action_value_filters=4)
             options['group_norm']['groups'] = 2
             with patch.dict(settings, {key: options}):

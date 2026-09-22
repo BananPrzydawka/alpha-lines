@@ -83,6 +83,15 @@ existing weights and AdamW moments. To compile out mark classification and its
 storage, set `TRACK_MARK_CLASSES` to `false` in `rust/src/game.rs` and rebuild Rust;
 training detects this and omits the head and auxiliary loss.
 
+The immediate-score head predicts both current scores as 81-way logits (0–80),
+ordered current player then opponent. It reads the final shared residual-tower
+features alongside the policy, action-value and mark heads. The model receives
+only board planes; scores stored with each self-play position are training
+targets, not model inputs. Cross-entropy averaged over both players joins the
+loss with `klent.immediate_score_weight` (default 0.1). On resume from older
+FP32 checkpoints, the obsolete score-input embedding is discarded while
+shared weights and their AdamW moments are retained.
+
 After dependency setup, local training can also run directly:
 
 ```sh
