@@ -110,9 +110,16 @@ class KlentTests(unittest.TestCase):
             small = dict(settings[key],filters=8,blocks=1,se_hidden=4,
                          policy_filters=4,action_value_filters=4)
             options = dict(self.options,model=name)
-            with patch.dict(settings,{key:small}),contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
+            report = io.StringIO()
+            with patch.dict(settings,{key:small}),contextlib.redirect_stdout(report), torch.backends.mkldnn.flags(enabled=False):
                 summaries = run(LIBRARY,options,cycles=2,device='cpu',compile_model=False)
             self.assertEqual(len(summaries),2)
+            self.assertEqual(report.getvalue().count(' complete\n'),2)
+            for label in ('Policy', 'Q', 'Mark', 'Score head'):
+                self.assertEqual(report.getvalue().count(f'    {label} '),2)
+            for removed in (' / Self-play', 'Training / ', 'Position-weighted loss',
+                            'Strength test / ', 'Mean over '):
+                self.assertNotIn(removed,report.getvalue())
             for summary in summaries:
                 self.assertEqual(sum(summary[k] for k in ('wins','draws','losses')),4)
                 self.assertGreater(summary['states'],0)
@@ -121,6 +128,9 @@ class KlentTests(unittest.TestCase):
                 self.assertGreaterEqual(summary['scoring_head_processing_seconds'],0)
                 self.assertGreaterEqual(summary['mark_class_loss'],0)
                 self.assertGreater(summary['immediate_score_loss'],0)
+                self.assertAlmostEqual(summary['loss'],
+                    summary['policy_loss']+summary['q_loss']+summary['mark_class_loss']+
+                    summary['immediate_score_weight']*summary['immediate_score_loss'],places=4)
 
     def test_history_is_independent_bounded_and_correctly_aged(self):
         model = torch.nn.Linear(1,1)

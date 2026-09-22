@@ -220,8 +220,6 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
         model_time = cpu_time = 0.0
         arena_step = 0
         while cycles == 0 or completed < stop_cycle:
-            if arena_step == 0:
-                output.emit(f"\nCycle {completed+1} / Self-play")
             arena_step += 1
             t = perf_counter()
             boards,_ = arena.inputs()
@@ -244,8 +242,6 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             processing_start = perf_counter()
             arena.shuffle()
             shuffle_time = perf_counter()-processing_start
-            output.emit(f"  Mean over {arena_step:,} steps: CPU {cpu_time*1000/arena_step:.3f} ms | Model {model_time*1000/arena_step:.3f} ms")
-            output.training_header(count, dropped)
             dev.sync(); training_start = perf_counter()
             history.remember(model)
             model.train()
@@ -293,15 +289,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 for j, (first, second) in enumerate(((forward_start,forward_end),
                         (forward_end,backward_end),(backward_end,optimizer_end))):
                     timing_sum[j] += dev.elapsed(first,second)
-            output.emit(f"  Mean over {batch_number:,} batches (ms)",
-                f"  Forward {timing_sum[0]/batch_number:.3f} | Backward {timing_sum[1]/batch_number:.3f}"
-                f" | Optimizer {timing_sum[2]/batch_number:.3f}",
-                f"  Position-weighted loss {loss_sum/count:.4f} | Policy {policy_sum/count:.4f}"
-                f" | Q {value_sum/count:.4f} | Mark {mark_sum/count:.4f}"
-                f" | Score {immediate_score_sum/count:.4f} (weight {options['immediate_score_weight']:g})")
             arena.clear()
             dev.sync(); training_time = perf_counter()-training_start
-            output.strength_header(options['test_games'])
             test_start = perf_counter()
             model.eval()
             evaluations = []
@@ -347,7 +336,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                            mean_backward_ms=timing_sum[1]/batch_number,
                            mean_optimizer_ms=timing_sum[2]/batch_number,
                            policy_loss=policy_sum/count,q_loss=value_sum/count,mark_class_loss=mark_sum/count,
-                           immediate_score_loss=immediate_score_sum/count)
+                           immediate_score_loss=immediate_score_sum/count,
+                           immediate_score_weight=options['immediate_score_weight'])
             summary.update(timestamp=datetime.now(timezone.utc).isoformat(),
                            elapsed_seconds=perf_counter()-run_start,
                            win_rate=latest['win_rate'], score_rate=latest['score_rate'])

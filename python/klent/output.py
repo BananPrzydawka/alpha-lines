@@ -17,19 +17,16 @@ def setup(options, device, compiled):
         emit('  Timings include compilation/autotuning on first use.')
 
 
-def training_header(count, dropped):
-    emit('', f'Training / {count:,} positions / {dropped:,} unfinished positions dropped')
-
-
-def strength_header(games):
-    emit('', f'Strength test / {games:,} games per opponent / equal games on each side / policy sampling')
-
-
 def summary(row):
     emit('', f"Cycle {row['cycle']} complete", '-'*43,
          f"  Positions     {row['states']:>12,}",
          f"  Dropped       {row['dropped_states']:>12,}",
-         f"  Mean loss     {row['loss']:>12.4f}", '')
+         f"  Mean loss     {row['loss']:>12.4f}",
+         f"    Policy      {row['policy_loss']:>12.4f}",
+         f"    Q           {row['q_loss']:>12.4f}",
+         f"    Mark        {row['mark_class_loss']:>12.4f}",
+         f"    Score head  {row['immediate_score_loss']:>12.4f} × {row['immediate_score_weight']:g}"
+         f" = {row['immediate_score_loss']*row['immediate_score_weight']:.4f}", '')
     for label, key in [('Model','model_seconds'), ('CPU','cpu_seconds'),
                        ('Shuffle','shuffle_seconds'),
                        ('Scoring head processing','scoring_head_processing_seconds'),
