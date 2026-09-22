@@ -1,24 +1,16 @@
-# Python
+# personal project notes
+notes
+
+# Python and local environment
 __pycache__/
 *.py[cod]
 .venv/
 
-# Numba cache
-*.nbc
-*.nbi
-
-# Profiling output / logs
-logs/
-
-# Model checkpoints
-*.pt
-cuda/build/
-cuda/out/
-
-# Rust build artifacts
+# Build artifacts
 /rust/target/
 
-# Local training artifacts
-/checkpoints/klent/*
-!/checkpoints/cycle-000166.pt
+# Training outputs stay local; only the manually selected input ships.
+/logs/
+*.pt
 *.pt.tmp
+!/checkpoints/resume.pt

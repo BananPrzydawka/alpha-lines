@@ -6,7 +6,7 @@ import modal
 project_dir = Path(__file__).resolve().parent.parent
 volume = modal.Volume.from_name("alphalines", create_if_missing=True)
 base_image = (
-    # The native loader and AOTInductor export compile against CUDA headers.
+    # CUDA runtime and compiler for torch.compile training.
     modal.Image.from_registry("nvidia/cuda:13.0.0-devel-ubuntu22.04", add_python="3.13")
     # rustup uses curl when provisioning the cached remote Rust toolchain.
     .apt_install("curl")

@@ -1,254 +1,109 @@
-# Alpha Lines
+# Alpha-lines
 
-Rust implements the game engine and MCTS. Python provides the model, native
-inference export, and a score-learning demo on Modal.
+KLENT self-play training with a Rust game engine and PyTorch KataGo/ResNet models.
+Local/Verda training and Modal are supported.
 
-## KLENT training on a rented GPU
+## Checkpoints and logs
 
-For Ubuntu GPU boxes over SSH, run `./scripts/train_verda.sh` after cloning.
-It completes setup and resumes the latest checkpoint in the current terminal.
-Set additional cycles in `config.json` (`klent.cycles`). The seed checkpoint
-`checkpoints/cycle-000166.pt` ships in Git; new checkpoints and metrics stay local.
-See [KLENT instructions](python/klent/README.md) for fresh runs, checkpointing,
-historical evaluation and benchmarking.
+- `checkpoints/resume.pt`: the **manually selected FP32 input**, the only checkpoint tracked by Git. Move or copy your chosen checkpoint here before committing. It is never automatically selected or replaced.
+- `checkpoints/klent/<run-id>/cycle-XXXXXX.pt`: generated checkpoints, kept locally and ignored by Git.
+- `checkpoints/klent/bf16/`: older BF16 checkpoints, kept locally and excluded from result downloads.
+- `logs/klent/<run-id>/`: `console.log` (Verda), `run.json` and `metrics.jsonl`, ignored by Git.
 
-## Setup on Fedora
+Each invocation creates a separate run. Repeating the Verda command starts another
+experiment from the same `resume.pt`, even when newer outputs exist.
+To change the starting point, replace `resume.pt` yourself. For example:
 
-```bash
-sudo dnf install uv rust cargo gcc gcc-c++
-uv python install 3.13
-uv sync --locked --managed-python
-uv run modal token new
+```sh
+cp checkpoints/klent/RUN_ID/cycle-XXXXXX.pt checkpoints/resume.pt
 ```
 
-## Configuration
+## Verda workflow
 
-Edit `config.json` at the repository root. It contains the board dimensions,
-model architecture, MCTS defaults, and Modal resources.
-`python/config.py` only loads this file. Rust's build script reads the same file
-and generates constants; Cargo rebuilds them whenever the file changes. Run via
-Cargo after editing configuration, rather than running an old compiled binary.
+Edit `config.json` and select `checkpoints/resume.pt`, then publish locally:
 
-The current engine and model encoder support only a 10×16 board. Both config
-readers reject other dimensions. MCTS node capacity defaults to
-`g * s * node_capacity_factor`.
-
-## Model inference
-
-`python/export_mcts.py` is currently disabled: the native MCTS contract needs
-updating for spatial action values. The commands below describe the previous
-export workflow. The optional Rust `compiled-model` feature loads packages
-through the native inference bridge.
-
-```bash
-uv run python python/export_mcts.py --batch 2048 --output model.pt2
+```sh
+git add .
+git commit -m "commit"
+git push origin HEAD:main
 ```
 
-Export on the GPU used for inference. `--batch` counts positions; the model
-processes two player perspectives per position. `--seed` defaults to 1 and
-`--device` to CUDA. CPU export is available for smoke checks.
+On the rented Ubuntu GPU machine (with a working CUDA 13-compatible NVIDIA driver):
 
-`python/modal_image.py` defines the shared CUDA image and output volume. Local
-direct dependencies are Modal, PyTorch, torchinfo, and NumPy.
-
-Print layer shapes, parameter counts, multiply-adds, and estimated parameter and
-forward/backward memory using the current `config.json`:
-
-```bash
-uv run python python/model_summary.py resnet
-uv run python python/model_summary.py maia --batch 32
-uv run python python/model_summary.py katago --depth 2
+```sh
+apt-get update &&
+apt-get install -y git &&
+git clone https://github.com/BananPrzydawka/alpha-lines ~/projects/alpha-lines &&
+cd ~/projects/alpha-lines &&
+./scripts/train_verda.sh
 ```
 
-Summaries run on CPU with BF16 weights and inputs. Memory figures are estimates, not measured peak
-usage; functional operations such as attention are not fully accounted for.
+The launcher installs dependencies, builds Rust, and trains in the foreground.
+Keep SSH connected. On an existing checkout, run `git pull --ff-only origin main`
+before launching a new experiment.
 
-The core Rust engine can be built without local PyTorch or CUDA:
+Download results **from your local project directory**, before deleting the box:
 
-```bash
-cargo build --manifest-path rust/Cargo.toml
+```sh
+./scripts/pull_verda.sh --ip BOX_IP
 ```
 
-The build-time JSON parser is a Cargo dependency, not a runtime engine dependency.
+This merges runs directly into local `checkpoints/klent/` and `logs/`, excludes the
+remote input checkpoint, and never replaces your selected `resume.pt`. Rerun to
+continue a transfer. The script works from any working directory, skips unfinished
+checkpoint files and the local BF16 archive, and does not delete local files.
+It connects as `root` to `/root/projects/alpha-lines/` on the box.
 
-## Current-board score learning demo
+## Training configuration and resume
 
-```bash
-PYTHONPATH=python uv run modal run -m scores.modal_scores
-# Short GPU smoke run:
-PYTHONPATH=python uv run modal run -m scores.modal_scores --batch 32 --steps 10 --eval-every 5 --validation-steps 64
+`klent.cycles` is the number of **additional** cycles (0 runs until stopped).
+Current `klent` settings control self-play, buffer size, minibatches, evaluation,
+learning rate, weight decay, alpha/beta/lambda and seed. Checkpoints supply model
+type, architecture, FP32 weights, AdamW state and completed cycle number.
+An unchanged seed restores torch RNG state; changing it reseeds torch.
+BF16-only legacy checkpoints are unsupported. Training retains BF16 autocast
+with FP32 weights, optimizer moments and losses.
+
+Snapshots are saved atomically after complete cycles. Native games and opponent
+history are rebuilt on resume, so restarting is not an exact replay.
+Evaluation compares against process-local snapshots aged 1, 2, 4 and 8 cycles
+when available, with balanced player assignments. `test_games` must be even.
+Metrics record losses, W/D/L, historical matchups, counts and timings; `run.json`
+records the effective configuration, precision, hardware and resume source.
+
+After dependency setup, local training can also run directly:
+
+```sh
+./scripts/train_local.sh --resume checkpoints/resume.pt
 ```
 
-Defaults live in `config.json` under `score_training`; Modal GPU, CPU, memory and
-timeout use the existing `modal` section. `batch` is the number of boards, and
-`steps` is an optional upper limit on optimizer updates (default 100,000).
-The default run uses 256 boards and a 300-second budget, adjustable with
-`--seconds`. The timer starts before initial evaluation and includes compilation,
-validation, and reporting. Artifacts are saved once after training finishes. No new update starts after the deadline; an
-in-flight update and final evaluation/save may finish afterward. Provisioning,
-Rust build, data setup and local downloads are outside this budget.
-The demo trains from fresh random weights.
+Omit `--resume` to train from scratch. Optional `--checkpoint-dir` and `--log-dir`
+set output paths. KataGo and ResNet have independent model settings in `config.json`.
 
-`rust/src/score_batch.rs` owns a vector of games, one RNG and one scratch buffer.
-Each call independently samples both players' legal moves uniformly from the
-same pre-move board, applies the simultaneous move, and returns the resulting
-cells and exact current scores. The engine's opening half-board restriction and
-collisions apply normally. Terminal boards are trained on once; their slots
-restart on the next call. Initial empty boards are omitted. There is no arena,
-search, replay buffer, data-loader worker or game-generation thread. A small C
-ABI writes directly into reusable PyTorch CPU tensors through `ctypes`.
+## Modal
 
-The score-prediction harness now supports only `models.maia.MaiaNet()`.
-It takes five planes (unplayable, empty, removed, player 0 marks, player 1 marks)
-and returns `[batch, 2, 81]` score logits. Scores are targets, never inputs to Maia.
-ResNet and KataGo use the action-model interface described below.
-
-Training creates two examples per position: original and player-swapped.
-Player swapping exchanges the two mark planes and reverses the score targets;
-boards are never rotated. Each output predicts the score of the player in its
-mark plane. With 256 game slots, the training model batch is 512 examples,
-matching the pre-rotation experiment, with one loss averaged over all 1,024 score
-predictions and one optimizer update. The logged `boards` counts original
-positions; saved metrics also record `examples`, which is twice that count.
-Validation keeps the original player order and original positions for comparison
-with earlier runs; it does not average predictions from two perspectives.
-
-Every step performs forward, cross-entropy averaged over both players and all
-boards, backward, and one AdamW update. CUDA uses BF16 autocast with FP32 weights.
-On CUDA the model uses `torch.compile(mode="default", fullgraph=True,
-dynamic=False)`, without max autotune. The first validation and training calls
-include compilation time; CPU smoke checks stay eager. Checkpoints retain the
-original model's parameter names.
-Validation uses fixed random trajectories from a separate seed, without gradient
-updates. A separate batch of 256 games advances 64 times, retaining every
-post-move board (16,384 positions). Finished slots restart independently; the
-set is not explicitly balanced by stage. `--validation-batch` and
-`--validation-steps` control these dimensions independently of training.
-Validation positions receive no augmentation. It reports loss, each player's exact-score accuracy and argmax mean
-absolute error, and an always-zero baseline. Validation is recorded before
-training and every `eval_every` updates, including the last update. The default
-64 validation steps cover full games and restarts; very short validation runs
-mostly measure low-scoring opening positions. Fixed validation allows comparison
-over time, but repeated tuning against it would require a fresh test set.
-
-Modal saves `metrics.csv`, `results.json`, and `checkpoint.pt` to a unique
-`score-demo/<run-id>` directory in the `alphalines` volume and commits once at the end of training. The checkpoint includes model and optimizer states, config,
-step and input/output conventions; it does not include game/RNG state for exact
-resumption. The entrypoint downloads the final `checkpoint.pt` and `metrics.csv` and saves
-returned metrics in `results.json`, all under `logs/score-symmetry/<run-id>/`.
-`--output` changes the parent directory; every run gets a unique subdirectory
-so repeated invocations preserve previous results.
-Console reports show the learning curve as it
-runs. Improvement on held-out games must be measured; the smoke tests only check
-correctness and that the model can fit a small fixed batch.
-
-Local CPU checks (no Modal GPU required):
-
-```bash
-cargo test --manifest-path rust/Cargo.toml score_batch --lib
-cargo build --manifest-path rust/Cargo.toml --release --lib
-PYTHONPATH=python uv run python -m unittest discover -s python -p test_scores.py
+```sh
+PYTHONPATH=python uv run modal run -m klent.modal_train
 ```
 
-## Compare validation loss over time
+This starts a fresh run using the configured Modal GPU and timeout. Add `--smoke`
+for small batches. Checkpoints and metrics persist under
+`/checkpoints/klent/<run-id>/` on the `alphalines` Modal volume; each completed
+checkpoint is committed to the volume.
 
-```bash
-uv run --script python/scores/plot.py
-# Or choose a run collection and output format:
-uv run --script python/scores/plot.py logs/score-symmetry --output /tmp/comparison.svg
+## Project and checks
+
+- `python/klent/`: training, native bindings, checkpointing, logging and Modal entrypoint.
+- `python/models/`: KataGo/ResNet and shared layers.
+- `rust/src/`: game engine and KLENT arena.
+- `rust/tests/`: independent game parity tests; KLENT unit tests also live in Rust source.
+- `scripts/`: GPU setup, local/Verda launchers and result downloads.
+
+```sh
+cargo test --locked --manifest-path rust/Cargo.toml
+cargo build --release --locked --manifest-path rust/Cargo.toml
+PYTHONPATH=python uv run --no-sync python -m unittest klent.test_klent models.test_models
 ```
 
-The standalone script installs its plotting dependencies through uv, recursively
-finds runs, and overlays their validation losses against elapsed seconds. It
-prefers `results.json`, falling back to `metrics.csv` when JSON is absent, so a
-run with both files is plotted once. Run labels are relative directory names.
-It saves `logs/score-symmetry/validation-loss.png` by default; an empty collection
-produces a graph marked "No saved runs yet". Rerun after downloads to update it.
-Use `--log-y` to inspect losses when large early spikes compress the later curves.
-
-### Maia-style alternative for score experiments
-
-Run `PYTHONPATH=python uv run modal run -m scores.modal_scores --model maia` to select the
-model in `python/models/maia.py`; `maia` is the default and only supported score model.
-It uses the configured training batch, player-perspective duplication, validation
-positions, optimizer, and time budget. The chosen architecture is saved in run
-options and checkpoints. Training hyperparameters remain your configured values,
-not the paper's human-imitation learning-rate schedule.
-
-`config.json` → `maia_model` controls the Maia-3 small-model adaptation:
-configurable encoder depth, width 192, 6 attention heads of dimension 32, MLP expansion 2,
-and pooled GAB with hidden/template dimensions 64. It uses only the 80 playable
-squares, in fixed board order, without history or rating embeddings. Every layer
-mixes a shared bank of learned 80×80 attention-bias templates using coefficients
-generated from its mean-pooled board representation. Pre-LayerNorm residuals,
-GELU MLPs, and no dropout are implementation choices where the supplied paper
-leaves details unspecified. There is no additional absolute or relative encoding.
-
-Score mode returns `(batch, 2, 81)` score logits. Its score head applies
-LayerNorm and a shared projection to 32 features per square, then flattens the
-80 square representations into a 256-unit GELU MLP. Configure these widths with
-`maia_model.score_head.square_features` and `hidden_dim`. Policy/value head definitions and their forward operations are commented out
-in `models/maia.py`; the active model has only a score head and five input planes.
-Maia retains its existing optional `apply_softmax` argument.
-
-Run `PYTHONPATH=python .venv/bin/python -m unittest discover -s python/scores -p test_maia.py`
-for the alternative model's CPU checks, after building the Rust library.
-
-### Python layout
-
-- `python/models/resnet.py`: score-conditioned ResNet with spatial policy and action-value heads.
-- `python/models/maia.py`: Maia score model with unused heads commented out.
-- `python/scores/`: data generation bridge, training, Modal entrypoint, plotting, and tests.
-- `python/config.py`, `modal_image.py`, and `export_mcts.py`: shared setup and native export.
-
-Run all score checks with
-`PYTHONPATH=python .venv/bin/python -m unittest discover -s python/scores -p 'test_*.py'`.
-
-Score progress lines show total milliseconds in each phase since the previous
-report (since startup at step zero), without dividing by update count. Saved results also retain cumulative
-seconds. Phase times: `cpu` covers
-training data generation, transfers, encoding, and perspective duplication;
-`model` covers training forward/loss/backward and optimizer updates; `log`
-covers validation and reporting. Final artifact writes and the volume commit are
-outside the reported phase timings. Compilation
-is charged to the phase that triggers it. CUDA is synchronized at phase boundaries
-for accurate attribution, which can add overhead. Each snapshot includes its
-validation time; its own terminal output appears in the next snapshot. Initial setup remains outside the training budget.
-MAE metrics remain in saved results but are omitted from the terminal line.
-
-### ResNet and KataGo action models
-
-Each network has fully separate settings: `resnet_model`, `katago_model`, and
-`maia_model`. The convolutional networks independently configure `filters`,
-`blocks`, `se_hidden`, `score_embed_hidden`, `policy_filters`,
-`action_value_filters`, and `group_norm` (`groups`, `eps`, `affine`).
-GroupNorm uses `gcd(groups, channels)` groups.
-
-```python
-policy_logits, action_values = net(board, scores)
-```
-
-`board` has shape `(batch, 5, 10, 16)`, and `scores` has shape `(batch, 2)`
-with raw scores from 0 to 80 ordered current player, opponent. The board's
-player mark planes must use the same order. An unbatched board and score pair
-are also accepted and produce a batch of one.
-
-Scores are divided by 80 and passed through Linear → SiLU → Linear.
-The resulting channel embedding is broadcast-added after the initial convolution
-and GroupNorm, before SiLU. Both heads use 1×1 convolution → GroupNorm → SiLU
-→ 1×1 convolution and return `(batch, 10, 16)`. Policy logits have no softmax;
-action values have no output activation. Legal-action masking belongs to the caller.
-There are no other heads in these two models. Old score-head checkpoints are incompatible.
-
-KataGo's outer blocks project to half width, apply two two-convolution inner
-residual blocks, project back, apply SE, and add the outer skip. This is a
-KataGo-inspired adaptation using GroupNorm and SiLU. Its settings are independent
-of ResNet, including normalization and head widths.
-
-The score-training harness is reserved for Maia. Native MCTS export remains
-inactive because the Rust interface expects scalar state values and needs updating
-for spatial action values. Summary and inference benchmark tools support all three
-networks with their respective input and output formats.
-
-Run action-model checks with
-`PYTHONPATH=python .venv/bin/python -m unittest discover -s python/models -p 'test_*.py'`.
+The Python suite exercises CPU training, checkpoint resume, current-setting
+overrides, model contracts and historical evaluation without needing a GPU.

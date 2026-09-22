@@ -1,12 +1,10 @@
 [project]
 name = "alpha-lines"
 version = "0.1.0"
-description = "Add your description here"
+description = "KLENT self-play training for alpha-lines"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "modal>=1.5.1",
-    "numpy>=2.5.3",
     "torch>=2.12.1",
-    "torchinfo>=1.8.0",
 ]

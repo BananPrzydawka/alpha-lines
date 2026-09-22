@@ -102,6 +102,9 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
         restored = torch.load(resume,map_location='cpu',weights_only=True)
         if restored['format_version'] != 1:
             raise ValueError('Unsupported checkpoint format')
+        if any(t.is_floating_point() and t.dtype != torch.float32
+               for t in restored['model'].values()):
+            raise ValueError('Resume requires an FP32 checkpoint')
         # Architecture must match the weights; runtime training settings are current.
         options['model'] = restored['options']['model']
         settings[options['model']+'_model'] = dict(restored['model_config'])

@@ -1,6 +1,5 @@
 //! The oracle: a port of the old `main/game_kernels.py` (deleted in the Rust port;
-//! only `python/config.py`, `python/models/resnet.py`, `python/export_mcts.py`,
-//! `python/modal_harness.py`, `python/modal_mcts.py` remain), used only by the tests.
+//! retained as an independent reference for game-engine tests).
 //!
 //! This is the reference the incremental engine is checked against. It lives in `tests/`
 //! rather than `src/` because it is not part of the product — the engine ships alone — but
@@ -197,23 +196,6 @@ pub fn score_player(boards: &[i8], g: usize, player_mark: i8, height: usize, wid
     }
 
     score as f32
-}
-
-/// `score_batch`: scores every game in the batch for `player_mark`, regardless of
-/// active/finished state. Used once at import/construction time; the hot loop uses
-/// [`apply_and_score_kernel`] instead, which only rescores games whose boards changed.
-pub fn score_batch(
-    boards: &[i8],
-    n: usize,
-    player_mark: i8,
-    height: usize,
-    width: usize,
-) -> Vec<f32> {
-    let mut scores = vec![0.0f32; n];
-    for g in 0..n {
-        scores[g] = score_player(boards, g, player_mark, height, width);
-    }
-    scores
 }
 
 /// `legal_masks_kernel`: (N, H, W) float legal-move masks + (N,) counts for both players,

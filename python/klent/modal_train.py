@@ -38,9 +38,3 @@ def train(smoke: bool = False):
 @app.local_entrypoint()
 def main(smoke: bool = False):
     train.remote(smoke)
-
-
-@app.function(image=training_image,gpu=resources['gpu'],timeout=resources['timeout'])
-def benchmark(model: str = '', batch_size: int = 0, warmup: int = 20, iterations: int = 100):
-    from klent.benchmark import run
-    return run(model,batch_size,warmup,iterations)

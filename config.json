@@ -9,15 +9,15 @@
   },
   "klent": {
     "cycles": 20,
-    "n": 2048,
-    "m": 1048576,
+    "n": 1024,
+    "m": 524288,
     "max_ply": 80,
     "alpha": 0.03,
     "beta": 0.1,
-    "lambda": 0.8824969025845955,
-    "train_minibatch": 8192,
+    "lambda": 0.951229425,
+    "train_minibatch": 4096,
     "lr": 0.0003,
-    "test_games": 2048,
+    "test_games": 1024,
     "optimizer": "adamw",
     "weight_decay": 0.01,
     "seed": 1,
@@ -48,39 +48,5 @@
       "eps": 1e-05,
       "affine": true
     }
-  },
-  "maia_model": {
-    "dim": 192,
-    "layers": 8,
-    "head_dim": 32,
-    "mlp_ratio": 2,
-    "gab_dim": 64,
-    "score_head": {
-      "square_features": 32,
-      "hidden_dim": 256
-    }
-  },
-  "mcts": {
-    "k": 64,
-    "g": 8192,
-    "b": 4096,
-    "t": 4096,
-    "s": 100,
-    "node_capacity_factor": 8,
-    "c_puct": 1.5,
-    "alpha": 0.3,
-    "epsilon": 0.25,
-    "exp3_gamma": 0.1
-  },
-  "score_training": {
-    "seconds": 100,
-    "batch": 256,
-    "validation_batch": 256,
-    "steps": 100000,
-    "lr": 0.0003,
-    "eval_every": 200,
-    "validation_steps": 64,
-    "seed": 1,
-    "output": "logs/score-symmetry"
   }
 }

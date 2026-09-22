@@ -6,7 +6,6 @@ from pathlib import Path
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 settings = json.loads(CONFIG_PATH.read_text())
 game = settings["game"]
-mcts = settings["mcts"]
 resources = settings["modal"]
 
 if (game["height"], game["width"]) != (10, 16):

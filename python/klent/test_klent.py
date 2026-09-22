@@ -116,13 +116,6 @@ class KlentTests(unittest.TestCase):
             run(LIBRARY,dict(self.options,model='resnet'),cycles=1,device='cpu',
                 compile_model=False,checkpoint=checkpoint)
             path = Path(directory)/'cycle-000001.pt'
-            # Emulate the old all-BF16 checkpoint, including AdamW moments.
-            legacy = torch.load(path, weights_only=True)
-            legacy['model'] = {k: v.bfloat16() for k,v in legacy['model'].items()}
-            for state in legacy['optimizer']['state'].values():
-                for key in ('exp_avg', 'exp_avg_sq'):
-                    state[key] = state[key].bfloat16()
-            torch.save(legacy, path)
             # Change architecture defaults and runtime settings independently.
             settings['resnet_model'] = dict(small, filters=16, blocks=2)
             current = dict(self.options,model='katago',cycles=1,n=3,m=480,
@@ -155,6 +148,13 @@ class KlentTests(unittest.TestCase):
             self.assertEqual(saved['model_config'],small)
             self.assertGreater(next(iter(saved['optimizer']['state'].values()))['step'].item(),
                                next(iter(torch.load(path,weights_only=True)['optimizer']['state'].values()))['step'].item())
+
+    def test_resume_rejects_bf16_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'legacy.pt'
+            torch.save(dict(format_version=1, model={'weight': torch.ones(1, dtype=torch.bfloat16)}), path)
+            with self.assertRaisesRegex(ValueError, 'FP32 checkpoint'):
+                run(LIBRARY, self.options, cycles=1, device='cpu', compile_model=False, resume=path)
 
     def test_balanced_assignment(self):
         old,new = evaluation_rows(8)

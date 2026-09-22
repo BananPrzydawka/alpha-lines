@@ -7,8 +7,7 @@ description = "The alpha-lines game: one board, scored incrementally"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
-# The core needs no external crates. The optional compiled-model feature links the
-# local PyTorch installation through a small C++ AOTInductor loader.
+# The core needs no external crates.
 [dependencies]
 
 # Read the shared config at build time; the engine has no runtime dependencies.
@@ -19,6 +18,3 @@ serde_json = "1"
 opt-level = 3
 lto = true
 codegen-units = 1
-
-[features]
-compiled-model = []
