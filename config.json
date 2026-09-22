@@ -8,7 +8,7 @@
     "timeout": 1200
   },
   "klent": {
-    "cycles": 20,
+    "cycles": 32,
     "n": 1024,
     "m": 524288,
     "max_ply": 80,
