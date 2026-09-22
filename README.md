@@ -5,8 +5,8 @@ inference export, and a score-learning demo on Modal.
 
 ## KLENT training on a rented GPU
 
-For Ubuntu GPU boxes over SSH, run `./scripts/setup_gpu.sh` after cloning, then
-`./scripts/train_verda.sh` to resume the latest checkpoint inside tmux.
+For Ubuntu GPU boxes over SSH, run `./scripts/train_verda.sh` after cloning.
+It completes setup and resumes the latest checkpoint in the current terminal.
 Set additional cycles in `config.json` (`klent.cycles`). The seed checkpoint
 `checkpoints/cycle-000166.pt` ships in Git; new checkpoints and metrics stay local.
 See [KLENT instructions](python/klent/README.md) for fresh runs, checkpointing,

@@ -75,39 +75,32 @@ Commit and push these changes **and `checkpoints/cycle-000166.pt`** before creat
 the box. Only that seed checkpoint is allowed through `.gitignore`; historical
 and newly generated checkpoints stay ignored.
 
-Verda startup script (runs as the startup user, usually root):
+After connecting over SSH, clone the repository once:
 
 ```sh
-#!/usr/bin/env bash
-set -euo pipefail
-apt-get update
-apt-get install -y git
+apt-get update && apt-get install -y git &&
 git clone https://github.com/BananPrzydawka/alpha-lines ~/projects/alpha-lines
-cd ~/projects/alpha-lines
-./scripts/setup_gpu.sh
-./scripts/train_verda.sh
 ```
 
-The launcher finds the highest numbered checkpoint beneath `checkpoints/`,
-starts a detached `klent` tmux session, and writes each run to unique directories
-under `checkpoints/klent/` and `logs/klent/`. An existing `klent` session is left
-running. Setup installs tmux and rsync alongside uv, Rust and dependencies.
-Attach over SSH using the same user that ran startup:
+Then run:
 
 ```sh
-tmux attach -t klent
+cd ~/projects/alpha-lines && ./scripts/train_verda.sh
 ```
 
-Mouse scrolling is enabled. Keyboard scrollback: Ctrl-b then `[`, arrow/PageUp
-keys, `q` to leave; detach with Ctrl-b then `d`. The shell stays open after
-training exits and prints its exit status. To launch another run, exit that shell
-and rerun `./scripts/train_verda.sh`. It resumes the latest saved cycle.
+For an existing checkout, update it first with `git pull --ff-only origin main`.
+The launcher completes dependency setup, then finds the highest numbered
+checkpoint beneath `checkpoints/` and trains directly in your terminal. Setup
+failure or interruption stops the launcher before training starts. Let dependency
+downloads finish. There is no tmux or background process; keep SSH connected.
+Each run writes to unique directories under `checkpoints/klent/` and `logs/klent/`.
+Rerun the same command to resume the latest saved cycle.
 
 For foreground training use `./scripts/train_local.sh --resume
 checkpoints/cycle-000166.pt` (on one line). Omit `--resume` for a fresh model.
 Optional `--checkpoint-dir` and `--log-dir` set output paths.
 
-Each run logs `console.log` (tmux launcher), `run.json` (effective configuration,
+Each run logs `console.log` (Verda launcher), `run.json` (effective configuration,
 precision, hardware, resume source), and `metrics.jsonl` (one row per completed
 cycle). Metrics include total/policy/Q losses, W/D/L, win rate, draw-adjusted
 score rate, every historical matchup, position counts, timings and UTC/elapsed

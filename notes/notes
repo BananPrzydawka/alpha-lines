@@ -10,10 +10,14 @@
 32768   213826
 
 
-git add
+
+
+
+git add .
 git diff --cached --stat
 git commit -m "Use FP32 weights with BF16 autocast and add resumable GPU startup"
 git push origin HEAD:main
+
 
 #!/usr/bin/env bash
 set -euo pipefail
@@ -27,14 +31,18 @@ cd ~/projects/alpha-lines
 
 tmux attach -t klent
 
+
 mkdir -p verda-results
 rsync -avP --include='/checkpoints/' --include='/checkpoints/***' --include='/logs/' --include='/logs/***' --exclude='*' root@BOX_IP:/root/projects/alpha-lines/ ./verda-results/
+
+
+
+
 
 
 - prescision fucking us
 
 - junk q target theory
-
 
 
 - end value head
@@ -44,7 +52,6 @@ rsync -avP --include='/checkpoints/' --include='/checkpoints/***' --include='/lo
 - oponent policy head
 
 - add exploration to games
-
 
 
 - stochastic interference

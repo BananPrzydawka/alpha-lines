@@ -4,10 +4,10 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 if [[ $EUID -eq 0 ]]; then
     apt-get update
-    apt-get install -y git curl build-essential tmux rsync ca-certificates
+    apt-get install -y git curl build-essential rsync ca-certificates
 else
     sudo apt-get update
-    sudo apt-get install -y git curl build-essential tmux rsync ca-certificates
+    sudo apt-get install -y git curl build-essential rsync ca-certificates
 fi
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 if ! command -v uv >/dev/null; then
