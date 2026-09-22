@@ -1,6 +1,7 @@
 """Native integration and objective regression tests; no GPU required."""
 import contextlib
 import io
+import json
 import unittest
 import tempfile
 from pathlib import Path
@@ -105,7 +106,7 @@ class KlentTests(unittest.TestCase):
                 self.assertEqual(result['opponent_cycle'],cycle-result['age'])
                 self.assertEqual(sum(result[k] for k in ('wins','draws','losses')),4)
 
-    def test_resume_continues_cycle_and_restores_configuration(self):
+    def test_resume_restores_architecture_but_uses_current_training_settings(self):
         from klent.checkpoint import save
         small = dict(settings['resnet_model'],filters=8,blocks=1,se_hidden=4,
                      score_embed_hidden=8,policy_filters=4,action_value_filters=4)
@@ -115,14 +116,42 @@ class KlentTests(unittest.TestCase):
             run(LIBRARY,dict(self.options,model='resnet'),cycles=1,device='cpu',
                 compile_model=False,checkpoint=checkpoint)
             path = Path(directory)/'cycle-000001.pt'
-            # Deliberately provide different defaults: saved configuration wins.
-            results = run(LIBRARY,dict(self.options,model='katago'),cycles=1,
+            # Emulate the old all-BF16 checkpoint, including AdamW moments.
+            legacy = torch.load(path, weights_only=True)
+            legacy['model'] = {k: v.bfloat16() for k,v in legacy['model'].items()}
+            for state in legacy['optimizer']['state'].values():
+                for key in ('exp_avg', 'exp_avg_sq'):
+                    state[key] = state[key].bfloat16()
+            torch.save(legacy, path)
+            # Change architecture defaults and runtime settings independently.
+            settings['resnet_model'] = dict(small, filters=16, blocks=2)
+            current = dict(self.options,model='katago',cycles=1,n=3,m=480,
+                           train_minibatch=40,test_games=6,lr=0.001,
+                           weight_decay=0.02,alpha=0.04,beta=0.2,
+                           **{'lambda':0.8,'seed':7})
+            results = run(LIBRARY,current,
                           device='cpu',compile_model=False,resume=path,
-                          checkpoint=checkpoint)
+                          checkpoint=checkpoint,log_dir=Path(directory)/'logs')
             self.assertEqual(results[0]['cycle'],2)
             self.assertEqual(results[0]['evaluations'][0]['opponent_cycle'],1)
             saved = torch.load(Path(directory)/'cycle-000002.pt',weights_only=True)
-            self.assertEqual(saved['options']['model'],'resnet')
+            self.assertEqual(saved['options'], dict(current, model='resnet'))
+            for group in saved['optimizer']['param_groups']:
+                self.assertEqual(group['lr'], current['lr'])
+                self.assertEqual(group['weight_decay'], current['weight_decay'])
+            self.assertEqual(results[0]['wins']+results[0]['draws']+results[0]['losses'], 6)
+            self.assertEqual(results[0]['batches'], (results[0]['states']+19)//20)
+            self.assertTrue(all(v.dtype == torch.float32 for v in saved['model'].values()))
+            for state in saved['optimizer']['state'].values():
+                self.assertEqual(state['exp_avg'].dtype, torch.float32)
+                self.assertEqual(state['exp_avg_sq'].dtype, torch.float32)
+            metrics = [json.loads(line) for line in (Path(directory)/'logs/metrics.jsonl').read_text().splitlines()]
+            self.assertEqual(metrics, results)
+            self.assertEqual(metrics[0]['win_rate'], metrics[0]['wins']/6)
+            self.assertEqual(metrics[0]['score_rate'], (metrics[0]['wins']+0.5*metrics[0]['draws'])/6)
+            metadata = json.loads((Path(directory)/'logs/run.json').read_text())
+            self.assertEqual(metadata['options'], dict(current, model='resnet'))
+            self.assertEqual(metadata['initial_cycle'], 1)
             self.assertEqual(saved['model_config'],small)
             self.assertGreater(next(iter(saved['optimizer']['state'].values()))['step'].item(),
                                next(iter(torch.load(path,weights_only=True)['optimizer']['state'].values()))['step'].item())

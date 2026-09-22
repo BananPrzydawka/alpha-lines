@@ -1,4 +1,3 @@
-
 64      78592
 128     110037
 256     131490
@@ -11,86 +10,41 @@
 32768   213826
 
 
+git add
+git diff --cached --stat
+git commit -m "Use FP32 weights with BF16 autocast and add resumable GPU startup"
+git push origin HEAD:main
+
+#!/usr/bin/env bash
+set -euo pipefail
+apt-get update
+apt-get install -y git
+git clone https://github.com/BananPrzydawka/alpha-lines ~/projects/alpha-lines
+cd ~/projects/alpha-lines
+./scripts/setup_gpu.sh
+./scripts/train_verda.sh
+
+
+tmux attach -t klent
+
+mkdir -p verda-results
+rsync -avP --include='/checkpoints/' --include='/checkpoints/***' --include='/logs/' --include='/logs/***' --exclude='*' root@BOX_IP:/root/projects/alpha-lines/ ./verda-results/
+
+
+- prescision fucking us
+
+- junk q target theory
 
 
 
+- end value head
+- end score head
+- end ownership head
+- intermediate score head
+- oponent policy head
+
+- add exploration to games
 
 
 
-ideas to test: auxiliary heads, target recomputation in training
-
-
-
-
-
-
-// n, m, maxply, a, B, lambda, train minibatch, lr, test games, train_epochs, optimizer, weight_decay, seed - are to be added to config.json aproprietly
-
-arena is n games // game slot maintains game instance
-for each arena slot game history vector (length = max possible ply = 80 ) // abreviated as ghv
-big buffer is m slots
-model is either resnet or katago, cast to bf16
-
-while true:
-
-    // states must be encoded
-    start timer "model"
-    evaluate n games with model from both player perspectives (model batch = 2n)
-    end timer "model"
-
-    start timer "cpu"
-    calculate improved policy in fp32:   pi' = softmax_a( (Q(a) + B*log pi(a)) / (a + B) ) // mask illegal before softmax
-    calculate value estimate  in fp32:   V_t = sum_a( pi' * Q )
-
-    store to ghv: board (bitpacking 20B), scores (2 * u8 = 2B), played move (2 * u8 = 2B), pi' (2 * 80 * bf16 / 8b = 320B), V_t (2 * fp32 / 8b = 8B)
-
-    step n games sampling from pi'
-
-    if after step game i is terminal:
-        backward calculate G_t in fp32:  G_t = (1-lambda)V_t+1 + lambda*G_t+1, G_T-1 = R_T
-        // do not store terminal state
-        store to big buffer: board (bitpacking 20B), scores (2 * u8 = 2B), played move (2 * u8 = 2B), pi' (2 * 80 * bf16 = 320B), G_t (2 * bf16 = 4B)
-        clear ghv for game i
-        init fresh game instance in arena slot i
-
-    if big buffer has less than n*max_ply free slots remaining:
-        // throwing away the non termianl games is faster than playing them to completion
-        record number of states in big buffer, and number of states dropped from all n ghvs
-        reset arena to fresh games
-        reset all ghv
-        stop timer "cpu"
-        start timer "training"
-        train model on big buffer, the target for policy is pi', the target for q is only for the played action, at S_t, G_t.
-            inside training, keep time per minibatch
-            one epoch per self-play cycle, with every position used once
-        clear big buffer
-        print stats per minibatch time in miliseconds (forward, backward, optimizer), loss
-        stop timer "training"
-
-        start timer "strength_test"
-        test strength against previous model:
-            play test_games number of games in parralel untill completion
-            game is symetrical so player 0 is old model, player 1 new model
-            as some games terminate, we do not change batch size, just input zero tensors in place, to avoid model recompilation
-            play by argmax over raw policy, not pi'
-        stop timer strength_test
-
-        print stats for whole training step: total model time, total cpu time, total training time, strength_test time, in seconds :2f, win draw loss games against old model
-    else if not:
-        stop timer "cpu"
-        print stats for arena step, cpu time, model time, in miliseconds
-
-
-def bitpacking:
-    // whether that is 20 i8s or 2 words and one i32 - i don't care
-    the board is held in 80 i8, but each can only hold 4 states, hence pack 4 squares into 8 bits, so full game in 20B
-
-
-
-Phase          Mean ms   Median ms     Best ms
-Forward+loss      24.068      23.965      23.396
-Backward          76.451      76.292      75.206
-Optimizer          8.052       0.087       0.083
-Total            108.571     100.408      98.780
-Wall ms/step: 108.586 | Peak allocated: 0.04 GiB
-Synthetic shared-trunk gradient norms (32 rows): policy 0.50763 | Q 0.33520
+- stochastic interference

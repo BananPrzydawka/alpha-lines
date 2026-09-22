@@ -20,7 +20,7 @@ def run(model_name='', batch_size=0, warmup=20, iterations=100):
     torch.manual_seed(options['seed'])
     torch.backends.cudnn.benchmark = True
     model = {'katago': KataGoNet, 'resnet': ResNet}[name]().cuda().to(
-        dtype=torch.bfloat16, memory_format=torch.channels_last).train()
+        dtype=torch.float32, memory_format=torch.channels_last).train()
     net = torch.compile(model, mode='max-autotune', dynamic=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=options['lr'],
                                  weight_decay=options['weight_decay'])
@@ -36,7 +36,8 @@ def run(model_name='', batch_size=0, warmup=20, iterations=100):
         optimizer.zero_grad(set_to_none=True)
         torch.compiler.cudagraph_mark_step_begin()
         if events: events[0].record()
-        pi,q = net(boards,scores)
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            pi,q = net(boards,scores)
         pl,vl = losses(pi,q,target,actions,returns,valid)
         if events: events[1].record()
         (pl+vl).backward()
@@ -44,7 +45,7 @@ def run(model_name='', batch_size=0, warmup=20, iterations=100):
         optimizer.step()
         if events: events[3].record()
 
-    print(f'Benchmark: {name}, {size:,} perspectives, BF16, channels-last, max-autotune',flush=True)
+    print(f'Benchmark: {name}, {size:,} perspectives, FP32 weights + BF16 autocast, channels-last, max-autotune',flush=True)
     print(f'GPU: {torch.cuda.get_device_name()} | torch {torch.__version__}',flush=True)
     print('Warming forward, backward and optimizer; compilation excluded.',flush=True)
     for _ in range(warmup): step()
@@ -66,7 +67,8 @@ def run(model_name='', batch_size=0, warmup=20, iterations=100):
     # targets make this a diagnostic example, not proof of real-data balance.
     optimizer.zero_grad(set_to_none=True)
     diagnostic_size = min(size,32)
-    pi,q = model(boards[:diagnostic_size],scores[:diagnostic_size])
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        pi,q = model(boards[:diagnostic_size],scores[:diagnostic_size])
     pl,vl = losses(pi,q,target[:diagnostic_size],actions[:diagnostic_size],
                    returns[:diagnostic_size],valid[:diagnostic_size])
     params = tuple(model.parameters())

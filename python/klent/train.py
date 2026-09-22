@@ -3,6 +3,8 @@ import argparse
 from collections import deque
 import copy
 import math
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 
@@ -91,32 +93,42 @@ class Device:
         return first.elapsed_time(second) if self.cuda else (second-first)*1000
 
 
-def run(library, options=None, *, cycles=0, device='cuda', compile_model=True, checkpoint=None, resume=None):
+def run(library, options=None, *, cycles=None, device='cuda', compile_model=True, checkpoint=None, resume=None, log_dir=None):
     """cycles=0 runs until interrupted or the Modal function timeout expires."""
     options = dict(settings['klent'] if options is None else options)
+    cycles = options['cycles'] if cycles is None else cycles
     restored = None
     if resume is not None:
         restored = torch.load(resume,map_location='cpu',weights_only=True)
         if restored['format_version'] != 1:
             raise ValueError('Unsupported checkpoint format')
-        options = dict(restored['options'])
+        # Architecture must match the weights; runtime training settings are current.
+        options['model'] = restored['options']['model']
         settings[options['model']+'_model'] = dict(restored['model_config'])
+    options['cycles'] = cycles
     validate(options)
-    if cycles < 0:
+    if type(cycles) is not int or cycles < 0:
         raise ValueError('cycles must be nonnegative')
     dev = Device(device)
     torch.set_num_threads(1)
     torch.manual_seed(options['seed'])
     factory = {'katago':KataGoNet,'resnet':ResNet}[options['model']]
-    model = factory().to(device=device,dtype=torch.bfloat16,memory_format=torch.channels_last)
+    model = factory().to(device=device,dtype=torch.float32,memory_format=torch.channels_last)
     old = copy.deepcopy(model).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(),lr=options['lr'],weight_decay=options['weight_decay'])
     if restored is not None:
         model.load_state_dict(restored['model'])
         optimizer.load_state_dict(restored['optimizer'])
-        torch.set_rng_state(restored['torch_rng'])
-        if dev.cuda and restored['cuda_rng']:
-            torch.cuda.set_rng_state(restored['cuda_rng'][0],device=device)
+        # Loading AdamW also restores param-group settings: apply current config.
+        for group in optimizer.param_groups:
+            group['lr'] = options['lr']
+            group['weight_decay'] = options['weight_decay']
+        if options['seed'] == restored['options']['seed']:
+            torch.set_rng_state(restored['torch_rng'])
+            if dev.cuda and restored['cuda_rng']:
+                torch.cuda.set_rng_state(restored['cuda_rng'][0],device=device)
+        else:
+            torch.manual_seed(options['seed'])
     network = torch.compile(model,mode='max-autotune',dynamic=False) if compile_model else model
     previous = torch.compile(old,mode='max-autotune',dynamic=False) if compile_model else old
     sq = torch.arange(80,device=device)
@@ -129,7 +141,7 @@ def run(library, options=None, *, cycles=0, device='cuda', compile_model=True, c
     history = ModelHistory()
 
     def infer(net, boards, scores):
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
             b,s = dev.transfer((boards,scores))
             pi,q = net(b.contiguous(memory_format=torch.channels_last),s)
             # Blocking CPU copies also prevent reuse of compiled output storage
@@ -137,6 +149,17 @@ def run(library, options=None, *, cycles=0, device='cuda', compile_model=True, c
             return (pi.flatten(1)[:,indices].float().cpu().contiguous(),
                     q.flatten(1)[:,indices].float().cpu().contiguous())
 
+    run_start = perf_counter()
+    if log_dir is not None:
+        log_dir = Path(log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        metadata = dict(started_at=datetime.now(timezone.utc).isoformat(),
+                        resume=str(resume) if resume else None, initial_cycle=completed,
+                        options=options, model_config=settings[options['model']+'_model'],
+                        precision='fp32-weights-bf16-autocast', device=str(device),
+                        gpu=torch.cuda.get_device_name(device) if dev.cuda else None,
+                        torch_version=str(torch.__version__), compiled=compile_model)
+        (log_dir/'run.json').write_text(json.dumps(metadata, indent=2)+'\n')
     output.setup(options, device, compile_model)
     with Arena(library,options,pinned=dev.cuda,seed=(options['seed']+completed)%(2**64)) as arena:
         model_time = cpu_time = 0.0
@@ -178,9 +201,10 @@ def run(library, options=None, *, cycles=0, device='cuda', compile_model=True, c
                 optimizer.zero_grad(set_to_none=True)
                 torch.compiler.cudagraph_mark_step_begin()
                 forward_start = dev.stamp()
-                logits,values = network(b,s)
-                policy_loss,value_loss = losses(logits,values,target,actions,returns,valid)
-                loss = policy_loss+value_loss
+                with torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
+                    logits,values = network(b,s)
+                    policy_loss,value_loss = losses(logits,values,target,actions,returns,valid)
+                    loss = policy_loss+value_loss
                 forward_end = dev.stamp()
                 loss.backward()
                 backward_end = dev.stamp()
@@ -231,6 +255,8 @@ def run(library, options=None, *, cycles=0, device='cuda', compile_model=True, c
                 dev.sync()
                 evaluations.append(dict(age=age,opponent_cycle=completed+1-age,
                     wins=wins,draws=draws,losses=losses_count,
+                    win_rate=wins/options['test_games'],
+                    score_rate=(wins+0.5*draws)/options['test_games'],
                     seconds=perf_counter()-opponent_start))
             dev.sync(); test_time = perf_counter()-test_start
             latest = evaluations[0]
@@ -246,6 +272,12 @@ def run(library, options=None, *, cycles=0, device='cuda', compile_model=True, c
                            mean_backward_ms=timing_sum[1]/batch_number,
                            mean_optimizer_ms=timing_sum[2]/batch_number,
                            policy_loss=policy_sum/count,q_loss=value_sum/count)
+            summary.update(timestamp=datetime.now(timezone.utc).isoformat(),
+                           elapsed_seconds=perf_counter()-run_start,
+                           win_rate=latest['win_rate'], score_rate=latest['score_rate'])
+            if log_dir is not None:
+                with (log_dir/'metrics.jsonl').open('a') as stream:
+                    stream.write(json.dumps(summary, allow_nan=False)+'\n')
             if cycles:
                 summaries.append(summary)
             output.summary(summary)
@@ -259,20 +291,22 @@ def run(library, options=None, *, cycles=0, device='cuda', compile_model=True, c
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--library',type=Path,default=Path(__file__).resolve().parents[2]/'rust/target/release/libalpha_lines_game.so')
-    parser.add_argument('--cycles',type=int,default=0)
     parser.add_argument('--device',default='cuda')
     parser.add_argument('--no-compile',action='store_true',help='CPU smoke testing only')
-    parser.add_argument('--resume',type=Path,help='Restore weights, optimizer, configuration and cycle number')
+    parser.add_argument('--resume',type=Path,help='Restore weights, optimizer state, architecture and cycle number')
     parser.add_argument('--checkpoint-dir',type=Path,help='Output directory; defaults to a new local run')
+    parser.add_argument('--log-dir',type=Path,help='Metrics directory; defaults to logs/klent/<run-id>')
     args = parser.parse_args()
     from uuid import uuid4
     from klent.checkpoint import save
-    directory = args.checkpoint_dir or Path('checkpoints/klent')/uuid4().hex
+    run_id = uuid4().hex
+    directory = args.checkpoint_dir or Path('checkpoints/klent')/run_id
+    log_dir = args.log_dir or Path('logs/klent')/run_id
     def checkpoint(model,optimizer,options,summary):
         path = save(directory,model,optimizer,options,summary)
         output.emit(f'Checkpoint saved: {path}')
-    run(args.library,cycles=args.cycles,device=args.device,compile_model=not args.no_compile,
-        checkpoint=checkpoint,resume=args.resume)
+    run(args.library,device=args.device,compile_model=not args.no_compile,
+        checkpoint=checkpoint,resume=args.resume,log_dir=log_dir)
 
 
 if __name__ == '__main__':

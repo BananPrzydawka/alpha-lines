@@ -1,7 +1,7 @@
 KLENT training:
 
 ```sh
-PYTHONPATH=python uv run modal run -m klent.modal_train --cycles 5
+PYTHONPATH=python uv run modal run -m klent.modal_train
 ```
 
 Evaluation assigns the new model to P1 in the first half of the games and P0
@@ -29,7 +29,7 @@ PYTHONPATH=python uv run modal run -m klent.modal_train::benchmark
 
 Optional flags: `--model resnet`, `--batch-size 8192`, `--warmup 20`,
 `--iterations 100`. Defaults use the configured model and training minibatch.
-It uses BF16, channels-last, max-autotune compilation, cuDNN benchmarking,
+It uses FP32 weights and AdamW state with BF16 autocast, channels-last, max-autotune compilation, cuDNN benchmarking,
 resident synthetic inputs/targets, and the same CE + played-action MSE and AdamW.
 Warmup includes backward and optimizer initialization. CUDA events measure
 forward plus loss, backward, optimizer and total; synchronization occurs after
@@ -57,21 +57,71 @@ History lasts for the current process only.
 
 Local GPU / SSH training (Ubuntu GPU image with CUDA 13-compatible driver):
 
+Set `klent.cycles` in `config.json` before deploying (default: 20 additional
+cycles; 0 runs until stopped). The cycle budget always comes from the current
+config, even on resume. Starting from the supplied cycle 166, 20 cycles produces
+cycles 167 through 186. Training settings come from the current `klent` config, including buffer and
+arena sizes, minibatch size, evaluation games, learning rate, weight decay,
+alpha/beta/lambda and seed. The current `m=1048576` therefore applies on resume.
+The checkpoint supplies model type/architecture, weights, AdamW moments and cycle
+number. Current learning rate and weight decay override saved optimizer settings.
+An unchanged seed restores torch RNG state; a changed seed reseeds torch and the
+native arena. Existing validation constraints still apply (`max_ply` must be 80,
+and AdamW is the supported optimizer). FP32 parameters and AdamW moments are used, including when
+resuming an older BF16 checkpoint; forwards use BF16 autocast and losses use FP32.
+This cannot recover precision already lost during earlier BF16 training.
+
+Commit and push these changes **and `checkpoints/cycle-000166.pt`** before creating
+the box. Only that seed checkpoint is allowed through `.gitignore`; historical
+and newly generated checkpoints stay ignored.
+
+Verda startup script (runs as the startup user, usually root):
+
 ```sh
+#!/usr/bin/env bash
+set -euo pipefail
+apt-get update
+apt-get install -y git
+git clone https://github.com/BananPrzydawka/alpha-lines ~/projects/alpha-lines
+cd ~/projects/alpha-lines
 ./scripts/setup_gpu.sh
-./scripts/train_local.sh --resume checkpoints/cycle-000009.pt --cycles 20
+./scripts/train_verda.sh
 ```
 
-`--cycles 20` means 20 additional cycles (10 through 29 in this example).
-Omit `--resume` to start fresh. `--cycles 0` runs until stopped, with no Modal
-timeout. The setup script installs uv, Rust and locked Python dependencies,
-builds the native library and checks GPU availability. It does not change the
-NVIDIA driver or profiler permissions and does not reboot.
+The launcher finds the highest numbered checkpoint beneath `checkpoints/`,
+starts a detached `klent` tmux session, and writes each run to unique directories
+under `checkpoints/klent/` and `logs/klent/`. An existing `klent` session is left
+running. Setup installs tmux and rsync alongside uv, Rust and dependencies.
+Attach over SSH using the same user that ran startup:
 
-Resume restores checkpoint model/training configuration, weights, optimizer,
-torch RNG and cycle number. Saved configuration takes precedence over config.json
-for that run. Opponent history starts with the resumed model and builds up again.
-Local output defaults to a new `checkpoints/klent/<run-id>` directory; override
-with `--checkpoint-dir PATH`. Existing checkpoint files are never overwritten.
-Run inside tmux so disconnecting SSH does not stop training. Download saved files
-before releasing the rented storage.
+```sh
+tmux attach -t klent
+```
+
+Mouse scrolling is enabled. Keyboard scrollback: Ctrl-b then `[`, arrow/PageUp
+keys, `q` to leave; detach with Ctrl-b then `d`. The shell stays open after
+training exits and prints its exit status. To launch another run, exit that shell
+and rerun `./scripts/train_verda.sh`. It resumes the latest saved cycle.
+
+For foreground training use `./scripts/train_local.sh --resume
+checkpoints/cycle-000166.pt` (on one line). Omit `--resume` for a fresh model.
+Optional `--checkpoint-dir` and `--log-dir` set output paths.
+
+Each run logs `console.log` (tmux launcher), `run.json` (effective configuration,
+precision, hardware, resume source), and `metrics.jsonl` (one row per completed
+cycle). Metrics include total/policy/Q losses, W/D/L, win rate, draw-adjusted
+score rate, every historical matchup, position counts, timings and UTC/elapsed
+time. No trajectories are saved. Opponent history rebuilds after resume.
+
+After training finishes, run this **on your local machine** before deleting the
+box. Replace `BOX_IP` and the SSH user/path if startup did not run as root:
+
+```sh
+mkdir -p verda-results
+rsync -avP --include='/checkpoints/' --include='/checkpoints/***' \
+  --include='/logs/' --include='/logs/***' --exclude='*' \
+  root@BOX_IP:/root/projects/alpha-lines/ ./verda-results/
+```
+
+This downloads checkpoints and logs together and can be rerun to resume a
+transfer. For a custom SSH port add `-e 'ssh -p PORT'` to rsync.

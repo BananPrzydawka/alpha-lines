@@ -6,7 +6,7 @@ def emit(*lines):
 
 
 def setup(options, device, compiled):
-    emit('', 'KLENT  |  '+options['model']+'  |  BF16  |  '+device,
+    emit('', 'KLENT  |  '+options['model']+'  |  FP32 weights + BF16 autocast  |  '+device,
          '  Compile    '+('max-autotune' if compiled else 'disabled'),
          f"  Arena      {options['n']:,} games   |   Buffer {options['m']:,} positions",
          f"  Minibatch  {options['train_minibatch']:,} perspectives   |   One epoch",

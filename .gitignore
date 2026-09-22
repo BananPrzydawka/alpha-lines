@@ -19,5 +19,6 @@ cuda/out/
 /rust/target/
 
 # Local training artifacts
-/checkpoints/
+/checkpoints/klent/*
+!/checkpoints/cycle-000166.pt
 *.pt.tmp

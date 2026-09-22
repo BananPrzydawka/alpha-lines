@@ -1,4 +1,4 @@
-"""Run KLENT on Modal: modal run -m klent.modal_train --cycles 1."""
+"""Run KLENT on Modal: modal run -m klent.modal_train."""
 import modal
 from config import resources
 from modal_image import base_image, project_dir, with_project_files, volume
@@ -15,7 +15,7 @@ training_image = with_project_files(
 
 @app.function(image=training_image,gpu=resources['gpu'],timeout=resources['timeout'],
               volumes={'/checkpoints': volume})
-def train(cycles: int = 0, smoke: bool = False):
+def train(smoke: bool = False):
     import subprocess
     from config import settings
     from klent.train import run
@@ -32,14 +32,12 @@ def train(cycles: int = 0, smoke: bool = False):
         volume.commit()
         print(f'Checkpoint saved: {path}', flush=True)
     return run('/root/rust/target/release/libalpha_lines_game.so',options,
-               cycles=cycles,checkpoint=checkpoint)
+               checkpoint=checkpoint,log_dir=directory)
 
 
 @app.local_entrypoint()
-def main(cycles: int = 0, smoke: bool = False):
-    if cycles < 0:
-        raise ValueError('cycles must be nonnegative')
-    train.remote(cycles,smoke)
+def main(smoke: bool = False):
+    train.remote(smoke)
 
 
 @app.function(image=training_image,gpu=resources['gpu'],timeout=resources['timeout'])
