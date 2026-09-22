@@ -10,7 +10,7 @@ from unittest.mock import patch
 import torch
 from config import settings
 from klent.native import Arena, Batch
-from klent.train import losses, run, validate, evaluation_rows, ModelHistory
+from klent.train import losses, run, validate, evaluation_rows, ModelHistory, mark_class_targets, mark_class_loss
 
 LIBRARY = Path(__file__).resolve().parents[2]/'rust/target/release/libalpha_lines_game.so'
 
@@ -35,6 +35,23 @@ class KlentTests(unittest.TestCase):
         self.assertAlmostEqual(pl.item(),torch.tensor(160.).log().item())
         self.assertEqual(vl.item(),1)
 
+    def test_mark_class_targets_and_masked_loss(self):
+        indices = torch.arange(80)//8*16+2*(torch.arange(80)%8)+(torch.arange(80)//8%2)
+        classes = torch.full((2,80),-1,dtype=torch.int8)
+        classes[0,0],classes[0,1],classes[0,2] = 0,2,5
+        target = mark_class_targets(classes,indices)
+        self.assertEqual(target.shape,(2,6,10,16))
+        self.assertEqual(target[0,0,0,0].item(),1)
+        self.assertEqual(target[0,2,0,2].item(),1)
+        self.assertEqual(target[0,5,0,4].item(),1)
+        self.assertEqual(target.sum().item(),3)
+        logits = torch.zeros_like(target,requires_grad=True)
+        loss = mark_class_loss(logits,target,torch.tensor([1.,0.]))
+        loss.backward()
+        self.assertAlmostEqual(loss.item(),torch.tensor(6.).log().item())
+        self.assertEqual(logits.grad[1].count_nonzero().item(),0)
+        self.assertEqual(logits.grad[0,:,0,1].count_nonzero().item(),0)
+
     def test_native_batch_reproducibility_and_perspectives(self):
         with Arena(LIBRARY,self.options) as a, Arena(LIBRARY,self.options) as other:
             pi = torch.zeros(4,80)
@@ -54,13 +71,23 @@ class KlentTests(unittest.TestCase):
             for start in range(0,count,15):
                 size = a.batch(start,batch)
                 seen += size
-                b,s,target,actions,returns = batch.tensors
+                b,s,target,actions,returns,classes = batch.tensors
                 torch.testing.assert_close(b[0:2*size:2,3],b[1:2*size:2,4])
                 torch.testing.assert_close(s[:2*size:2],s[1:2*size:2].flip(1))
                 torch.testing.assert_close(target[:2*size].float().sum(1),torch.ones(2*size),atol=.004,rtol=0)
                 self.assertTrue((target[:2*size].gather(1,actions[:2*size,None])>0).all())
                 self.assertEqual(b[2*size:].count_nonzero().item(),0)
                 self.assertEqual(target[2*size:].count_nonzero().item(),0)
+                self.assertTrue((classes[2*size:] == -1).all())
+                self.assertTrue(((classes[:2*size] >= -1) & (classes[:2*size] <= 5)).all())
+                swapped = classes[1:2*size:2]
+                own = classes[:2*size:2]
+                torch.testing.assert_close(swapped,torch.where(own < 0,own,(own+3)%6))
+                for row in range(2*size):
+                    # Class 2 contributes two points, class 1 one, class 0 none.
+                    own_score = sum(int(c) for c in classes[row].tolist() if 0 <= c < 3)
+                    opponent_score = sum(int(c)-3 for c in classes[row].tolist() if 3 <= c < 6)
+                    self.assertEqual((own_score,opponent_score),tuple(int(x) for x in s[row]))
             self.assertEqual(seen,count)
             a.reset(); a.clear()
             self.assertEqual(a.stats()[0],0)
@@ -78,30 +105,35 @@ class KlentTests(unittest.TestCase):
                 self.assertEqual(sum(summary[k] for k in ('wins','draws','losses')),4)
                 self.assertGreater(summary['states'],0)
                 self.assertGreater(summary['loss'],0)
+                self.assertGreaterEqual(summary['shuffle_seconds'],0)
+                self.assertGreaterEqual(summary['scoring_head_processing_seconds'],0)
+                self.assertGreaterEqual(summary['mark_class_loss'],0)
 
     def test_history_is_independent_bounded_and_correctly_aged(self):
         model = torch.nn.Linear(1,1)
         history = ModelHistory()
-        for cycle in range(12):
+        for cycle in range(36):
             with torch.no_grad():
                 model.weight.fill_(cycle)
             history.remember(model)
-            self.assertEqual(len(history.snapshots),min(cycle+1,8))
+            self.assertEqual(len(history.snapshots),min(cycle+1,32))
+            self.assertEqual([age for age,_ in history.opponents()],
+                             [age for age in (1,2,4,8,16,32) if age<=cycle+1])
             for age,weights in history.opponents():
                 self.assertEqual(weights['weight'].item(),cycle+1-age)
             with torch.no_grad():
                 model.weight.fill_(-100)
             self.assertEqual(history.opponents()[0][1]['weight'].item(),cycle)
 
-    def test_nine_cycles_evaluate_available_history(self):
+    def test_33_cycles_evaluate_available_history(self):
         small = dict(settings['resnet_model'],filters=8,blocks=1,se_hidden=4,
                      score_embed_hidden=8,policy_filters=4,action_value_filters=4)
         with patch.dict(settings,{'resnet_model':small}),contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
             summaries = run(LIBRARY,dict(self.options,model='resnet'),
-                            cycles=9,device='cpu',compile_model=False)
+                            cycles=33,device='cpu',compile_model=False)
         for cycle,summary in enumerate(summaries,1):
             self.assertEqual([r['age'] for r in summary['evaluations']],
-                             [age for age in (1,2,4,8) if age<=cycle])
+                             [age for age in (1,2,4,8,16,32) if age<=cycle])
             for result in summary['evaluations']:
                 self.assertEqual(result['opponent_cycle'],cycle-result['age'])
                 self.assertEqual(sum(result[k] for k in ('wins','draws','losses')),4)
@@ -155,6 +187,27 @@ class KlentTests(unittest.TestCase):
             torch.save(dict(format_version=1, model={'weight': torch.ones(1, dtype=torch.bfloat16)}), path)
             with self.assertRaisesRegex(ValueError, 'FP32 checkpoint'):
                 run(LIBRARY, self.options, cycles=1, device='cpu', compile_model=False, resume=path)
+
+    def test_resume_adds_head_to_legacy_checkpoint(self):
+        from models.resnet import ResNet
+        small = dict(settings['resnet_model'],filters=8,blocks=1,se_hidden=4,
+                     score_embed_hidden=8,policy_filters=4,action_value_filters=4)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(settings,{'resnet_model':small}), contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
+            legacy = ResNet(mark_classes=False)
+            optimizer = torch.optim.AdamW(legacy.parameters())
+            board = torch.zeros(2,5,10,16)
+            scores = torch.zeros(2,2)
+            pi,q,_ = legacy(board,scores)
+            (pi.square().mean()+q.square().mean()).backward()
+            optimizer.step()
+            path = Path(directory)/'legacy.pt'
+            torch.save(dict(format_version=1,model=legacy.state_dict(),optimizer=optimizer.state_dict(),
+                            options=dict(self.options,model='resnet'),model_config=small,
+                            summary=dict(cycle=1),torch_rng=torch.get_rng_state(),cuda_rng=[]),path)
+            results = run(LIBRARY,dict(self.options,model='resnet'),cycles=1,
+                          device='cpu',compile_model=False,resume=path)
+            self.assertEqual(results[0]['cycle'],2)
+            self.assertGreater(results[0]['mark_class_loss'],0)
 
     def test_balanced_assignment(self):
         old,new = evaluation_rows(8)

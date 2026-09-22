@@ -3,6 +3,12 @@ import ctypes as C
 import torch
 
 
+def mark_classes_enabled(library):
+    function = C.CDLL(str(library)).klent_mark_classes_enabled
+    function.argtypes, function.restype = [], C.c_bool
+    return function()
+
+
 def check(status):
     if status < 0:
         raise RuntimeError("Rust KLENT operation failed; see the preceding Rust diagnostic")
@@ -19,8 +25,9 @@ class Arena:
             'step': ([C.c_void_p]*3, C.c_int),
             'stats': ([C.c_void_p]*2, None),
             'reset': ([C.c_void_p], C.c_size_t),
+            'shuffle': ([C.c_void_p], None),
             'clear': ([C.c_void_p], None),
-            'batch': ([C.c_void_p,C.c_size_t,C.c_size_t]+[C.c_void_p]*5, C.c_int),
+            'batch': ([C.c_void_p,C.c_size_t,C.c_size_t]+[C.c_void_p]*6, C.c_int),
         }
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, 'klent_'+name)
@@ -52,6 +59,9 @@ class Arena:
     def reset(self):
         return self.lib.klent_reset(self.handle)
 
+    def shuffle(self):
+        self.lib.klent_shuffle(self.handle)
+
     def clear(self):
         self.lib.klent_clear(self.handle)
 
@@ -78,4 +88,5 @@ class Batch:
             return torch.empty(shape,dtype=dtype,pin_memory=pinned)
         self.tensors = (empty((rows,5,10,16),torch.bfloat16),
             empty((rows,2),torch.bfloat16), empty((rows,160),torch.bfloat16),
-            empty((rows,),torch.int64), empty((rows,),torch.float32))
+            empty((rows,),torch.int64), empty((rows,),torch.float32),
+            empty((rows,80),torch.int8))

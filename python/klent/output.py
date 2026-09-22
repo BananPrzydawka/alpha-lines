@@ -31,8 +31,10 @@ def summary(row):
          f"  Dropped       {row['dropped_states']:>12,}",
          f"  Mean loss     {row['loss']:>12.4f}", '')
     for label, key in [('Model','model_seconds'), ('CPU','cpu_seconds'),
+                       ('Shuffle','shuffle_seconds'),
+                       ('Scoring head processing','scoring_head_processing_seconds'),
                        ('Training','training_seconds'), ('Strength test','strength_test_seconds')]:
-        emit(f'  {label:<14}{row[key]:>12.2f} s')
+        emit(f'  {label:<24}{row[key]:>12.2f} s')
     emit('', '  Opponent       W     D     L    Score')
     for result in row['evaluations']:
         w,d,l = (result[k] for k in ('wins','draws','losses'))

@@ -58,12 +58,12 @@ class NestedBottleneck(nn.Module):
 
 
 class KataGoNet(nn.Module):
-    """forward(board, scores) -> (policy_logits, action_values), each (B, 10, 16).
+    """forward(board, scores) -> policy, action values, mark classes (B, 6, 10, 16).
 
     Scores are raw values in [0, 80], ordered current player then opponent;
     board player planes must use the same perspective. Outputs are unbounded.
     """
-    def __init__(self):
+    def __init__(self, mark_classes=True):
         super().__init__()
         options = settings["katago_model"]
         channels = options["filters"]
@@ -81,6 +81,8 @@ class KataGoNet(nn.Module):
         ))
         self.policy_head = spatial_head(channels, options["policy_filters"], norm)
         self.action_value_head = spatial_head(channels, options["action_value_filters"], norm)
+        self.mark_class_head = (spatial_head(channels, options.get("mark_class_filters", options["action_value_filters"]), norm, 6)
+                                if mark_classes else None)
 
     def forward(self, board, scores):
         board, scores = prepare_inputs(board, scores)
@@ -88,4 +90,5 @@ class KataGoNet(nn.Module):
         features = F.silu(features + self.score_embed(scores)[:, :, None, None])
         features = self.tower(features)
         return (self.policy_head(features).squeeze(1),
-                self.action_value_head(features).squeeze(1))
+                self.action_value_head(features).squeeze(1),
+                self.mark_class_head(features) if self.mark_class_head is not None else None)

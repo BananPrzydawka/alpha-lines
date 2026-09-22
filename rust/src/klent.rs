@@ -1,5 +1,5 @@
 //! Single-threaded KLENT collection, compact storage and Python tensor encoding.
-use crate::{game::{board_index, Rng}, Game, Scratch};
+use crate::{game::{board_index, Rng, MARK_CLASS_SQUARES, NO_MARK_CLASS, TRACK_MARK_CLASSES}, Game, Scratch};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 pub fn bf16(x: f32) -> u16 {
@@ -13,14 +13,15 @@ fn float(x: u16) -> f32 { f32::from_bits((x as u32) << 16) }
 pub struct Record<T> {
     board: [u8; 20],
     scores: [u8; 2],
+    mark_classes: [i8; MARK_CLASS_SQUARES],
     actions: [u8; 2],
     policy: [[u16; 80]; 2],
     returns: T,
 }
 type Position = Record<[u16; 2]>;
 type History = Record<[f32; 2]>;
-const _: () = assert!(std::mem::size_of::<Position>() == 348);
-const _: () = assert!(std::mem::size_of::<History>() == 352);
+const _: () = assert!(std::mem::size_of::<Position>() == 348 + MARK_CLASS_SQUARES);
+const _: () = assert!(std::mem::size_of::<History>() == 352 + MARK_CLASS_SQUARES);
 
 fn finish(history: &mut Vec<History>, reward: [f32; 2], lambda: f32, buffer: &mut Vec<Position>) {
     let mut ret = reward;
@@ -30,7 +31,8 @@ fn finish(history: &mut Vec<History>, reward: [f32; 2], lambda: f32, buffer: &mu
         }
         // The following iteration needs V_t, so write into a separate destination.
         let h = &history[t];
-        buffer.push(Position { board: h.board, scores: h.scores, actions: h.actions, policy: h.policy, returns: ret.map(bf16) });
+        buffer.push(Position { board: h.board, scores: h.scores, mark_classes: h.mark_classes,
+            actions: h.actions, policy: h.policy, returns: ret.map(bf16) });
     }
     let start = buffer.len()-history.len();
     buffer[start..].reverse();
@@ -91,7 +93,7 @@ fn sample(p: &[f32; 80], rng: &mut Rng) -> usize {
 pub struct Arena {
     games: Vec<Game>, histories: Vec<Vec<History>>, buffer: Vec<Position>,
     capacity: usize, max_ply: usize, alpha: f32, beta: f32, lambda: f32,
-    rng: Rng, scratch: Scratch, evaluation: bool, pub results: [usize; 3],
+    rng: Rng, shuffle_rng: Rng, scratch: Scratch, evaluation: bool, pub results: [usize; 3],
 }
 impl Arena {
     pub fn new(n: usize, capacity: usize, max_ply: usize, alpha: f32, beta: f32, lambda: f32, seed: u64, evaluation: bool) -> Self {
@@ -101,7 +103,8 @@ impl Arena {
         assert!(lambda.is_finite() && (0.0..=1.0).contains(&lambda));
         Self { games: vec![Game::new(); n], histories: (0..n).map(|_| Vec::with_capacity(if evaluation {0} else {max_ply})).collect(),
             buffer: Vec::with_capacity(if evaluation {0} else {capacity}), capacity, max_ply, alpha, beta, lambda,
-            rng: Rng::new(seed), scratch: Scratch::new(), evaluation, results: [0; 3] }
+            rng: Rng::new(seed), shuffle_rng: Rng::new(seed ^ 0x9e37_79b9_7f4a_7c15),
+            scratch: Scratch::new(), evaluation, results: [0; 3] }
     }
     pub fn inputs(&self, boards: &mut [u16], scores: &mut [u16]) {
         boards.fill(0); scores.fill(0);
@@ -131,7 +134,8 @@ impl Arena {
             if !self.evaluation {
                 assert!(self.histories[i].len() < self.max_ply);
                 self.histories[i].push(History { board: pack(&self.games[i].cells),
-                    scores: self.games[i].scores.map(|s| u8::try_from(s).unwrap()), actions, policy: policies, returns: values });
+                    scores: self.games[i].scores.map(|s| u8::try_from(s).unwrap()),
+                    mark_classes: self.games[i].mark_classes, actions, policy: policies, returns: values });
             }
             self.games[i].action_step(actions[0] as usize, actions[1] as usize, &mut self.scratch);
             if self.games[i].finished {
@@ -156,6 +160,12 @@ impl Arena {
         for h in &mut self.histories { h.clear(); }
         self.games.fill(Game::new()); dropped
     }
+    pub fn shuffle(&mut self) {
+        for i in (1..self.buffer.len()).rev() {
+            let j = self.shuffle_rng.randint((i+1) as u64) as usize;
+            self.buffer.swap(i,j);
+        }
+    }
 }
 
 // Project-private ABI. Python owns handles and validates contiguous tensor shapes.
@@ -166,6 +176,8 @@ pub extern "C" fn klent_new(n: usize, m: usize, max_ply: usize, alpha: f32, beta
 }
 #[no_mangle]
 pub unsafe extern "C" fn klent_free(h: *mut Arena) { if !h.is_null() { drop(Box::from_raw(h)); } }
+#[no_mangle]
+pub extern "C" fn klent_mark_classes_enabled() -> bool { TRACK_MARK_CLASSES }
 #[no_mangle]
 pub unsafe extern "C" fn klent_inputs(h: *mut Arena, b: *mut u16, s: *mut u16) -> i32 {
     catch_unwind(AssertUnwindSafe(|| { let a=&*h; a.inputs(std::slice::from_raw_parts_mut(b,a.games.len()*1600), std::slice::from_raw_parts_mut(s,a.games.len()*4)); 0 })).unwrap_or(-1)
@@ -181,9 +193,11 @@ pub unsafe extern "C" fn klent_stats(h: *mut Arena, out: *mut usize) {
 #[no_mangle]
 pub unsafe extern "C" fn klent_reset(h: *mut Arena) -> usize { (&mut *h).reset() }
 #[no_mangle]
+pub unsafe extern "C" fn klent_shuffle(h: *mut Arena) { (&mut *h).shuffle() }
+#[no_mangle]
 pub unsafe extern "C" fn klent_clear(h: *mut Arena) { (&mut *h).buffer.clear(); }
 #[no_mangle]
-pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize, b: *mut u16, s: *mut u16, pi: *mut u16, actions: *mut i64, returns: *mut f32) -> i32 {
+pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize, b: *mut u16, s: *mut u16, pi: *mut u16, actions: *mut i64, returns: *mut f32, classes: *mut i8) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         let a=&*h;
         let boards=std::slice::from_raw_parts_mut(b,count*1600);
@@ -191,7 +205,9 @@ pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize, 
         let policies=std::slice::from_raw_parts_mut(pi,count*320);
         let moves=std::slice::from_raw_parts_mut(actions,count*2);
         let targets=std::slice::from_raw_parts_mut(returns,count*2);
+        let mark_classes=std::slice::from_raw_parts_mut(classes,count*160);
         boards.fill(0); scores.fill(0); policies.fill(0); moves.fill(0); targets.fill(0.0);
+        mark_classes.fill(NO_MARK_CLASS);
         let end=(start+count).min(a.buffer.len());
         for (i,pos) in a.buffer[start..end].iter().enumerate() {
             for p in 0..2 {
@@ -200,6 +216,14 @@ pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize, 
                 for sq in 0..80 { policies[row*160+board_index(sq)]=pos.policy[p][sq]; }
                 moves[row]=board_index(pos.actions[p] as usize) as i64;
                 targets[row]=float(pos.returns[p]);
+                if TRACK_MARK_CLASSES {
+                    for sq in 0..80 {
+                        let class=pos.mark_classes[sq];
+                        mark_classes[row*80+sq] = if class < 0 { class }
+                            else if p == 0 { class }
+                            else if class < 3 { class+3 } else { class-3 };
+                    }
+                }
             }
         }
         (end-start) as i32
@@ -212,7 +236,7 @@ mod tests {
     #[test] fn exact_returns_use_next_state_and_preserve_order() {
         for lambda in [0.0, 0.5, 1.0] {
             let mut history: Vec<History> = (0..3).map(|i| History {
-                board: [i;20], scores: [0;2], actions: [0;2], policy: [[0;80];2],
+                board: [i;20], scores: [0;2], mark_classes: [NO_MARK_CLASS;MARK_CLASS_SQUARES], actions: [0;2], policy: [[0;80];2],
                 returns: [i as f32 * 0.25, -(i as f32)*0.25],
             }).collect();
             let mut buffer = Vec::new();
@@ -229,12 +253,32 @@ mod tests {
     #[test] fn packing_and_layout() {
         let cells=std::array::from_fn(|i| (i%4) as u8);
         assert_eq!(unpack(&pack(&cells)),cells);
-        assert_eq!(std::mem::size_of::<Position>(),348);
+        assert_eq!(std::mem::size_of::<Position>(),348 + MARK_CLASS_SQUARES);
         let mut b=vec![0;1600]; let mut s=vec![0;4];
         encode(&cells,[3,7],0,&mut b[..800],&mut s[..2]);
         encode(&cells,[3,7],1,&mut b[800..],&mut s[2..]);
         assert_eq!(s,[bf16(3.0),bf16(7.0),bf16(7.0),bf16(3.0)]);
         assert_eq!(&b[480..640],&b[1440..1600]);
+    }
+    #[test] fn shuffle_reorders_whole_positions() {
+        let mut arena=Arena::new(1,80,80,0.03,0.1,0.8,1,false);
+        arena.buffer=(0..40).map(|i| Position {
+            board: [i;20], scores: [i,i], mark_classes: [i as i8;MARK_CLASS_SQUARES], actions: [i,i],
+            policy: [[i as u16;80];2], returns: [bf16(i as f32);2],
+        }).collect();
+        arena.shuffle();
+        let order: Vec<_> = arena.buffer.iter().map(|p| p.board[0]).collect();
+        assert_ne!(order,(0..40).collect::<Vec<_>>());
+        let mut sorted=order.clone(); sorted.sort_unstable();
+        assert_eq!(sorted,(0..40).collect::<Vec<_>>());
+        for p in &arena.buffer {
+            let i=p.board[0];
+            assert_eq!(p.scores,[i,i]);
+            assert_eq!(p.mark_classes,[i as i8;MARK_CLASS_SQUARES]);
+            assert_eq!(p.actions,[i,i]);
+            assert_eq!(p.policy[0][0],i as u16);
+            assert_eq!(p.returns,[bf16(i as f32);2]);
+        }
     }
     #[test] fn policy_mask_and_formula() {
         let g=Game::new(); let logits=std::array::from_fn::<_,80,_>(|i| i as f32/80.0);

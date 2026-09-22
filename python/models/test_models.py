@@ -23,8 +23,8 @@ class ActionModelTests(unittest.TestCase):
                 scores = torch.tensor([[0, 80], [41, 40]])
                 outputs = net(board, scores)
                 changed = net(board, scores.flip(1))
-                for output, other in zip(outputs, changed):
-                    self.assertEqual(output.shape, (2, 10, 16))
+                for i, (output, other) in enumerate(zip(outputs, changed)):
+                    self.assertEqual(output.shape, (2, 6, 10, 16) if i == 2 else (2, 10, 16))
                     self.assertTrue(torch.isfinite(output).all())
                     self.assertFalse(torch.allclose(output, other))
                 sum(x.square().mean() for x in outputs).backward()

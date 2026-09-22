@@ -14,7 +14,7 @@
     "max_ply": 80,
     "alpha": 0.03,
     "beta": 0.1,
-    "lambda": 0.951229425,
+    "lambda": 0.94,
     "train_minibatch": 4096,
     "lr": 0.0003,
     "test_games": 1024,
@@ -30,6 +30,7 @@
     "score_embed_hidden": 128,
     "policy_filters": 64,
     "action_value_filters": 64,
+    "mark_class_filters": 64,
     "group_norm": {
       "groups": 8,
       "eps": 1e-05,
@@ -43,6 +44,7 @@
     "score_embed_hidden": 128,
     "policy_filters": 64,
     "action_value_filters": 64,
+    "mark_class_filters": 64,
     "group_norm": {
       "groups": 8,
       "eps": 1e-05,

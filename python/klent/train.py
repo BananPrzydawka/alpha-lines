@@ -9,8 +9,9 @@ from pathlib import Path
 from time import perf_counter
 
 import torch
+import torch.nn.functional as F
 from config import settings
-from klent.native import Arena, Batch
+from klent.native import Arena, Batch, mark_classes_enabled
 from klent import output
 from models.katago import KataGoNet
 from models.resnet import ResNet
@@ -47,6 +48,34 @@ def losses(logits, q, target, actions, returns, valid):
     return (policy*valid).sum()/denominator, (value*valid).sum()/denominator
 
 
+def mark_class_targets(classes, indices):
+    """Expand perspective-relative classes into six spatial one-hot planes."""
+    present = classes >= 0
+    target = torch.zeros((classes.shape[0], 6, 160), device=classes.device, dtype=torch.float32)
+    target[:, :, indices] = F.one_hot(classes.long().clamp_min(0), 6).permute(0, 2, 1).float() * present[:, None, :]
+    return target.reshape(-1, 6, 10, 16)
+
+
+def mark_class_loss(logits, target, valid):
+    per_cell = -(target * logits.float().log_softmax(1)).sum(1)
+    occupied = target.sum(1) * valid[:, None, None]
+    return (per_cell * occupied).sum() / occupied.sum().clamp_min(1)
+
+
+def restore_optimizer(optimizer, saved):
+    """Preserve existing AdamW moments when a new output head is appended."""
+    current = optimizer.state_dict()
+    if len(saved['param_groups']) != len(current['param_groups']):
+        raise ValueError('Checkpoint optimizer groups do not match the model')
+    for old_group, new_group in zip(saved['param_groups'], current['param_groups']):
+        old_ids, new_ids = old_group['params'], new_group['params']
+        new_group.update({k: v for k, v in old_group.items() if k != 'params'})
+        for old_id, new_id in zip(old_ids, new_ids):
+            if old_id in saved['state']:
+                current['state'][new_id] = saved['state'][old_id]
+    optimizer.load_state_dict(current)
+
+
 def evaluation_rows(games):
     """CPU row indices matching native new-model result accounting."""
     if games < 2 or games % 2:
@@ -57,16 +86,16 @@ def evaluation_rows(games):
 
 
 class ModelHistory:
-    """Eight independent CPU weight snapshots, newest first when selecting ages."""
+    """32 independent CPU weight snapshots, newest first when selecting ages."""
     def __init__(self):
-        self.snapshots = deque(maxlen=8)
+        self.snapshots = deque(maxlen=32)
 
     def remember(self, model):
         self.snapshots.append({k: v.detach().to('cpu', copy=True)
                                for k,v in model.state_dict().items()})
 
     def opponents(self):
-        return [(age,self.snapshots[-age]) for age in (1,2,4,8)
+        return [(age,self.snapshots[-age]) for age in (1,2,4,8,16,32)
                 if age <= len(self.snapshots)]
 
 
@@ -116,12 +145,15 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     torch.set_num_threads(1)
     torch.manual_seed(options['seed'])
     factory = {'katago':KataGoNet,'resnet':ResNet}[options['model']]
-    model = factory().to(device=device,dtype=torch.float32,memory_format=torch.channels_last)
+    use_mark_classes = mark_classes_enabled(library)
+    model = factory(mark_classes=use_mark_classes).to(device=device,dtype=torch.float32,memory_format=torch.channels_last)
     old = copy.deepcopy(model).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(),lr=options['lr'],weight_decay=options['weight_decay'])
     if restored is not None:
-        model.load_state_dict(restored['model'])
-        optimizer.load_state_dict(restored['optimizer'])
+        missing, unexpected = model.load_state_dict(restored['model'], strict=False)
+        if any(not key.startswith('mark_class_head.') for key in unexpected) or any(not key.startswith('mark_class_head.') for key in missing):
+            raise ValueError(f'Checkpoint model mismatch: missing={missing}, unexpected={unexpected}')
+        restore_optimizer(optimizer, restored['optimizer'])
         # Loading AdamW also restores param-group settings: apply current config.
         for group in optimizer.param_groups:
             group['lr'] = options['lr']
@@ -146,7 +178,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     def infer(net, boards, scores):
         with torch.no_grad(), torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
             b,s = dev.transfer((boards,scores))
-            pi,q = net(b.contiguous(memory_format=torch.channels_last),s)
+            pi,q,_ = net(b.contiguous(memory_format=torch.channels_last),s)
             # Blocking CPU copies also prevent reuse of compiled output storage
             # before the native consumer finishes with the result.
             return (pi.flatten(1)[:,indices].float().cpu().contiguous(),
@@ -160,6 +192,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                         resume=str(resume) if resume else None, initial_cycle=completed,
                         options=options, model_config=settings[options['model']+'_model'],
                         precision='fp32-weights-bf16-autocast', device=str(device),
+                        mark_classes_enabled=use_mark_classes,
                         gpu=torch.cuda.get_device_name(device) if dev.cuda else None,
                         torch_version=str(torch.__version__), compiled=compile_model)
         (log_dir/'run.json').write_text(json.dumps(metadata, indent=2)+'\n')
@@ -189,25 +222,37 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             count = arena.stats()[0]
             dropped = arena.reset()
             cpu_time += perf_counter()-t+encoding_time
+            processing_start = perf_counter()
+            arena.shuffle()
+            shuffle_time = perf_counter()-processing_start
             output.emit(f"  Mean over {arena_step:,} steps: CPU {cpu_time*1000/arena_step:.3f} ms | Model {model_time*1000/arena_step:.3f} ms")
             output.training_header(count, dropped)
             dev.sync(); training_start = perf_counter()
             history.remember(model)
             model.train()
-            loss_sum = policy_sum = value_sum = 0.0
+            loss_sum = policy_sum = value_sum = mark_sum = 0.0
+            scoring_processing_time = 0.0
             timing_sum = [0.0, 0.0, 0.0]
             for start in range(0,count,batch.rows//2):
                 valid_positions = arena.batch(start,batch)
-                b,s,target,actions,returns = dev.transfer(batch.tensors)
+                b,s,target,actions,returns,classes = dev.transfer(batch.tensors)
+                if use_mark_classes:
+                    dev.sync(); scoring_processing_start = perf_counter()
+                    class_target = mark_class_targets(classes, indices)
+                    dev.sync()
+                    scoring_processing_time += perf_counter()-scoring_processing_start
+                else:
+                    class_target = None
                 b = b.contiguous(memory_format=torch.channels_last)
                 valid = (rows < 2*valid_positions).float()
                 optimizer.zero_grad(set_to_none=True)
                 torch.compiler.cudagraph_mark_step_begin()
                 forward_start = dev.stamp()
                 with torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
-                    logits,values = network(b,s)
+                    logits,values,mark_logits = network(b,s)
                     policy_loss,value_loss = losses(logits,values,target,actions,returns,valid)
-                    loss = policy_loss+value_loss
+                    mark_loss = mark_class_loss(mark_logits,class_target,valid) if use_mark_classes else None
+                    loss = policy_loss+value_loss+(mark_loss if use_mark_classes else 0)
                 forward_end = dev.stamp()
                 loss.backward()
                 backward_end = dev.stamp()
@@ -221,6 +266,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 batch_number = start//(batch.rows//2)+1
                 policy_sum += policy_loss.item()*valid_positions
                 value_sum += value_loss.item()*valid_positions
+                if use_mark_classes:
+                    mark_sum += mark_loss.item()*valid_positions
                 for j, (first, second) in enumerate(((forward_start,forward_end),
                         (forward_end,backward_end),(backward_end,optimizer_end))):
                     timing_sum[j] += dev.elapsed(first,second)
@@ -228,7 +275,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 f"  Forward {timing_sum[0]/batch_number:.3f} | Backward {timing_sum[1]/batch_number:.3f}"
                 f" | Optimizer {timing_sum[2]/batch_number:.3f}",
                 f"  Position-weighted loss {loss_sum/count:.4f} | Policy {policy_sum/count:.4f}"
-                f" | Q {value_sum/count:.4f}")
+                f" | Q {value_sum/count:.4f} | Mark {mark_sum/count:.4f}")
             arena.clear()
             dev.sync(); training_time = perf_counter()-training_start
             output.strength_header(options['test_games'])
@@ -266,7 +313,9 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             wins,draws,losses_count = (latest[k] for k in ('wins','draws','losses'))
             completed += 1
             summary = dict(cycle=completed,evaluations=evaluations,states=count,dropped_states=dropped,loss=loss_sum/count,
-                           model_seconds=model_time,cpu_seconds=cpu_time,training_seconds=training_time,
+                           model_seconds=model_time,cpu_seconds=cpu_time,
+                           shuffle_seconds=shuffle_time,scoring_head_processing_seconds=scoring_processing_time,
+                           training_seconds=training_time,
                            strength_test_seconds=test_time,wins=wins,draws=draws,losses=losses_count,
                            selfplay_steps=arena_step,batches=batch_number,
                            mean_cpu_ms=cpu_time*1000/arena_step,
@@ -274,7 +323,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                            mean_forward_ms=timing_sum[0]/batch_number,
                            mean_backward_ms=timing_sum[1]/batch_number,
                            mean_optimizer_ms=timing_sum[2]/batch_number,
-                           policy_loss=policy_sum/count,q_loss=value_sum/count)
+                           policy_loss=policy_sum/count,q_loss=value_sum/count,mark_class_loss=mark_sum/count)
             summary.update(timestamp=datetime.now(timezone.utc).isoformat(),
                            elapsed_seconds=perf_counter()-run_start,
                            win_rate=latest['win_rate'], score_rate=latest['score_rate'])

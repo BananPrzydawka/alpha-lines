@@ -9,12 +9,12 @@ def group_norm(channels, options):
                         eps=options["eps"], affine=options["affine"])
 
 
-def spatial_head(channels, hidden, norm):
+def spatial_head(channels, hidden, norm, outputs=1):
     return nn.Sequential(
         nn.Conv2d(channels, hidden, 1, bias=False),
         group_norm(hidden, norm),
         nn.SiLU(),
-        nn.Conv2d(hidden, 1, 1),
+        nn.Conv2d(hidden, outputs, 1),
     )
 
 

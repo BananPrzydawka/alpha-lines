@@ -66,10 +66,22 @@ with FP32 weights, optimizer moments and losses.
 
 Snapshots are saved atomically after complete cycles. Native games and opponent
 history are rebuilt on resume, so restarting is not an exact replay.
-Evaluation compares against process-local snapshots aged 1, 2, 4 and 8 cycles
-when available, with balanced player assignments. `test_games` must be even.
+Evaluation retains 32 CPU weight snapshots in RAM and compares against snapshots
+aged 1, 2, 4, 8, 16 and 32 cycles when available, with balanced player assignments.
+`test_games` must be even and applies to each opponent separately.
 Metrics record losses, W/D/L, historical matchups, counts and timings; `run.json`
 records the effective configuration, precision, hardware and resume source.
+Completed positions are shuffled before each cycle's single training epoch. Shuffle
+time is reported as `shuffle_seconds`; expansion of mark classes into training
+planes is reported as `scoring_head_processing_seconds`.
+
+The auxiliary mark head predicts six classes on occupied squares: own or opponent
+mark contributing 0, 1, or 2 points. Its target is derived from the current
+border-connected diagonal runs and stored with each self-play position. The
+head is added automatically when resuming a two-head FP32 checkpoint, preserving
+existing weights and AdamW moments. To compile out mark classification and its
+storage, set `TRACK_MARK_CLASSES` to `false` in `rust/src/game.rs` and rebuild Rust;
+training detects this and omits the head and auxiliary loss.
 
 After dependency setup, local training can also run directly:
 

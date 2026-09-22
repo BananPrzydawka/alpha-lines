@@ -142,6 +142,11 @@ const ANTI: Dir = (1, true);
 const MAIN: Dir = (1, false);
 const FAMILIES: [Dir; 2] = [ANTI, MAIN];
 
+/// Set to false to compile out per-mark training labels and their update scan.
+pub const TRACK_MARK_CLASSES: bool = true;
+pub const NO_MARK_CLASS: i8 = -1;
+pub const MARK_CLASS_SQUARES: usize = if TRACK_MARK_CLASSES { SQUARES } else { 0 };
+
 #[inline]
 fn back(d: Dir) -> Dir {
     (-d.0, !d.1)
@@ -478,6 +483,40 @@ fn score_board(cells: &[u8], level: &[u8], p: u8) -> i32 {
     (0..SQUARES).map(|i| runs_starting_at(cells, level, i, p)).sum()
 }
 
+/// Classes 0..2 are player 0's marks worth 0..2 points; 3..5 are player 1's.
+/// Each qualifying diagonal run contributes one point to every mark in it.
+fn classify_marks(cells: &[u8], level: &[u8], classes: &mut [i8]) {
+    debug_assert_eq!(classes.len(), SQUARES);
+    classes.fill(NO_MARK_CLASS);
+    for i in 0..SQUARES {
+        let p = cells[i];
+        if p == PLAYER_0_MARK || p == PLAYER_1_MARK {
+            classes[i] = if p == PLAYER_0_MARK { 0 } else { 3 };
+        }
+    }
+    for i in 0..SQUARES {
+        let p = cells[i];
+        if p != PLAYER_0_MARK && p != PLAYER_1_MARK { continue; }
+        for v in FAMILIES {
+            if mark_at(cells, i, back(v), p) { continue; }
+            let mut end = i;
+            let mut len = 1;
+            while let Some(n) = step(end, v) {
+                if cells[n] != p { break; }
+                end = n;
+                len += 1;
+            }
+            if len < 2 || level[i] == INF { continue; }
+            let mut at = i;
+            loop {
+                classes[at] += 1;
+                if at == end { break; }
+                at = step(at, v).unwrap();
+            }
+        }
+    }
+}
+
 /// Score of the runs that *begin* at `i`, in either family. Zero if `i` holds no mark of
 /// `p`, if an earlier cell owns the run, if the run is shorter than 2, or if it is
 /// unreachable. A cell in a qualifying run of both families counts twice, as intended.
@@ -740,6 +779,8 @@ pub struct Game {
     pub levels: [u8; SQUARES],
     /// Running score, integer because every score is a sum of run lengths.
     pub scores: [i32; 2],
+    /// -1 for an unmarked square; otherwise player and points contributed, 0..5.
+    pub mark_classes: [i8; MARK_CLASS_SQUARES],
     /// Only ever compared against zero, for the opening-move half-board rule.
     pub move_count: u32,
     pub finished: bool,
@@ -759,6 +800,7 @@ impl Game {
             cells: [PLAYABLE_SQUARE; SQUARES],
             levels: [INF; SQUARES],
             scores: [0; 2],
+            mark_classes: [NO_MARK_CLASS; MARK_CLASS_SQUARES],
             move_count: 0,
             finished: false,
             legal: LEGAL_ALL,
@@ -776,6 +818,7 @@ impl Game {
             cells,
             levels: [INF; SQUARES],
             scores: [0; 2],
+            mark_classes: [NO_MARK_CLASS; MARK_CLASS_SQUARES],
             move_count: 0,
             finished: false,
             legal: [0; LEGAL_WORDS],
@@ -794,6 +837,7 @@ impl Game {
             score_board(&g.cells, &g.levels, PLAYER_0_MARK),
             score_board(&g.cells, &g.levels, PLAYER_1_MARK),
         ];
+        if TRACK_MARK_CLASSES { classify_marks(&g.cells, &g.levels, &mut g.mark_classes); }
         g
     }
 
@@ -914,6 +958,7 @@ impl Game {
             i1,
             s,
         );
+        if TRACK_MARK_CLASSES { classify_marks(&self.cells, &self.levels, &mut self.mark_classes); }
         self.move_count += 1;
         self.finished = self.no_moves_left();
     }
@@ -972,5 +1017,62 @@ impl Game {
     #[inline]
     fn holds_bit(&self, k: usize, player: usize) -> bool {
         k < SQUARES && self.legal_moves(player)[k >> 6] >> (k & 63) & 1 == 1
+    }
+}
+
+#[cfg(test)]
+mod mark_class_tests {
+    use super::*;
+
+    #[test]
+    fn classes_follow_runs_and_sum_to_scores() {
+        if !TRACK_MARK_CLASSES { return; }
+        let mut cells = [PLAYABLE_SQUARE; SQUARES];
+        let sq = |r: usize, c: usize| r * ROW + c / 2;
+        // The border mark (0, 0) anchors both diagonals through (1, 1).
+        for (r, c) in [(0,0), (1,1), (2,2), (3,3), (2,0)] {
+            cells[sq(r,c)] = PLAYER_0_MARK;
+        }
+        // Interior isolated mark is worth zero.
+        cells[sq(5,5)] = PLAYER_1_MARK;
+        let mut scratch = Scratch::new();
+        let game = Game::from_cells(cells, &mut scratch);
+        assert_eq!(game.mark_classes[sq(1,1)], 2);
+        assert_eq!(game.mark_classes[sq(5,5)], 3);
+        for p in 0..2 {
+            let sum: i32 = game.mark_classes.iter().filter(|&&class| class >= (3*p) as i8 && class < (3*p+3) as i8)
+                .map(|&class| (class as i32) % 3).sum();
+            assert_eq!(sum, game.scores[p]);
+        }
+    }
+
+    #[test]
+    fn classes_stay_in_sync_through_random_games() {
+        if !TRACK_MARK_CLASSES { return; }
+        let mut rng = Rng::new(9);
+        let mut scratch = Scratch::new();
+        for _ in 0..20 {
+            let mut game = Game::new();
+            while !game.finished {
+                let pick = |game: &Game, p: usize, rng: &mut Rng| {
+                    let mut choices = Vec::new();
+                    let mask = game.legal_moves(p);
+                    for sq in 0..SQUARES {
+                        if mask[sq >> 6] >> (sq & 63) & 1 != 0 { choices.push(sq); }
+                    }
+                    choices[rng.randint(choices.len() as u64) as usize]
+                };
+                let a = pick(&game, 0, &mut rng);
+                let b = pick(&game, 1, &mut rng);
+                game.action_step(a, b, &mut scratch);
+                let rebuilt = Game::from_cells(game.cells, &mut scratch);
+                assert_eq!(game.mark_classes, rebuilt.mark_classes);
+                for p in 0..2 {
+                    let sum: i32 = game.mark_classes.iter().filter(|&&class| class >= (3*p) as i8 && class < (3*p+3) as i8)
+                        .map(|&class| (class as i32) % 3).sum();
+                    assert_eq!(sum, game.scores[p]);
+                }
+            }
+        }
     }
 }
