@@ -23,7 +23,7 @@ class ActionModelTests(unittest.TestCase):
                 outputs = net(board)
                 for i, output in enumerate(outputs):
                     self.assertEqual(output.shape, [(2, 10, 16), (2, 10, 16),
-                                                    (2, 6, 10, 16), (2, 2, 81)][i])
+                                                    (2, 6, 10, 16), (2, 2, 81), (2, 2, 81)][i])
                     self.assertTrue(torch.isfinite(output).all())
                 sum(x.square().mean() for x in outputs).backward()
                 for name, parameter in net.named_parameters():
@@ -31,6 +31,9 @@ class ActionModelTests(unittest.TestCase):
                     self.assertTrue(torch.isfinite(parameter.grad).all(), name)
                 net.zero_grad(set_to_none=True)
                 net(board)[3].square().mean().backward()
+                self.assertGreater(next(net.tower.parameters()).grad.abs().sum(), 0)
+                net.zero_grad(set_to_none=True)
+                net(board)[4].square().mean().backward()
                 self.assertGreater(next(net.tower.parameters()).grad.abs().sum(), 0)
                 net.eval()
                 alone = net(board[0])

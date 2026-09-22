@@ -29,11 +29,13 @@ def validate(options):
         raise ValueError('test_games must be even for balanced sides')
     if options['train_minibatch'] % 2:
         raise ValueError('train_minibatch counts perspectives and must be even')
-    for key in ('alpha','beta','lambda','lr','weight_decay','immediate_score_weight'):
+    for key in ('alpha','beta','lambda','lr','weight_decay',
+                'policy_loss_weight','q_loss_weight','mark_class_loss_weight',
+                'immediate_score_weight','discounted_score_weight','discounted_score_lambda'):
         if not math.isfinite(options[key]) or options[key] < 0:
             raise ValueError(f'klent.{key} must be nonnegative and finite')
-    if options['alpha']+options['beta'] <= 0 or options['lambda'] > 1 or options['lr'] <= 0:
-        raise ValueError('require alpha+beta > 0, lambda <= 1, and lr > 0')
+    if options['alpha']+options['beta'] <= 0 or options['lambda'] > 1 or options['discounted_score_lambda'] > 1 or options['lr'] <= 0:
+        raise ValueError('require alpha+beta > 0, lambda and discounted_score_lambda <= 1, and lr > 0')
     if type(options['seed']) is not int or not 0 <= options['seed'] < 2**64:
         raise ValueError('seed must fit u64')
     if options['model'] not in ('resnet','katago') or options['optimizer'].lower() != 'adamw':
@@ -68,6 +70,14 @@ def immediate_score_loss(logits, scores, valid):
     per_player = F.cross_entropy(logits.float().flatten(0, 1),
                                  targets.clamp(0, 80).flatten(), reduction='none')
     per_row = per_player.reshape(-1, 2).mean(1)
+    return (per_row * valid).sum() / valid.sum().clamp_min(1)
+
+
+def discounted_score_loss(logits, target, valid):
+    """Soft-target cross-entropy for both players' future-score distributions."""
+    target = target.float()
+    target = target / target.sum(-1, keepdim=True).clamp_min(1)
+    per_row = -(target * logits.float().log_softmax(-1)).sum(-1).mean(-1)
     return (per_row * valid).sum() / valid.sum().clamp_min(1)
 
 
@@ -140,6 +150,7 @@ class Device:
 
 def run(library, options=None, *, cycles=None, device='cuda', compile_model=True, checkpoint=None, resume=None, log_dir=None):
     """cycles=0 runs until interrupted or the Modal function timeout expires."""
+    run_start = perf_counter()
     options = dict(settings['klent'] if options is None else options)
     cycles = options['cycles'] if cycles is None else cycles
     restored = None
@@ -155,6 +166,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
         model_key = options['model']+'_model'
         model_config = dict(restored['model_config'])
         model_config.setdefault('immediate_score_filters', settings[model_key]['immediate_score_filters'])
+        model_config.setdefault('discounted_score_filters', settings[model_key]['discounted_score_filters'])
         settings[model_key] = model_config
     options['cycles'] = cycles
     validate(options)
@@ -170,7 +182,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     optimizer = torch.optim.AdamW(model.parameters(),lr=options['lr'],weight_decay=options['weight_decay'])
     if restored is not None:
         missing, unexpected = model.load_state_dict(restored['model'], strict=False)
-        if any(not key.startswith(('mark_class_head.', 'score_embed.')) for key in unexpected) or any(not key.startswith(('mark_class_head.', 'immediate_score_head.')) for key in missing):
+        if any(not key.startswith(('mark_class_head.', 'score_embed.')) for key in unexpected) or any(not key.startswith(('mark_class_head.', 'immediate_score_head.', 'discounted_score_head.')) for key in missing):
             raise ValueError(f'Checkpoint model mismatch: missing={missing}, unexpected={unexpected}')
         restore_optimizer(optimizer, restored['optimizer'], restored['model'], model)
         # Loading AdamW also restores param-group settings: apply current config.
@@ -197,13 +209,12 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     def infer(net, boards):
         with torch.no_grad(), torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
             b, = dev.transfer((boards,))
-            pi,q,_,_ = net(b.contiguous(memory_format=torch.channels_last))
+            pi,q,_,_,_ = net(b.contiguous(memory_format=torch.channels_last))
             # Blocking CPU copies also prevent reuse of compiled output storage
             # before the native consumer finishes with the result.
             return (pi.flatten(1)[:,indices].float().cpu().contiguous(),
                     q.flatten(1)[:,indices].float().cpu().contiguous())
 
-    run_start = perf_counter()
     if log_dir is not None:
         log_dir = Path(log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -217,9 +228,12 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
         (log_dir/'run.json').write_text(json.dumps(metadata, indent=2)+'\n')
     output.setup(options, device, compile_model)
     with Arena(library,options,pinned=dev.cuda,seed=(options['seed']+completed)%(2**64)) as arena:
+        output.emit(f'  Setup      {perf_counter()-run_start:.2f} s')
         model_time = cpu_time = 0.0
         arena_step = 0
         while cycles == 0 or completed < stop_cycle:
+            if arena_step == 0:
+                cycle_start = perf_counter()
             arena_step += 1
             t = perf_counter()
             boards,_ = arena.inputs()
@@ -245,12 +259,12 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             dev.sync(); training_start = perf_counter()
             history.remember(model)
             model.train()
-            loss_sum = policy_sum = value_sum = mark_sum = immediate_score_sum = 0.0
+            loss_sum = policy_sum = value_sum = mark_sum = immediate_score_sum = discounted_score_sum = 0.0
             scoring_processing_time = 0.0
             timing_sum = [0.0, 0.0, 0.0]
             for start in range(0,count,batch.rows//2):
                 valid_positions = arena.batch(start,batch)
-                b,s,target,actions,returns,classes = dev.transfer(batch.tensors)
+                b,s,target,actions,returns,classes,discounted_scores = dev.transfer(batch.tensors)
                 if use_mark_classes:
                     dev.sync(); scoring_processing_start = perf_counter()
                     class_target = mark_class_targets(classes, indices)
@@ -264,12 +278,16 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 torch.compiler.cudagraph_mark_step_begin()
                 forward_start = dev.stamp()
                 with torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
-                    logits,values,mark_logits,score_logits = network(b)
+                    logits,values,mark_logits,score_logits,discounted_logits = network(b)
                     policy_loss,value_loss = losses(logits,values,target,actions,returns,valid)
                     mark_loss = mark_class_loss(mark_logits,class_target,valid) if use_mark_classes else None
                     score_loss = immediate_score_loss(score_logits,s,valid)
-                    loss = policy_loss+value_loss+(mark_loss if use_mark_classes else 0)
-                    loss = loss + options['immediate_score_weight'] * score_loss
+                    future_score_loss = discounted_score_loss(discounted_logits,discounted_scores,valid)
+                    loss = (options['policy_loss_weight'] * policy_loss
+                            + options['q_loss_weight'] * value_loss
+                            + (options['mark_class_loss_weight'] * mark_loss if use_mark_classes else 0)
+                            + options['immediate_score_weight'] * score_loss
+                            + options['discounted_score_weight'] * future_score_loss)
                 forward_end = dev.stamp()
                 loss.backward()
                 backward_end = dev.stamp()
@@ -286,11 +304,13 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 if use_mark_classes:
                     mark_sum += mark_loss.item()*valid_positions
                 immediate_score_sum += score_loss.item()*valid_positions
+                discounted_score_sum += future_score_loss.item()*valid_positions
                 for j, (first, second) in enumerate(((forward_start,forward_end),
                         (forward_end,backward_end),(backward_end,optimizer_end))):
                     timing_sum[j] += dev.elapsed(first,second)
             arena.clear()
             dev.sync(); training_time = perf_counter()-training_start
+            training_exclusive_time = training_time-scoring_processing_time
             test_start = perf_counter()
             model.eval()
             evaluations = []
@@ -327,7 +347,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             summary = dict(cycle=completed,evaluations=evaluations,states=count,dropped_states=dropped,loss=loss_sum/count,
                            model_seconds=model_time,cpu_seconds=cpu_time,
                            shuffle_seconds=shuffle_time,scoring_head_processing_seconds=scoring_processing_time,
-                           training_seconds=training_time,
+                           training_seconds=training_exclusive_time,
                            strength_test_seconds=test_time,wins=wins,draws=draws,losses=losses_count,
                            selfplay_steps=arena_step,batches=batch_number,
                            mean_cpu_ms=cpu_time*1000/arena_step,
@@ -337,18 +357,34 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                            mean_optimizer_ms=timing_sum[2]/batch_number,
                            policy_loss=policy_sum/count,q_loss=value_sum/count,mark_class_loss=mark_sum/count,
                            immediate_score_loss=immediate_score_sum/count,
-                           immediate_score_weight=options['immediate_score_weight'])
+                           discounted_score_loss=discounted_score_sum/count,
+                           policy_loss_weight=options['policy_loss_weight'],
+                           q_loss_weight=options['q_loss_weight'],
+                           mark_class_loss_weight=options['mark_class_loss_weight'],
+                           immediate_score_weight=options['immediate_score_weight'],
+                           discounted_score_weight=options['discounted_score_weight'])
             summary.update(timestamp=datetime.now(timezone.utc).isoformat(),
                            elapsed_seconds=perf_counter()-run_start,
                            win_rate=latest['win_rate'], score_rate=latest['score_rate'])
+            checkpoint_start = perf_counter()
+            if checkpoint is not None:
+                checkpoint(model, optimizer, options, summary)
+            checkpoint_time = perf_counter()-checkpoint_start
+            metrics_start = perf_counter()
             if log_dir is not None:
                 with (log_dir/'metrics.jsonl').open('a') as stream:
                     stream.write(json.dumps(summary, allow_nan=False)+'\n')
+            metrics_time = perf_counter()-metrics_start
             if cycles:
                 summaries.append(summary)
+            reporting_start = perf_counter()
             output.summary(summary)
-            if checkpoint is not None:
-                checkpoint(model, optimizer, options, summary)
+            reporting_time = perf_counter()-reporting_start
+            cycle_time = perf_counter()-cycle_start
+            measured_time = (model_time+cpu_time+shuffle_time+scoring_processing_time+
+                             training_exclusive_time+test_time+checkpoint_time+metrics_time+reporting_time)
+            other_time = cycle_time-measured_time
+            output.timing_footer(checkpoint_time,metrics_time,reporting_time,other_time,cycle_time)
             arena_step = 0
             model_time = cpu_time = 0.0
     return summaries

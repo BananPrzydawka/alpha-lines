@@ -18,8 +18,8 @@ def spatial_head(channels, hidden, norm, outputs=1):
     )
 
 
-def immediate_score_head(channels, hidden, norm):
-    """Predict both current scores from the shared residual tower."""
+def categorical_score_head(channels, hidden, norm):
+    """Predict a categorical score distribution from the shared residual tower."""
     return nn.Sequential(
         nn.Conv2d(channels, hidden, 3, padding=1, bias=False),
         group_norm(hidden, norm),

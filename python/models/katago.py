@@ -7,7 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from config import settings
-from models.common import group_norm, spatial_head, immediate_score_head, prepare_inputs
+from models.common import group_norm, spatial_head, categorical_score_head, prepare_inputs
 
 
 class InnerResidualBlock(nn.Module):
@@ -58,7 +58,7 @@ class NestedBottleneck(nn.Module):
 
 
 class KataGoNet(nn.Module):
-    """forward(board) -> policy, action values, mark classes, current scores (B, 2, 81).
+    """forward(board) -> policy, action values, mark classes, current and discounted scores.
 
     Score logits are ordered current player then opponent. Outputs are unbounded.
     """
@@ -81,7 +81,8 @@ class KataGoNet(nn.Module):
         self.action_value_head = spatial_head(channels, options["action_value_filters"], norm)
         self.mark_class_head = (spatial_head(channels, options.get("mark_class_filters", options["action_value_filters"]), norm, 6)
                                 if mark_classes else None)
-        self.immediate_score_head = immediate_score_head(channels, options.get("immediate_score_filters", 32), norm)
+        self.immediate_score_head = categorical_score_head(channels, options.get("immediate_score_filters", 32), norm)
+        self.discounted_score_head = categorical_score_head(channels, options.get("discounted_score_filters", 32), norm)
 
     def forward(self, board):
         board = prepare_inputs(board)
@@ -90,4 +91,5 @@ class KataGoNet(nn.Module):
         return (self.policy_head(features).squeeze(1),
                 self.action_value_head(features).squeeze(1),
                 self.mark_class_head(features) if self.mark_class_head is not None else None,
-                self.immediate_score_head(features).reshape(-1, 2, 81))
+                self.immediate_score_head(features).reshape(-1, 2, 81),
+                self.discounted_score_head(features).reshape(-1, 2, 81))

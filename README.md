@@ -73,7 +73,11 @@ Metrics record losses, W/D/L, historical matchups, counts and timings; `run.json
 records the effective configuration, precision, hardware and resume source.
 Completed positions are shuffled before each cycle's single training epoch. Shuffle
 time is reported as `shuffle_seconds`; expansion of mark classes into training
-planes is reported as `scoring_head_processing_seconds`.
+planes is reported as `scoring_head_processing_seconds`. The cycle report also
+times checkpoint saving, metrics writing, report printing, and residual overhead;
+`Cycle total` is wall-clock time through the main report. `Training` excludes
+scoring-head processing, so its timing categories add up to the total. One-time
+initialization and checkpoint loading appear separately as `Setup`.
 
 The auxiliary mark head predicts six classes on occupied squares: own or opponent
 mark contributing 0, 1, or 2 points. Its target is derived from the current
@@ -88,9 +92,20 @@ ordered current player then opponent. It reads the final shared residual-tower
 features alongside the policy, action-value and mark heads. The model receives
 only board planes; scores stored with each self-play position are training
 targets, not model inputs. Cross-entropy averaged over both players joins the
-loss with `klent.immediate_score_weight` (default 0.1). On resume from older
-FP32 checkpoints, the obsolete score-input embedding is discarded while
-shared weights and their AdamW moments are retained.
+loss with `klent.immediate_score_weight`. The loss weights are configured
+as `policy_loss_weight: 1.0`, `q_loss_weight: 2.0`,
+`mark_class_loss_weight: 2.0`, and `immediate_score_weight: 1.0`.
+The discounted-score head also outputs two 81-way score distributions from the
+shared tower. Each completed game supplies soft targets by walking scores
+backward from the final post-action score:
+`D_t = (1 - discounted_score_lambda) onehot(score_t) + discounted_score_lambda D_(t+1)`.
+The discount defaults to 0.94, independently of the Q-return `lambda`, and
+`discounted_score_weight` defaults to 1.0. The target distributions are computed
+before shuffling and stored with each position; this adds 324 bytes per buffered
+position. Both score heads use cross-entropy and report their raw and weighted
+losses separately. On resume from older FP32 checkpoints, missing heads are
+added while existing weights and their AdamW moments are retained; the obsolete
+score-input embedding, if present, is discarded.
 
 After dependency setup, local training can also run directly:
 

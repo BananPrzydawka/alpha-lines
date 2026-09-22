@@ -11,7 +11,7 @@ from unittest.mock import patch
 import torch
 from config import settings
 from klent.native import Arena, Batch
-from klent.train import losses, run, validate, evaluation_rows, ModelHistory, mark_class_targets, mark_class_loss, immediate_score_loss, restore_optimizer
+from klent.train import losses, run, validate, evaluation_rows, ModelHistory, mark_class_targets, mark_class_loss, immediate_score_loss, discounted_score_loss, restore_optimizer
 
 LIBRARY = Path(__file__).resolve().parents[2]/'rust/target/release/libalpha_lines_game.so'
 
@@ -64,6 +64,17 @@ class KlentTests(unittest.TestCase):
         self.assertLess(logits.grad[0,0,0].item(),0)
         self.assertLess(logits.grad[0,1,80].item(),0)
 
+    def test_discounted_score_loss_uses_soft_targets_and_masks_padding(self):
+        logits = torch.zeros(2,2,81,requires_grad=True)
+        target = torch.zeros(2,2,81,dtype=torch.bfloat16)
+        target[0,0,2],target[0,0,5] = 0.25,0.75
+        target[0,1,7] = 1
+        loss = discounted_score_loss(logits,target,torch.tensor([1.,0.]))
+        self.assertAlmostEqual(loss.item(),torch.tensor(81.).log().item(),places=5)
+        loss.backward()
+        self.assertEqual(logits.grad[1].count_nonzero().item(),0)
+        self.assertLess(logits.grad[0,0,5].item(),logits.grad[0,0,2].item())
+
     def test_native_batch_reproducibility_and_perspectives(self):
         with Arena(LIBRARY,self.options) as a, Arena(LIBRARY,self.options) as other:
             pi = torch.zeros(4,80)
@@ -83,7 +94,7 @@ class KlentTests(unittest.TestCase):
             for start in range(0,count,15):
                 size = a.batch(start,batch)
                 seen += size
-                b,s,target,actions,returns,classes = batch.tensors
+                b,s,target,actions,returns,classes,discounted = batch.tensors
                 torch.testing.assert_close(b[0:2*size:2,3],b[1:2*size:2,4])
                 torch.testing.assert_close(s[:2*size:2],s[1:2*size:2].flip(1))
                 torch.testing.assert_close(target[:2*size].float().sum(1),torch.ones(2*size),atol=.004,rtol=0)
@@ -91,6 +102,11 @@ class KlentTests(unittest.TestCase):
                 self.assertEqual(b[2*size:].count_nonzero().item(),0)
                 self.assertEqual(target[2*size:].count_nonzero().item(),0)
                 self.assertTrue((classes[2*size:] == -1).all())
+                self.assertEqual(discounted[2*size:].count_nonzero().item(),0)
+                torch.testing.assert_close(discounted[:2*size].float().sum(-1),
+                    torch.ones(2*size,2),atol=.025,rtol=0)
+                torch.testing.assert_close(discounted[0:2*size:2,0],discounted[1:2*size:2,1])
+                torch.testing.assert_close(discounted[0:2*size:2,1],discounted[1:2*size:2,0])
                 self.assertTrue(((classes[:2*size] >= -1) & (classes[:2*size] <= 5)).all())
                 swapped = classes[1:2*size:2]
                 own = classes[:2*size:2]
@@ -115,11 +131,27 @@ class KlentTests(unittest.TestCase):
                 summaries = run(LIBRARY,options,cycles=2,device='cpu',compile_model=False)
             self.assertEqual(len(summaries),2)
             self.assertEqual(report.getvalue().count(' complete\n'),2)
-            for label in ('Policy', 'Q', 'Mark', 'Score head'):
-                self.assertEqual(report.getvalue().count(f'    {label} '),2)
+            for label in ('Setup', 'Checkpoint', 'Metrics', 'Reporting', 'Other', 'Cycle total'):
+                expected = 1 if label == 'Setup' else 2
+                self.assertEqual(sum(line.strip().startswith(label+' ') for line in report.getvalue().splitlines()),expected)
+            for label, weight in (('Policy',1.0),('Q',2.0),('Mark',2.0),('Score head',1.0),('Future score',1.0)):
+                lines = [line for line in report.getvalue().splitlines()
+                         if line.startswith(f'    {label} ')]
+                self.assertEqual(len(lines),2)
+                self.assertTrue(all(f'× {weight} =' in line for line in lines))
             for removed in (' / Self-play', 'Training / ', 'Position-weighted loss',
                             'Strength test / ', 'Mean over '):
                 self.assertNotIn(removed,report.getvalue())
+            for block in report.getvalue().split('\nCycle ')[1:]:
+                timing_lines = block.splitlines()
+                labels = ('Model','CPU','Shuffle','Scoring head processing','Training',
+                          'Strength test','Checkpoint','Metrics','Reporting','Other')
+                measured = [float(next(line for line in timing_lines
+                                       if line.strip().startswith(label+' ')).split()[-2])
+                            for label in labels]
+                total = float(next(line for line in timing_lines
+                                   if line.strip().startswith('Cycle total ')).split()[-2])
+                self.assertAlmostEqual(sum(measured),total,delta=0.11)
             for summary in summaries:
                 self.assertEqual(sum(summary[k] for k in ('wins','draws','losses')),4)
                 self.assertGreater(summary['states'],0)
@@ -128,9 +160,13 @@ class KlentTests(unittest.TestCase):
                 self.assertGreaterEqual(summary['scoring_head_processing_seconds'],0)
                 self.assertGreaterEqual(summary['mark_class_loss'],0)
                 self.assertGreater(summary['immediate_score_loss'],0)
+                self.assertGreater(summary['discounted_score_loss'],0)
                 self.assertAlmostEqual(summary['loss'],
-                    summary['policy_loss']+summary['q_loss']+summary['mark_class_loss']+
-                    summary['immediate_score_weight']*summary['immediate_score_loss'],places=4)
+                    summary['policy_loss_weight']*summary['policy_loss']+
+                    summary['q_loss_weight']*summary['q_loss']+
+                    summary['mark_class_loss_weight']*summary['mark_class_loss']+
+                    summary['immediate_score_weight']*summary['immediate_score_loss']+
+                    summary['discounted_score_weight']*summary['discounted_score_loss'],places=4)
 
     def test_history_is_independent_bounded_and_correctly_aged(self):
         model = torch.nn.Linear(1,1)
@@ -176,7 +212,7 @@ class KlentTests(unittest.TestCase):
             current = dict(self.options,model='katago',cycles=1,n=3,m=480,
                            train_minibatch=40,test_games=6,lr=0.001,
                            weight_decay=0.02,alpha=0.04,beta=0.2,
-                           **{'lambda':0.8,'seed':7})
+                           **{'lambda':0.8,'discounted_score_lambda':0.7,'seed':7})
             results = run(LIBRARY,current,
                           device='cpu',compile_model=False,resume=path,
                           checkpoint=checkpoint,log_dir=Path(directory)/'logs')
@@ -216,25 +252,33 @@ class KlentTests(unittest.TestCase):
         small = dict(settings['resnet_model'],filters=8,blocks=1,se_hidden=4,
                      policy_filters=4,action_value_filters=4)
         with tempfile.TemporaryDirectory() as directory, patch.dict(settings,{'resnet_model':small}), contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
-            for has_mark_head in (False, True):
-                with self.subTest(has_mark_head=has_mark_head):
+            for has_mark_head, has_immediate_head in ((False,False),(True,False),(True,True)):
+                with self.subTest(has_mark_head=has_mark_head,has_immediate_head=has_immediate_head):
                     legacy = ResNet(mark_classes=has_mark_head)
-                    legacy.score_embed = torch.nn.Sequential(torch.nn.Linear(2,8),torch.nn.SiLU(),torch.nn.Linear(8,8))
-                    modules = list(legacy._modules.items())
-                    legacy._modules = OrderedDict(modules[:2]+[modules[-1]]+modules[2:-1])
+                    if not has_immediate_head:
+                        legacy.score_embed = torch.nn.Sequential(torch.nn.Linear(2,8),torch.nn.SiLU(),torch.nn.Linear(8,8))
+                        modules = list(legacy._modules.items())
+                        legacy._modules = OrderedDict(modules[:2]+[modules[-1]]+modules[2:-1])
+                    def retained(name):
+                        return not (name.startswith('discounted_score_head.') or
+                                    (not has_immediate_head and name.startswith('immediate_score_head.')))
                     optimizer = torch.optim.AdamW(p for name,p in legacy.named_parameters()
-                                                   if not name.startswith('immediate_score_head.'))
+                                                   if retained(name))
                     board = torch.zeros(2,5,10,16)
                     scores = torch.zeros(2,2)
-                    pi,q,mark,_ = legacy(board)
-                    loss = pi.square().mean()+q.square().mean()+legacy.score_embed(scores).square().mean()
+                    pi,q,mark,immediate,_ = legacy(board)
+                    loss = pi.square().mean()+q.square().mean()
+                    if not has_immediate_head:
+                        loss = loss+legacy.score_embed(scores).square().mean()
+                    else:
+                        loss = loss+immediate.square().mean()
                     if mark is not None:
                         loss = loss+mark.square().mean()
                     loss.backward()
                     optimizer.step()
-                    path = Path(directory)/f'legacy-{has_mark_head}.pt'
+                    path = Path(directory)/f'legacy-{has_mark_head}-{has_immediate_head}.pt'
                     old_weights = {k:v for k,v in legacy.state_dict().items()
-                                   if not k.startswith('immediate_score_head.')}
+                                   if retained(k)}
                     current = ResNet(mark_classes=True)
                     current.load_state_dict(old_weights,strict=False)
                     migrated = torch.optim.AdamW(current.parameters())
@@ -250,6 +294,7 @@ class KlentTests(unittest.TestCase):
                     self.assertEqual(results[0]['cycle'],2)
                     self.assertGreater(results[0]['mark_class_loss'],0)
                     self.assertGreater(results[0]['immediate_score_loss'],0)
+                    self.assertGreater(results[0]['discounted_score_loss'],0)
 
     def test_balanced_assignment(self):
         old,new = evaluation_rows(8)
@@ -282,7 +327,10 @@ class KlentTests(unittest.TestCase):
 
     def test_validation(self):
         validate(self.options)
-        for override in ({'train_minibatch':3},{'test_games':3},{'m':1},{'lambda':1.1},{'alpha':0,'beta':0}):
+        for override in ({'train_minibatch':3},{'test_games':3},{'m':1},{'lambda':1.1},{'alpha':0,'beta':0},
+                         {'policy_loss_weight':-1},{'q_loss_weight':float('nan')},
+                         {'mark_class_loss_weight':float('inf')},{'immediate_score_weight':-1},
+                         {'discounted_score_weight':-1},{'discounted_score_lambda':1.1}):
             with self.assertRaises(ValueError):
                 validate(dict(self.options,**override))
 
