@@ -18,6 +18,8 @@ from models.resnet import ResNet
 
 
 def validate(options):
+    if type(options['cycles']) is not int or options['cycles'] < 0:
+        raise ValueError('cycles must be a nonnegative integer')
     for key in ('n','m','max_ply','train_minibatch','test_games'):
         if type(options[key]) is not int or options[key] < 1:
             raise ValueError(f'klent.{key} must be a positive integer')
@@ -29,13 +31,14 @@ def validate(options):
         raise ValueError('test_games must be even for balanced sides')
     if options['train_minibatch'] % 2:
         raise ValueError('train_minibatch counts perspectives and must be even')
-    for key in ('alpha','beta','lambda','lr','weight_decay',
-                'policy_loss_weight','q_loss_weight','mark_class_loss_weight',
-                'immediate_score_weight','discounted_score_weight','discounted_score_lambda'):
+    for key in ('alpha','beta','exploration_fraction','lambda','lr','weight_decay',
+                'policy_loss_weight','opponent_policy_weight','q_loss_weight','mark_class_loss_weight',
+                'immediate_score_weight','discounted_score_weight','discounted_score_lambda',
+                'discounted_mark_weight','discounted_mark_lambda'):
         if not math.isfinite(options[key]) or options[key] < 0:
             raise ValueError(f'klent.{key} must be nonnegative and finite')
-    if options['alpha']+options['beta'] <= 0 or options['lambda'] > 1 or options['discounted_score_lambda'] > 1 or options['lr'] <= 0:
-        raise ValueError('require alpha+beta > 0, lambda and discounted_score_lambda <= 1, and lr > 0')
+    if options['alpha']+options['beta'] <= 0 or options['exploration_fraction'] > 1 or options['lambda'] > 1 or options['discounted_score_lambda'] > 1 or options['discounted_mark_lambda'] > 1 or options['lr'] <= 0:
+        raise ValueError('require alpha+beta > 0, exploration_fraction, lambda values <= 1, and lr > 0')
     if type(options['seed']) is not int or not 0 <= options['seed'] < 2**64:
         raise ValueError('seed must fit u64')
     if options['model'] not in ('resnet','katago') or options['optimizer'].lower() != 'adamw':
@@ -48,6 +51,13 @@ def losses(logits, q, target, actions, returns, valid):
     value = (q.flatten(1).float().gather(1,actions[:,None]).squeeze(1)-returns).square()
     denominator = valid.sum().clamp_min(1)
     return (policy*valid).sum()/denominator, (value*valid).sum()/denominator
+
+
+def opponent_policy_loss(logits, target, valid):
+    """Predict the other player's improved policy from each paired board row."""
+    other = target.reshape(-1, 2, 160).flip(1).reshape(-1, 160).float()
+    per_row = -(other * logits.flatten(1).float().log_softmax(1)).sum(1)
+    return (per_row * valid).sum() / valid.sum().clamp_min(1)
 
 
 def mark_class_targets(classes, indices):
@@ -79,6 +89,21 @@ def discounted_score_loss(logits, target, valid):
     target = target / target.sum(-1, keepdim=True).clamp_min(1)
     per_row = -(target * logits.float().log_softmax(-1)).sum(-1).mean(-1)
     return (per_row * valid).sum() / valid.sum().clamp_min(1)
+
+
+def discounted_mark_targets(distributions, indices):
+    """Expand eight-class per-square future targets into spatial planes."""
+    target = torch.zeros((distributions.shape[0], 8, 160), device=distributions.device, dtype=torch.float32)
+    target[:, :, indices] = distributions.float().permute(0, 2, 1)
+    return target.reshape(-1, 8, 10, 16)
+
+
+def discounted_mark_loss(logits, target, valid):
+    """Soft-target CE over all 80 playable squares, ignoring padded rows."""
+    target = target / target.sum(1, keepdim=True).clamp_min(1)
+    per_cell = -(target * logits.float().log_softmax(1)).sum(1)
+    mask = target.sum(1) * valid[:, None, None]
+    return (per_cell * mask).sum() / mask.sum().clamp_min(1)
 
 
 def restore_optimizer(optimizer, saved, saved_model, model):
@@ -152,7 +177,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     """cycles=0 runs until interrupted or the Modal function timeout expires."""
     run_start = perf_counter()
     options = dict(settings['klent'] if options is None else options)
-    cycles = options['cycles'] if cycles is None else cycles
+    if cycles is not None:
+        options['cycles'] = cycles
     restored = None
     if resume is not None:
         restored = torch.load(resume,map_location='cpu',weights_only=True)
@@ -167,11 +193,11 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
         model_config = dict(restored['model_config'])
         model_config.setdefault('immediate_score_filters', settings[model_key]['immediate_score_filters'])
         model_config.setdefault('discounted_score_filters', settings[model_key]['discounted_score_filters'])
+        model_config.setdefault('discounted_mark_filters', settings[model_key]['discounted_mark_filters'])
+        model_config.setdefault('opponent_policy_filters', settings[model_key]['opponent_policy_filters'])
         settings[model_key] = model_config
-    options['cycles'] = cycles
     validate(options)
-    if type(cycles) is not int or cycles < 0:
-        raise ValueError('cycles must be nonnegative')
+    cycles = options['cycles']
     dev = Device(device)
     torch.set_num_threads(1)
     torch.manual_seed(options['seed'])
@@ -182,7 +208,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     optimizer = torch.optim.AdamW(model.parameters(),lr=options['lr'],weight_decay=options['weight_decay'])
     if restored is not None:
         missing, unexpected = model.load_state_dict(restored['model'], strict=False)
-        if any(not key.startswith(('mark_class_head.', 'score_embed.')) for key in unexpected) or any(not key.startswith(('mark_class_head.', 'immediate_score_head.', 'discounted_score_head.')) for key in missing):
+        if any(not key.startswith(('mark_class_head.', 'score_embed.')) for key in unexpected) or any(not key.startswith(('mark_class_head.', 'immediate_score_head.', 'discounted_score_head.', 'discounted_mark_head.', 'opponent_policy_head.')) for key in missing):
             raise ValueError(f'Checkpoint model mismatch: missing={missing}, unexpected={unexpected}')
         restore_optimizer(optimizer, restored['optimizer'], restored['model'], model)
         # Loading AdamW also restores param-group settings: apply current config.
@@ -209,7 +235,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     def infer(net, boards):
         with torch.no_grad(), torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
             b, = dev.transfer((boards,))
-            pi,q,_,_,_ = net(b.contiguous(memory_format=torch.channels_last))
+            pi,q,_,_,_,_,_ = net(b.contiguous(memory_format=torch.channels_last))
             # Blocking CPU copies also prevent reuse of compiled output storage
             # before the native consumer finishes with the result.
             return (pi.flatten(1)[:,indices].float().cpu().contiguous(),
@@ -259,35 +285,41 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             dev.sync(); training_start = perf_counter()
             history.remember(model)
             model.train()
-            loss_sum = policy_sum = value_sum = mark_sum = immediate_score_sum = discounted_score_sum = 0.0
+            loss_sum = policy_sum = opponent_policy_sum = value_sum = mark_sum = immediate_score_sum = discounted_score_sum = discounted_mark_sum = 0.0
             scoring_processing_time = 0.0
             timing_sum = [0.0, 0.0, 0.0]
             for start in range(0,count,batch.rows//2):
                 valid_positions = arena.batch(start,batch)
-                b,s,target,actions,returns,classes,discounted_scores = dev.transfer(batch.tensors)
+                b,s,target,actions,returns,classes,discounted_scores,discounted_marks = dev.transfer(batch.tensors)
                 if use_mark_classes:
                     dev.sync(); scoring_processing_start = perf_counter()
                     class_target = mark_class_targets(classes, indices)
+                    future_mark_target = discounted_mark_targets(discounted_marks, indices)
                     dev.sync()
                     scoring_processing_time += perf_counter()-scoring_processing_start
                 else:
                     class_target = None
+                    future_mark_target = None
                 b = b.contiguous(memory_format=torch.channels_last)
                 valid = (rows < 2*valid_positions).float()
                 optimizer.zero_grad(set_to_none=True)
                 torch.compiler.cudagraph_mark_step_begin()
                 forward_start = dev.stamp()
                 with torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
-                    logits,values,mark_logits,score_logits,discounted_logits = network(b)
+                    logits,values,mark_logits,score_logits,discounted_logits,discounted_mark_logits,opponent_logits = network(b)
                     policy_loss,value_loss = losses(logits,values,target,actions,returns,valid)
+                    other_policy_loss = opponent_policy_loss(opponent_logits,target,valid)
                     mark_loss = mark_class_loss(mark_logits,class_target,valid) if use_mark_classes else None
                     score_loss = immediate_score_loss(score_logits,s,valid)
                     future_score_loss = discounted_score_loss(discounted_logits,discounted_scores,valid)
+                    future_mark_loss = discounted_mark_loss(discounted_mark_logits,future_mark_target,valid) if use_mark_classes else None
                     loss = (options['policy_loss_weight'] * policy_loss
+                            + options['opponent_policy_weight'] * other_policy_loss
                             + options['q_loss_weight'] * value_loss
                             + (options['mark_class_loss_weight'] * mark_loss if use_mark_classes else 0)
                             + options['immediate_score_weight'] * score_loss
-                            + options['discounted_score_weight'] * future_score_loss)
+                            + options['discounted_score_weight'] * future_score_loss
+                            + (options['discounted_mark_weight'] * future_mark_loss if use_mark_classes else 0))
                 forward_end = dev.stamp()
                 loss.backward()
                 backward_end = dev.stamp()
@@ -300,11 +332,14 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 loss_sum += loss_value*valid_positions
                 batch_number = start//(batch.rows//2)+1
                 policy_sum += policy_loss.item()*valid_positions
+                opponent_policy_sum += other_policy_loss.item()*valid_positions
                 value_sum += value_loss.item()*valid_positions
                 if use_mark_classes:
                     mark_sum += mark_loss.item()*valid_positions
                 immediate_score_sum += score_loss.item()*valid_positions
                 discounted_score_sum += future_score_loss.item()*valid_positions
+                if use_mark_classes:
+                    discounted_mark_sum += future_mark_loss.item()*valid_positions
                 for j, (first, second) in enumerate(((forward_start,forward_end),
                         (forward_end,backward_end),(backward_end,optimizer_end))):
                     timing_sum[j] += dev.elapsed(first,second)
@@ -355,14 +390,18 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                            mean_forward_ms=timing_sum[0]/batch_number,
                            mean_backward_ms=timing_sum[1]/batch_number,
                            mean_optimizer_ms=timing_sum[2]/batch_number,
-                           policy_loss=policy_sum/count,q_loss=value_sum/count,mark_class_loss=mark_sum/count,
+                           policy_loss=policy_sum/count,opponent_policy_loss=opponent_policy_sum/count,
+                           q_loss=value_sum/count,mark_class_loss=mark_sum/count,
                            immediate_score_loss=immediate_score_sum/count,
                            discounted_score_loss=discounted_score_sum/count,
+                           discounted_mark_loss=discounted_mark_sum/count,
                            policy_loss_weight=options['policy_loss_weight'],
+                           opponent_policy_weight=options['opponent_policy_weight'],
                            q_loss_weight=options['q_loss_weight'],
                            mark_class_loss_weight=options['mark_class_loss_weight'],
                            immediate_score_weight=options['immediate_score_weight'],
-                           discounted_score_weight=options['discounted_score_weight'])
+                           discounted_score_weight=options['discounted_score_weight'],
+                           discounted_mark_weight=options['discounted_mark_weight'])
             summary.update(timestamp=datetime.now(timezone.utc).isoformat(),
                            elapsed_seconds=perf_counter()-run_start,
                            win_rate=latest['win_rate'], score_rate=latest['score_rate'])

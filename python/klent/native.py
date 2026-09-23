@@ -19,7 +19,7 @@ class Arena:
     def __init__(self, library, options, *, evaluation=False, seed=None, pinned=False):
         self.lib = C.CDLL(str(library))
         signatures = {
-            'new': ([C.c_size_t]*3+[C.c_float]*4+[C.c_uint64,C.c_bool], C.c_void_p),
+            'new': ([C.c_size_t]*3+[C.c_float]*6+[C.c_uint64,C.c_bool], C.c_void_p),
             'free': ([C.c_void_p], None),
             'inputs': ([C.c_void_p]*3, C.c_int),
             'step': ([C.c_void_p]*3, C.c_int),
@@ -27,7 +27,7 @@ class Arena:
             'reset': ([C.c_void_p], C.c_size_t),
             'shuffle': ([C.c_void_p], None),
             'clear': ([C.c_void_p], None),
-            'batch': ([C.c_void_p,C.c_size_t,C.c_size_t]+[C.c_void_p]*7, C.c_int),
+            'batch': ([C.c_void_p,C.c_size_t,C.c_size_t]+[C.c_void_p]*8, C.c_int),
         }
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, 'klent_'+name)
@@ -35,6 +35,7 @@ class Arena:
         self.n = options['test_games'] if evaluation else options['n']
         self.handle = self.lib.klent_new(self.n, options['m'], options['max_ply'],
             options['alpha'], options['beta'], options['lambda'], options['discounted_score_lambda'],
+            options['exploration_fraction'], options['discounted_mark_lambda'],
             options['seed'] if seed is None else seed, evaluation)
         if not self.handle:
             raise RuntimeError('Could not create Rust KLENT arena')
@@ -89,4 +90,5 @@ class Batch:
         self.tensors = (empty((rows,5,10,16),torch.bfloat16),
             empty((rows,2),torch.bfloat16), empty((rows,160),torch.bfloat16),
             empty((rows,),torch.int64), empty((rows,),torch.float32),
-            empty((rows,80),torch.int8), empty((rows,2,81),torch.bfloat16))
+            empty((rows,80),torch.int8), empty((rows,2,81),torch.bfloat16),
+            empty((rows,80,8),torch.bfloat16))

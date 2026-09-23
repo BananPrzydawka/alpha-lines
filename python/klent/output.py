@@ -13,6 +13,8 @@ def setup(options, device, compiled):
          f"  Test       {options['test_games']:,} games   |   Seed {options['seed']}",
          f"  Alpha      {options['alpha']:g}   |   Beta {options['beta']:g}   |   Lambda {options['lambda']:.6f}"
          f"   |   Score lambda {options['discounted_score_lambda']:.6f}",
+         f"  Self-play uniform exploration {options['exploration_fraction']:.1%}",
+         f"  Discounted mark lambda {options['discounted_mark_lambda']:.6f}",
          f"  Optimizer  {options['optimizer']}   |   LR {options['lr']:g}   |   Decay {options['weight_decay']:g}")
     if compiled:
         emit('  Timings include compilation/autotuning on first use.')
@@ -22,10 +24,12 @@ def summary(row):
     loss_lines = []
     for label, loss_key, weight_key in (
         ('Policy', 'policy_loss', 'policy_loss_weight'),
+        ('Opponent pi', 'opponent_policy_loss', 'opponent_policy_weight'),
         ('Q', 'q_loss', 'q_loss_weight'),
         ('Mark', 'mark_class_loss', 'mark_class_loss_weight'),
         ('Score head', 'immediate_score_loss', 'immediate_score_weight'),
         ('Future score', 'discounted_score_loss', 'discounted_score_weight'),
+        ('Future mark', 'discounted_mark_loss', 'discounted_mark_weight'),
     ):
         raw, weight = row[loss_key], row[weight_key]
         loss_lines.append(f'    {label:<11}{raw:>10.4f} × {weight} = {raw*weight:.4f}')

@@ -7,10 +7,18 @@ pub fn bf16(x: f32) -> u16 {
     ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16
 }
 fn float(x: u16) -> f32 { f32::from_bits((x as u32) << 16) }
+const MARK_TARGET_CLASSES: usize = 8;
+const ABSENT_MARK_CLASS: usize = 6;
+const UNPLAYED_MARK_CLASS: usize = 7;
+fn mark_target_class(class: i8, cell: u8) -> usize {
+    if class >= 0 { class as usize }
+    else if cell == 3 { ABSENT_MARK_CLASS }
+    else { assert_eq!(cell, 0); UNPLAYED_MARK_CLASS }
+}
 
 #[repr(C)]
 #[derive(Clone)]
-pub struct Record<T, D> {
+pub struct Record<T, D, M> {
     board: [u8; 20],
     scores: [u8; 2],
     mark_classes: [i8; MARK_CLASS_SQUARES],
@@ -18,19 +26,25 @@ pub struct Record<T, D> {
     policy: [[u16; 80]; 2],
     returns: T,
     discounted_scores: D,
+    discounted_marks: M,
 }
-type Position = Record<[u16; 2], [[u16; 81]; 2]>;
-type History = Record<[f32; 2], ()>;
-const _: () = assert!(std::mem::size_of::<Position>() == 672 + MARK_CLASS_SQUARES);
+type Position = Record<[u16; 2], [[u16; 81]; 2], [[u16; MARK_TARGET_CLASSES]; MARK_CLASS_SQUARES]>;
+type History = Record<[f32; 2], (), ()>;
+const _: () = assert!(std::mem::size_of::<Position>() == 672 + MARK_CLASS_SQUARES*(1+2*MARK_TARGET_CLASSES));
 const _: () = assert!(std::mem::size_of::<History>() == 352 + MARK_CLASS_SQUARES);
 
 fn finish(history: &mut Vec<History>, reward: [f32; 2], terminal_scores: [u8; 2],
-          lambda: f32, score_lambda: f32, buffer: &mut Vec<Position>) {
+          terminal_cells: [u8; 80], terminal_marks: [i8; MARK_CLASS_SQUARES], lambda: f32, score_lambda: f32,
+          mark_lambda: f32, buffer: &mut Vec<Position>) {
     let mut ret = reward;
     let mut score_dist = [[0.0f32; 81]; 2];
     for p in 0..2 {
         assert!(terminal_scores[p] <= 80);
         score_dist[p][terminal_scores[p] as usize] = 1.0;
+    }
+    let mut mark_dist = [[0.0f32; MARK_TARGET_CLASSES]; MARK_CLASS_SQUARES];
+    for (sq, &class) in terminal_marks.iter().enumerate() {
+        mark_dist[sq][mark_target_class(class, terminal_cells[sq])] = 1.0;
     }
     for t in (0..history.len()).rev() {
         if t+1 < history.len() {
@@ -43,9 +57,15 @@ fn finish(history: &mut Vec<History>, reward: [f32; 2], terminal_scores: [u8; 2]
             for value in &mut score_dist[p] { *value *= score_lambda; }
             score_dist[p][h.scores[p] as usize] += 1.0-score_lambda;
         }
+        let cells = unpack(&h.board);
+        for (sq, &class) in h.mark_classes.iter().enumerate() {
+            for value in &mut mark_dist[sq] { *value *= mark_lambda; }
+            mark_dist[sq][mark_target_class(class, cells[sq])] += 1.0-mark_lambda;
+        }
         buffer.push(Position { board: h.board, scores: h.scores, mark_classes: h.mark_classes,
             actions: h.actions, policy: h.policy, returns: ret.map(bf16),
-            discounted_scores: score_dist.map(|dist| dist.map(bf16)) });
+            discounted_scores: score_dist.map(|dist| dist.map(bf16)),
+            discounted_marks: mark_dist.map(|dist| dist.map(bf16)) });
     }
     let start = buffer.len()-history.len();
     buffer[start..].reverse();
@@ -102,22 +122,35 @@ fn sample(p: &[f32; 80], rng: &mut Rng) -> usize {
     }
     last
 }
+fn mix_uniform(p: &[f32; 80], legal: [u64; 2], fraction: f32) -> [f32; 80] {
+    if fraction == 0.0 { return *p; }
+    let count = legal.iter().map(|bits| bits.count_ones()).sum::<u32>();
+    assert!(count > 0);
+    let floor = fraction / count as f32;
+    std::array::from_fn(|a| {
+        if legal[a/64] >> (a%64) & 1 != 0 { (1.0-fraction)*p[a] + floor } else { 0.0 }
+    })
+}
 
 pub struct Arena {
     games: Vec<Game>, histories: Vec<Vec<History>>, buffer: Vec<Position>,
     capacity: usize, max_ply: usize, alpha: f32, beta: f32, lambda: f32, score_lambda: f32,
+    exploration_fraction: f32, mark_lambda: f32,
     rng: Rng, shuffle_rng: Rng, scratch: Scratch, evaluation: bool, pub results: [usize; 3],
 }
 impl Arena {
     pub fn new(n: usize, capacity: usize, max_ply: usize, alpha: f32, beta: f32, lambda: f32,
-               score_lambda: f32, seed: u64, evaluation: bool) -> Self {
+               score_lambda: f32, exploration_fraction: f32, mark_lambda: f32, seed: u64, evaluation: bool) -> Self {
         assert!(n > 0 && max_ply == 80);
         assert!(evaluation || capacity >= n.checked_mul(max_ply).unwrap());
         assert!(alpha.is_finite() && beta.is_finite() && alpha >= 0.0 && beta >= 0.0 && alpha+beta > 0.0);
         assert!(lambda.is_finite() && (0.0..=1.0).contains(&lambda));
         assert!(score_lambda.is_finite() && (0.0..=1.0).contains(&score_lambda));
+        assert!(exploration_fraction.is_finite() && (0.0..=1.0).contains(&exploration_fraction));
+        assert!(mark_lambda.is_finite() && (0.0..=1.0).contains(&mark_lambda));
         Self { games: vec![Game::new(); n], histories: (0..n).map(|_| Vec::with_capacity(if evaluation {0} else {max_ply})).collect(),
             buffer: Vec::with_capacity(if evaluation {0} else {capacity}), capacity, max_ply, alpha, beta, lambda, score_lambda,
+            exploration_fraction, mark_lambda,
             rng: Rng::new(seed), shuffle_rng: Rng::new(seed ^ 0x9e37_79b9_7f4a_7c15),
             scratch: Scratch::new(), evaluation, results: [0; 3] }
     }
@@ -144,14 +177,17 @@ impl Arena {
                     policy(&self.games[i], p, &logits[row..row+80], &[0.0; 80], 0.0, 1.0)
                 } else { policy(&self.games[i], p, &logits[row..row+80], &q[row..row+80], self.alpha, self.beta) };
                 policies[p] = dist.map(bf16); values[p] = value;
-                actions[p] = sample(&dist, &mut self.rng) as u8;
+                let sampling_dist = if self.evaluation { dist } else {
+                    mix_uniform(&dist, self.games[i].legal_moves(p), self.exploration_fraction)
+                };
+                actions[p] = sample(&sampling_dist, &mut self.rng) as u8;
             }
             if !self.evaluation {
                 assert!(self.histories[i].len() < self.max_ply);
                 self.histories[i].push(History { board: pack(&self.games[i].cells),
                     scores: self.games[i].scores.map(|s| u8::try_from(s).unwrap()),
                     mark_classes: self.games[i].mark_classes, actions, policy: policies, returns: values,
-                    discounted_scores: () });
+                    discounted_scores: (), discounted_marks: () });
             }
             self.games[i].action_step(actions[0] as usize, actions[1] as usize, &mut self.scratch);
             if self.games[i].finished {
@@ -164,7 +200,8 @@ impl Arena {
                     let history = &mut self.histories[i];
                     assert!(self.buffer.len()+history.len() <= self.capacity);
                     let terminal_scores = self.games[i].scores.map(|s| u8::try_from(s).unwrap());
-                    finish(history, reward, terminal_scores, self.lambda, self.score_lambda, &mut self.buffer);
+                    finish(history, reward, terminal_scores, self.games[i].cells, self.games[i].mark_classes,
+                           self.lambda, self.score_lambda, self.mark_lambda, &mut self.buffer);
                     self.games[i] = Game::new();
                 }
             }
@@ -189,8 +226,8 @@ impl Arena {
 // All fallible calls catch Rust panics rather than unwinding across the C boundary.
 #[no_mangle]
 pub extern "C" fn klent_new(n: usize, m: usize, max_ply: usize, alpha: f32, beta: f32, lambda: f32,
-                            score_lambda: f32, seed: u64, evaluation: bool) -> *mut Arena {
-    catch_unwind(|| Box::into_raw(Box::new(Arena::new(n,m,max_ply,alpha,beta,lambda,score_lambda,seed,evaluation)))).unwrap_or(std::ptr::null_mut())
+                            score_lambda: f32, exploration_fraction: f32, mark_lambda: f32, seed: u64, evaluation: bool) -> *mut Arena {
+    catch_unwind(|| Box::into_raw(Box::new(Arena::new(n,m,max_ply,alpha,beta,lambda,score_lambda,exploration_fraction,mark_lambda,seed,evaluation)))).unwrap_or(std::ptr::null_mut())
 }
 #[no_mangle]
 pub unsafe extern "C" fn klent_free(h: *mut Arena) { if !h.is_null() { drop(Box::from_raw(h)); } }
@@ -215,7 +252,7 @@ pub unsafe extern "C" fn klent_shuffle(h: *mut Arena) { (&mut *h).shuffle() }
 #[no_mangle]
 pub unsafe extern "C" fn klent_clear(h: *mut Arena) { (&mut *h).buffer.clear(); }
 #[no_mangle]
-pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize, b: *mut u16, s: *mut u16, pi: *mut u16, actions: *mut i64, returns: *mut f32, classes: *mut i8, discounted: *mut u16) -> i32 {
+pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize, b: *mut u16, s: *mut u16, pi: *mut u16, actions: *mut i64, returns: *mut f32, classes: *mut i8, discounted: *mut u16, discounted_marks_out: *mut u16) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         let a=&*h;
         let boards=std::slice::from_raw_parts_mut(b,count*1600);
@@ -225,9 +262,11 @@ pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize, 
         let targets=std::slice::from_raw_parts_mut(returns,count*2);
         let mark_classes=std::slice::from_raw_parts_mut(classes,count*160);
         let discounted_scores=std::slice::from_raw_parts_mut(discounted,count*324);
+        let discounted_marks=std::slice::from_raw_parts_mut(discounted_marks_out,count*2*MARK_CLASS_SQUARES*MARK_TARGET_CLASSES);
         boards.fill(0); scores.fill(0); policies.fill(0); moves.fill(0); targets.fill(0.0);
         mark_classes.fill(NO_MARK_CLASS);
         discounted_scores.fill(0);
+        discounted_marks.fill(0);
         let end=(start+count).min(a.buffer.len());
         for (i,pos) in a.buffer[start..end].iter().enumerate() {
             for p in 0..2 {
@@ -246,6 +285,11 @@ pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize, 
                         mark_classes[row*80+sq] = if class < 0 { class }
                             else if p == 0 { class }
                             else if class < 3 { class+3 } else { class-3 };
+                        for class in 0..MARK_TARGET_CLASSES {
+                            let source = if p == 0 || class >= ABSENT_MARK_CLASS { class }
+                                else if class < 3 { class+3 } else { class-3 };
+                            discounted_marks[(row*80+sq)*MARK_TARGET_CLASSES+class] = pos.discounted_marks[sq][source];
+                        }
                     }
                 }
             }
@@ -260,16 +304,17 @@ mod tests {
     #[test] fn exact_returns_use_next_state_and_preserve_order() {
         for lambda in [0.0, 0.5, 1.0] {
             let mut history: Vec<History> = (0..3).map(|i| History {
-                board: [i;20], scores: [0;2], mark_classes: [NO_MARK_CLASS;MARK_CLASS_SQUARES], actions: [0;2], policy: [[0;80];2],
-                returns: [i as f32 * 0.25, -(i as f32)*0.25], discounted_scores: (),
+                board: [0;20], scores: [0;2], mark_classes: [NO_MARK_CLASS;MARK_CLASS_SQUARES], actions: [i;2], policy: [[0;80];2],
+                returns: [i as f32 * 0.25, -(i as f32)*0.25], discounted_scores: (), discounted_marks: (),
             }).collect();
             let mut buffer = Vec::new();
-            finish(&mut history, [1.0,-1.0], [2, 3], lambda, 0.94, &mut buffer);
+            finish(&mut history, [1.0,-1.0], [2, 3], [0;80], [NO_MARK_CLASS;MARK_CLASS_SQUARES],
+                   lambda, 0.94, 0.94, &mut buffer);
             let g1=(1.0-lambda)*0.5+lambda;
             let g0=(1.0-lambda)*0.25+lambda*g1;
             for (i,g) in [g0,g1,1.0].into_iter().enumerate() {
                 assert_eq!(buffer[i].returns,[bf16(g),bf16(-g)]);
-                assert_eq!(buffer[i].board,[i as u8;20]);
+                assert_eq!(buffer[i].actions,[i as u8;2]);
             }
             assert!(history.is_empty());
         }
@@ -279,10 +324,11 @@ mod tests {
         for score_lambda in [0.0, 0.5, 1.0] {
             let mut history: Vec<History> = [[0, 3], [1, 2]].into_iter().map(|scores| History {
                 board: [0;20], scores, mark_classes: [NO_MARK_CLASS;MARK_CLASS_SQUARES],
-                actions: [0;2], policy: [[0;80];2], returns: [0.0;2], discounted_scores: (),
+                actions: [0;2], policy: [[0;80];2], returns: [0.0;2], discounted_scores: (), discounted_marks: (),
             }).collect();
             let mut buffer = Vec::new();
-            finish(&mut history, [0.0;2], [2, 1], 0.94, score_lambda, &mut buffer);
+            finish(&mut history, [0.0;2], [2, 1], [0;80], [NO_MARK_CLASS;MARK_CLASS_SQUARES],
+                   0.94, score_lambda, 0.94, &mut buffer);
             for p in 0..2 {
                 let current = [0usize, 3][p];
                 let next = [1usize, 2][p];
@@ -301,10 +347,36 @@ mod tests {
             }
         }
     }
+    #[test] fn discounted_marks_include_future_removal_and_new_placement() {
+        if !TRACK_MARK_CLASSES { return; }
+        let mut first = [0u8;80]; first[0] = 1;
+        let mut second = first; second[1] = 2;
+        let mut terminal = second; terminal[0] = 3;
+        let mut classes0 = [NO_MARK_CLASS;MARK_CLASS_SQUARES]; classes0[0] = 0;
+        let mut classes1 = classes0; classes1[0] = 1; classes1[1] = 3;
+        let mut terminal_classes = classes1; terminal_classes[0] = NO_MARK_CLASS; terminal_classes[1] = 4;
+        let mut history = vec![
+            History { board: pack(&first), scores: [0;2], mark_classes: classes0,
+                actions: [0;2], policy: [[0;80];2], returns: [0.0;2],
+                discounted_scores: (), discounted_marks: () },
+            History { board: pack(&second), scores: [0;2], mark_classes: classes1,
+                actions: [0;2], policy: [[0;80];2], returns: [0.0;2],
+                discounted_scores: (), discounted_marks: () },
+        ];
+        let mut buffer = Vec::new();
+        finish(&mut history, [0.0;2], [0;2], terminal, terminal_classes,
+               0.94, 0.94, 0.5, &mut buffer);
+        let expected0 = [(0,0.5),(1,0.25),(ABSENT_MARK_CLASS,0.25)];
+        let expected1 = [(UNPLAYED_MARK_CLASS,0.5),(3,0.25),(4,0.25)];
+        for (class, weight) in expected0 { assert_eq!(buffer[0].discounted_marks[0][class],bf16(weight)); }
+        for (class, weight) in expected1 { assert_eq!(buffer[0].discounted_marks[1][class],bf16(weight)); }
+        assert_eq!(buffer[1].discounted_marks[0][ABSENT_MARK_CLASS],bf16(0.5));
+        assert_eq!(buffer[1].discounted_marks[1][4],bf16(0.5));
+    }
     #[test] fn packing_and_layout() {
         let cells=std::array::from_fn(|i| (i%4) as u8);
         assert_eq!(unpack(&pack(&cells)),cells);
-        assert_eq!(std::mem::size_of::<Position>(),672 + MARK_CLASS_SQUARES);
+        assert_eq!(std::mem::size_of::<Position>(),672 + MARK_CLASS_SQUARES*(1+2*MARK_TARGET_CLASSES));
         let mut b=vec![0;1600]; let mut s=vec![0;4];
         encode(&cells,[3,7],0,&mut b[..800],&mut s[..2]);
         encode(&cells,[3,7],1,&mut b[800..],&mut s[2..]);
@@ -312,11 +384,12 @@ mod tests {
         assert_eq!(&b[480..640],&b[1440..1600]);
     }
     #[test] fn shuffle_reorders_whole_positions() {
-        let mut arena=Arena::new(1,80,80,0.03,0.1,0.8,0.94,1,false);
+        let mut arena=Arena::new(1,80,80,0.03,0.1,0.8,0.94,0.0,0.94,1,false);
         arena.buffer=(0..40).map(|i| Position {
             board: [i;20], scores: [i,i], mark_classes: [i as i8;MARK_CLASS_SQUARES], actions: [i,i],
             policy: [[i as u16;80];2], returns: [bf16(i as f32);2],
             discounted_scores: [[bf16(i as f32);81];2],
+            discounted_marks: [[bf16(i as f32);MARK_TARGET_CLASSES];MARK_CLASS_SQUARES],
         }).collect();
         arena.shuffle();
         let order: Vec<_> = arena.buffer.iter().map(|p| p.board[0]).collect();
@@ -331,6 +404,7 @@ mod tests {
             assert_eq!(p.policy[0][0],i as u16);
             assert_eq!(p.returns,[bf16(i as f32);2]);
             assert_eq!(p.discounted_scores[0][0],bf16(i as f32));
+            if TRACK_MARK_CLASSES { assert_eq!(p.discounted_marks[0][0],bf16(i as f32)); }
         }
     }
     #[test] fn policy_mask_and_formula() {
@@ -341,9 +415,21 @@ mod tests {
         for i in 0..80 { if i%8>=4 { assert_eq!(p[i],0.0); } }
         assert!((p[1]/p[0]-(0.1*(logits[1]-logits[0])/0.13).exp()).abs()<1e-5);
     }
+    #[test] fn self_play_exploration_mixes_only_legal_moves() {
+        let g=Game::new();
+        let logits=std::array::from_fn::<_,80,_>(|i| i as f32);
+        let (p,_) = policy(&g,0,&logits,&[0.0;80],0.03,0.1);
+        let mixed = mix_uniform(&p,g.legal_moves(0),0.1);
+        assert!((mixed.iter().sum::<f32>()-1.0).abs()<1e-6);
+        for i in 0..80 {
+            if i%8 < 4 { assert!((mixed[i]-(0.9*p[i]+0.1/40.0)).abs()<1e-7); }
+            else { assert_eq!(mixed[i],0.0); }
+        }
+        assert_eq!(mix_uniform(&p,g.legal_moves(0),0.0),p);
+    }
     #[test] fn collection_returns_capacity_and_evaluation() {
         for lambda in [0.0,0.5,1.0] {
-            let mut a=Arena::new(4,640,80,0.03,0.1,lambda,0.94,1,false);
+            let mut a=Arena::new(4,640,80,0.03,0.1,lambda,0.94,0.1,0.94,1,false);
             for _ in 0..1000 { if a.step(&[0.0;640],&[0.25;640]) { break; } }
             assert!(a.buffer.len()>320 && a.buffer.len()<=640);
             for pos in &a.buffer { for p in 0..2 {
@@ -353,7 +439,7 @@ mod tests {
             } }
             let dropped=a.reset(); assert!(dropped<320); assert!(a.histories.iter().all(Vec::is_empty));
         }
-        let mut a=Arena::new(4,0,80,0.03,0.1,0.8,0.94,1,true);
+        let mut a=Arena::new(4,0,80,0.03,0.1,0.8,0.94,0.1,0.94,1,true);
         for _ in 0..80 { if a.step(&[0.0;640],&[0.0;640]) { break; } }
         assert_eq!(a.results.iter().sum::<usize>(),4);
         let mut expected = [0;3];

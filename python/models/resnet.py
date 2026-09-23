@@ -42,7 +42,7 @@ class res_block(nn.Module):
         return self.silu(out)
 
 class ResNet(nn.Module):
-    """forward(board) -> policy, action values, mark classes, current and discounted scores.
+    """forward(board) -> policy, values, mark/score heads, and opponent policy.
 
     Score logits are ordered current player then opponent. Outputs are unbounded.
     """
@@ -58,9 +58,12 @@ class ResNet(nn.Module):
             for _ in range(options["blocks"])
         ))
         self.policy_head = spatial_head(channels, options["policy_filters"], norm)
+        self.opponent_policy_head = spatial_head(channels, options["opponent_policy_filters"], norm)
         self.action_value_head = spatial_head(channels, options["action_value_filters"], norm)
         self.mark_class_head = (spatial_head(channels, options.get("mark_class_filters", options["action_value_filters"]), norm, 6)
                                 if mark_classes else None)
+        self.discounted_mark_head = (spatial_head(channels, options.get("discounted_mark_filters", options["action_value_filters"]), norm, 8)
+                                     if mark_classes else None)
         self.immediate_score_head = categorical_score_head(channels, options.get("immediate_score_filters", 32), norm)
         self.discounted_score_head = categorical_score_head(channels, options.get("discounted_score_filters", 32), norm)
 
@@ -72,4 +75,6 @@ class ResNet(nn.Module):
                 self.action_value_head(features).squeeze(1),
                 self.mark_class_head(features) if self.mark_class_head is not None else None,
                 self.immediate_score_head(features).reshape(-1, 2, 81),
-                self.discounted_score_head(features).reshape(-1, 2, 81))
+                self.discounted_score_head(features).reshape(-1, 2, 81),
+                self.discounted_mark_head(features) if self.discounted_mark_head is not None else None,
+                self.opponent_policy_head(features).squeeze(1))
