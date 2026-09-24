@@ -147,6 +147,9 @@ class ModelHistory:
     def remember_previous(self, model, cycle):
         self.previous = (cycle, self.snapshot(model))
 
+    def remember_initial_anchor(self, model):
+        self.anchors.append((self.start_cycle, self.snapshot(model)))
+
     def remember_anchor(self, model, cycle):
         if cycle > self.start_cycle and (cycle-self.start_cycle) % 8 == 0 and len(self.anchors) < 3:
             self.anchors.append((cycle, self.snapshot(model)))
@@ -245,6 +248,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     stop_cycle = completed + cycles
     summaries = []
     history = ModelHistory(start_cycle=completed)
+    if restored is not None:
+        history.remember_initial_anchor(model)
 
     def infer(net, boards):
         with torch.no_grad(), torch.autocast(torch.device(device).type, dtype=torch.bfloat16):

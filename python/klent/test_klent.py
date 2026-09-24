@@ -233,9 +233,10 @@ class KlentTests(unittest.TestCase):
                              [c for c in (8,16,24) if c<=cycle+1])
             self.assertEqual(history.previous[1]['weight'].item(),cycle)
         bootstrapped = ModelHistory(start_cycle=5)
+        bootstrapped.remember_initial_anchor(model)
         for cycle in range(6, 30):
             bootstrapped.remember_anchor(model, cycle)
-        self.assertEqual([c for c,_ in bootstrapped.anchors],[13,21,29])
+        self.assertEqual([c for c,_ in bootstrapped.anchors],[5,13,21])
         self.assertEqual([w['weight'].item() for _,w in history.anchors],[8,16,24])
 
     def test_33_cycles_evaluate_previous_and_fixed_anchors(self):
@@ -267,11 +268,11 @@ class KlentTests(unittest.TestCase):
                             checkpoint=lambda model,optimizer,options,summary,anchors:
                                 save(Path(directory)/'bootstrap',model,optimizer,options,summary,anchors))
             self.assertEqual([(r['kind'],r['opponent_cycle'],r['is_anchor'])
-                              for r in bootstrap[0]['evaluations']], [('previous',1,False)])
+                              for r in bootstrap[0]['evaluations']], [('previous',1,True)])
             bootstrapped = torch.load(Path(directory)/'bootstrap/cycle-000002.pt',weights_only=True)
             self.assertNotIn('anchor_cycles',bootstrapped)
             self.assertNotIn('anchors',bootstrapped)
-            self.assertFalse((Path(directory)/'bootstrap/anchors').exists())
+            self.assertTrue((Path(directory)/'bootstrap/anchors/anchor-000001.pt').is_file())
             bootstrapped['anchor_cycles'] = [0]
             torch.save(bootstrapped,Path(directory)/'bootstrap/cycle-000002.pt')
             continued = run(LIBRARY,dict(self.options,model='katago'),cycles=1,
@@ -280,6 +281,7 @@ class KlentTests(unittest.TestCase):
             self.assertEqual([(r['kind'],r['opponent_cycle'])
                               for r in continued[0]['evaluations']],
                              [('previous',2)])
+            self.assertTrue(continued[0]['evaluations'][0]['is_anchor'])
             resume_state = torch.load(path,weights_only=True)
             resume_state['anchors'] = [(0, resume_state['model'])]
             torch.save(resume_state,path)
@@ -297,10 +299,12 @@ class KlentTests(unittest.TestCase):
             self.assertEqual(results[0]['evaluations'][0]['opponent_cycle'],1)
             self.assertEqual([(r['kind'],r['opponent_cycle']) for r in results[0]['evaluations']],
                              [('previous',1)])
+            self.assertTrue(results[0]['evaluations'][0]['is_anchor'])
             saved = torch.load(Path(directory)/'cycle-000002.pt',weights_only=True)
             self.assertNotIn('anchor_cycles',saved)
             self.assertNotIn('anchors',saved)
-            self.assertFalse((Path(directory)/'anchors').exists())
+            self.assertTrue((Path(directory)/'anchors/anchor-000001.pt').is_file())
+            self.assertFalse((Path(directory)/'anchors/anchor-000000.pt').exists())
             self.assertEqual(saved['options'], dict(current, model='katago'))
             for group in saved['optimizer']['param_groups']:
                 self.assertEqual(group['lr'], current['lr'])
