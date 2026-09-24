@@ -17,16 +17,11 @@ To change the starting point, replace `resume.pt` yourself. For example:
 
 ```sh
 cp checkpoints/klent/RUN_ID/cycle-XXXXXX.pt checkpoints/resume.pt
-mkdir -p checkpoints/anchors
-cp checkpoints/klent/RUN_ID/anchors/anchor-*.pt checkpoints/anchors/
 ```
 
-The copied `anchors/` directory must travel with a slim `resume.pt`; it is ignored
-by Git. On a new Verda box, transfer `checkpoints/anchors/` once before training.
-You can also resume directly from a run checkpoint in its original directory,
-or pass `--anchor-dir` to point to a directory containing `anchors/`.
-Older checkpoints with embedded anchors remain readable and are split into
-standalone anchor files when training next saves a checkpoint.
+Anchors belong to a training run and are never restored from `resume.pt`.
+Older checkpoints with embedded anchors remain readable, but those embedded
+anchors are ignored; new checkpoints contain no anchor weights or references.
 
 ## Verda workflow
 
@@ -78,14 +73,12 @@ with FP32 weights, optimizer moments and losses.
 Snapshots are saved atomically after complete cycles. Native games and opponent
 history are rebuilt on resume, so restarting is not an exact replay.
 Evaluation compares each completed cycle against the immediately previous model and
-up to three fixed anchor models, saved at completed cycles divisible by eight.
-Once three anchors are collected, the panel stays fixed. Anchors are stored in each
-run's `anchors/` directory as three separate model files. Cycle checkpoints contain
-only their anchor cycle numbers. The first cycle after a restart compares against
-the resumed model. If the resumed checkpoint
-has no anchors, its model becomes the first anchor immediately. Later anchors are
-captured eight cycles apart from that first anchor. When an anchor is also the previous model,
-that matchup runs only once and is labeled as both.
+up to three fixed anchor models from the current run. Anchors are captured after
+8, 16, and 24 completed cycles, then the panel stays fixed. Each anchor is saved
+once in that run's `anchors/` directory, separate from cycle checkpoints. The
+first cycle after a restart compares against the resumed model; old anchors are
+not evaluated. When an anchor is also the previous model, that matchup runs
+only once and is labeled as both.
 `test_games` must be even and applies to each opponent separately.
 Metrics record losses, W/D/L, historical matchups, counts and timings; `run.json`
 records the effective configuration, precision, hardware and resume source.
