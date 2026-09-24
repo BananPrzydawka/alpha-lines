@@ -172,39 +172,39 @@ class KlentTests(unittest.TestCase):
                 summaries = run(LIBRARY,options,cycles=2,device='cpu',compile_model=False)
             self.assertEqual(len(summaries),2)
             self.assertEqual(report.getvalue().count(' complete\n'),2)
-            for label in ('Setup', 'Checkpoint', 'Metrics', 'Reporting', 'Other', 'Cycle total'):
+            for label in ('Setup', 'Total', 'CPU', 'Model self play', 'Model training', 'Strength test', 'Other'):
                 expected = 1 if label == 'Setup' else 2
                 self.assertEqual(sum(line.strip().startswith(label+' ') for line in report.getvalue().splitlines()),expected)
             for label, weight in (('Policy',self.options['policy_loss_weight']),
-                                  ('Opponent pi',self.options['opponent_policy_weight']),
-                                  ('Q',self.options['q_loss_weight']),
+                                  ('Opponent policy',self.options['opponent_policy_weight']),
+                                  ('Action value',self.options['q_loss_weight']),
                                   ('Mark',self.options['mark_class_loss_weight']),
-                                  ('Score head',self.options['immediate_score_weight']),
-                                  ('Future score',self.options['discounted_score_weight']),
-                                  ('Future mark',self.options['discounted_mark_weight'])):
+                                  ('Future mark',self.options['discounted_mark_weight']),
+                                  ('Score',self.options['immediate_score_weight']),
+                                  ('Future score',self.options['discounted_score_weight'])):
                 lines = [line for line in report.getvalue().splitlines()
                          if line.startswith(f'    {label} ')]
                 self.assertEqual(len(lines),2)
                 self.assertTrue(all(f'× {weight} =' in line for line in lines))
-            for removed in (' / Self-play', 'Training / ', 'Position-weighted loss',
-                            'Strength test / ', 'Mean over '):
+            for removed in ('  Shuffle ', '  Scoring head processing ', '  Checkpoint ',
+                            '  Metrics ', '  Reporting ', '  Cycle total '):
                 self.assertNotIn(removed,report.getvalue())
             for block in report.getvalue().split('\nCycle ')[1:]:
                 timing_lines = block.splitlines()
-                labels = ('Model','CPU','Shuffle','Scoring head processing','Training',
-                          'Strength test','Checkpoint','Metrics','Reporting','Other')
-                measured = [float(next(line for line in timing_lines
-                                       if line.strip().startswith(label+' ')).split()[-2])
-                            for label in labels]
-                total = float(next(line for line in timing_lines
-                                   if line.strip().startswith('Cycle total ')).split()[-2])
-                self.assertAlmostEqual(sum(measured),total,delta=0.11)
+                labels = ('Total','CPU','Model self play','Model training','Strength test','Other')
+                timing_rows = [next(i for i,line in enumerate(timing_lines)
+                                    if line.strip().startswith(label+' ')) for label in labels]
+                self.assertEqual(timing_rows,sorted(timing_rows))
+                times = [float(timing_lines[i].split()[-2]) for i in timing_rows]
+                self.assertAlmostEqual(sum(times[1:]),times[0],delta=0.04)
             for summary in summaries:
                 self.assertEqual(sum(summary[k] for k in ('wins','draws','losses')),4)
                 self.assertGreater(summary['states'],0)
                 self.assertGreater(summary['loss'],0)
                 self.assertGreaterEqual(summary['shuffle_seconds'],0)
                 self.assertGreaterEqual(summary['scoring_head_processing_seconds'],0)
+                self.assertGreaterEqual(summary['cpu_seconds'],
+                                        summary['shuffle_seconds']+summary['scoring_head_processing_seconds'])
                 self.assertGreaterEqual(summary['mark_class_loss'],0)
                 self.assertGreater(summary['immediate_score_loss'],0)
                 self.assertGreater(summary['discounted_score_loss'],0)

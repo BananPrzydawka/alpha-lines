@@ -343,6 +343,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             arena.clear()
             dev.sync(); training_time = perf_counter()-training_start
             training_exclusive_time = training_time-scoring_processing_time
+            cpu_total = cpu_time + shuffle_time + scoring_processing_time
             test_start = perf_counter()
             model.eval()
             evaluations = []
@@ -378,12 +379,12 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             wins,draws,losses_count = (latest[k] for k in ('wins','draws','losses'))
             completed += 1
             summary = dict(cycle=completed,evaluations=evaluations,states=count,dropped_states=dropped,loss=loss_sum/count,
-                           model_seconds=model_time,cpu_seconds=cpu_time,
+                           model_seconds=model_time,cpu_seconds=cpu_total,
                            shuffle_seconds=shuffle_time,scoring_head_processing_seconds=scoring_processing_time,
                            training_seconds=training_exclusive_time,
                            strength_test_seconds=test_time,wins=wins,draws=draws,losses=losses_count,
                            selfplay_steps=arena_step,batches=batch_number,
-                           mean_cpu_ms=cpu_time*1000/arena_step,
+                           mean_cpu_ms=cpu_total*1000/arena_step,
                            mean_model_ms=model_time*1000/arena_step,
                            mean_forward_ms=timing_sum[0]/batch_number,
                            mean_backward_ms=timing_sum[1]/batch_number,
@@ -403,25 +404,19 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             summary.update(timestamp=datetime.now(timezone.utc).isoformat(),
                            elapsed_seconds=perf_counter()-run_start,
                            win_rate=latest['win_rate'], score_rate=latest['score_rate'])
-            checkpoint_start = perf_counter()
             if checkpoint is not None:
                 checkpoint(model, optimizer, options, summary)
-            checkpoint_time = perf_counter()-checkpoint_start
-            metrics_start = perf_counter()
             if log_dir is not None:
                 with (log_dir/'metrics.jsonl').open('a') as stream:
                     stream.write(json.dumps(summary, allow_nan=False)+'\n')
-            metrics_time = perf_counter()-metrics_start
             if cycles:
                 summaries.append(summary)
-            reporting_start = perf_counter()
-            output.summary(summary)
-            reporting_time = perf_counter()-reporting_start
+            # A single report cannot include the duration of its own print call.
             cycle_time = perf_counter()-cycle_start
-            measured_time = (model_time+cpu_time+shuffle_time+scoring_processing_time+
-                             training_exclusive_time+test_time+checkpoint_time+metrics_time+reporting_time)
-            other_time = cycle_time-measured_time
-            output.timing_footer(checkpoint_time,metrics_time,reporting_time,other_time,cycle_time)
+            timing = dict(total=cycle_time, cpu=cpu_total, selfplay_model=model_time,
+                          training_model=training_exclusive_time, strength_test=test_time,
+                          other=cycle_time-cpu_total-model_time-training_exclusive_time-test_time)
+            output.summary(summary, timing)
             arena_step = 0
             model_time = cpu_time = 0.0
     return summaries

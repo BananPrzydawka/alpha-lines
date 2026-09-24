@@ -72,13 +72,13 @@ aged 1, 2, 4, 8, 16 and 32 cycles when available, with balanced player assignmen
 `test_games` must be even and applies to each opponent separately.
 Metrics record losses, W/D/L, historical matchups, counts and timings; `run.json`
 records the effective configuration, precision, hardware and resume source.
-Completed positions are shuffled before each cycle's single training epoch. Shuffle
-time is reported as `shuffle_seconds`; expansion of mark classes into training
-planes is reported as `scoring_head_processing_seconds`. The cycle report also
-times checkpoint saving, metrics writing, report printing, and residual overhead;
-`Cycle total` is wall-clock time through the main report. `Training` excludes
-scoring-head processing, so its timing categories add up to the total. One-time
-initialization and checkpoint loading appear separately as `Setup`.
+Completed positions are shuffled before each cycle's single training epoch.
+The cycle report shows total time, CPU time (including shuffle and mark-target
+preparation), self-play model time, training time, evaluation time, and other
+time (including checkpoint and metrics writing). The total ends just before
+printing the report, so the report's own print time is excluded. Detailed
+shuffle and mark-target times remain in metrics. One-time initialization and
+checkpoint loading appear separately as `Setup`.
 
 The auxiliary mark head predicts six classes on occupied squares: own or opponent
 mark contributing 0, 1, or 2 points. Its target is derived from the current
