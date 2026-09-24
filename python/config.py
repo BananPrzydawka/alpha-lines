@@ -14,7 +14,7 @@ if (game["height"], game["width"]) != (10, 16):
 height, width = game["height"], game["width"]
 board_size = height * width
 
-for name in ("resnet_model", "katago_model"):
+for name in ("katago_model",):
     options = settings[name]
     for key in ("filters", "blocks", "se_hidden",
                 "policy_filters", "opponent_policy_filters", "action_value_filters", "immediate_score_filters",

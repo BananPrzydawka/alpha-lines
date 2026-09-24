@@ -15,7 +15,6 @@ from klent.train import losses, opponent_policy_loss, run, validate, evaluation_
 
 LIBRARY = Path(__file__).resolve().parents[2]/'rust/target/release/libalpha_lines_game.so'
 
-
 class KlentTests(unittest.TestCase):
     def setUp(self):
         torch.set_num_threads(1)
@@ -114,16 +113,15 @@ class KlentTests(unittest.TestCase):
         with Arena(LIBRARY,self.options) as a, Arena(LIBRARY,self.options) as other:
             pi = torch.zeros(4,80)
             for _ in range(160):
-                ab,asc = a.inputs()
-                bb,bsc = other.inputs()
+                ab = a.inputs()
+                bb = other.inputs()
                 torch.testing.assert_close(ab,bb)
-                torch.testing.assert_close(asc,bsc)
                 full = a.step(pi,pi)
                 self.assertEqual(full,other.step(pi,pi))
                 if full:
                     break
             self.assertTrue(full)
-            count = a.stats()[0]
+            count = a.stats().positions
             batch = Batch(30)
             seen = 0
             for start in range(0,count,15):
@@ -161,10 +159,10 @@ class KlentTests(unittest.TestCase):
                     self.assertEqual((own_score,opponent_score),tuple(int(x) for x in s[row]))
             self.assertEqual(seen,count)
             a.reset(); a.clear()
-            self.assertEqual(a.stats()[0],0)
+            self.assertEqual(a.stats().positions,0)
 
-    def test_two_complete_cycles_both_models(self):
-        for name in ('katago','resnet'):
+    def test_two_complete_cycles(self):
+        for name in ('katago',):
             key = name+'_model'
             small = dict(settings[key],filters=8,blocks=1,se_hidden=4,
                          policy_filters=4,action_value_filters=4)
@@ -238,10 +236,10 @@ class KlentTests(unittest.TestCase):
             self.assertEqual(history.opponents()[0][1]['weight'].item(),cycle)
 
     def test_33_cycles_evaluate_available_history(self):
-        small = dict(settings['resnet_model'],filters=8,blocks=1,se_hidden=4,
+        small = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
                      policy_filters=4,action_value_filters=4)
-        with patch.dict(settings,{'resnet_model':small}),contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
-            summaries = run(LIBRARY,dict(self.options,model='resnet'),
+        with patch.dict(settings,{'katago_model':small}),contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
+            summaries = run(LIBRARY,dict(self.options,model='katago'),
                             cycles=33,device='cpu',compile_model=False)
         for cycle,summary in enumerate(summaries,1):
             self.assertEqual([r['age'] for r in summary['evaluations']],
@@ -252,16 +250,16 @@ class KlentTests(unittest.TestCase):
 
     def test_resume_restores_architecture_but_uses_current_training_settings(self):
         from klent.checkpoint import save
-        small = dict(settings['resnet_model'],filters=8,blocks=1,se_hidden=4,
+        small = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
                      policy_filters=4,action_value_filters=4)
-        with tempfile.TemporaryDirectory() as directory, patch.dict(settings,{'resnet_model':small}), contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(settings,{'katago_model':small}), contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
             def checkpoint(model,optimizer,options,summary):
                 save(directory,model,optimizer,options,summary)
-            run(LIBRARY,dict(self.options,model='resnet'),cycles=1,device='cpu',
+            run(LIBRARY,dict(self.options,model='katago'),cycles=1,device='cpu',
                 compile_model=False,checkpoint=checkpoint)
             path = Path(directory)/'cycle-000001.pt'
             # Change architecture defaults and runtime settings independently.
-            settings['resnet_model'] = dict(small, filters=16, blocks=2)
+            settings['katago_model'] = dict(small, filters=16, blocks=2)
             current = dict(self.options,model='katago',cycles=1,n=3,m=480,
                            train_minibatch=40,test_games=6,lr=0.001,
                            weight_decay=0.02,alpha=0.04,beta=0.2,
@@ -273,7 +271,7 @@ class KlentTests(unittest.TestCase):
             self.assertEqual(results[0]['cycle'],2)
             self.assertEqual(results[0]['evaluations'][0]['opponent_cycle'],1)
             saved = torch.load(Path(directory)/'cycle-000002.pt',weights_only=True)
-            self.assertEqual(saved['options'], dict(current, model='resnet'))
+            self.assertEqual(saved['options'], dict(current, model='katago'))
             for group in saved['optimizer']['param_groups']:
                 self.assertEqual(group['lr'], current['lr'])
                 self.assertEqual(group['weight_decay'], current['weight_decay'])
@@ -288,7 +286,7 @@ class KlentTests(unittest.TestCase):
             self.assertEqual(metrics[0]['win_rate'], metrics[0]['wins']/6)
             self.assertEqual(metrics[0]['score_rate'], (metrics[0]['wins']+0.5*metrics[0]['draws'])/6)
             metadata = json.loads((Path(directory)/'logs/run.json').read_text())
-            self.assertEqual(metadata['options'], dict(current, model='resnet'))
+            self.assertEqual(metadata['options'], dict(current, model='katago'))
             self.assertEqual(metadata['initial_cycle'], 1)
             self.assertEqual(saved['model_config'],small)
             self.assertGreater(next(iter(saved['optimizer']['state'].values()))['step'].item(),
@@ -302,13 +300,13 @@ class KlentTests(unittest.TestCase):
                 run(LIBRARY, self.options, cycles=1, device='cpu', compile_model=False, resume=path)
 
     def test_resume_adds_head_to_legacy_checkpoint(self):
-        from models.resnet import ResNet
-        small = dict(settings['resnet_model'],filters=8,blocks=1,se_hidden=4,
+        from models.katago import KataGoNet
+        small = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
                      policy_filters=4,action_value_filters=4)
-        with tempfile.TemporaryDirectory() as directory, patch.dict(settings,{'resnet_model':small}), contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(settings,{'katago_model':small}), contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
             for has_mark_head, has_immediate_head in ((False,False),(True,False),(True,True)):
                 with self.subTest(has_mark_head=has_mark_head,has_immediate_head=has_immediate_head):
-                    legacy = ResNet(mark_classes=has_mark_head)
+                    legacy = KataGoNet()
                     if not has_immediate_head:
                         legacy.score_embed = torch.nn.Sequential(torch.nn.Linear(2,8),torch.nn.SiLU(),torch.nn.Linear(8,8))
                         modules = list(legacy._modules.items())
@@ -317,7 +315,8 @@ class KlentTests(unittest.TestCase):
                         return not (name.startswith('discounted_score_head.') or
                                     name.startswith('discounted_mark_head.') or
                                     name.startswith('opponent_policy_head.') or
-                                    (not has_immediate_head and name.startswith('immediate_score_head.')))
+                                    (not has_immediate_head and name.startswith('immediate_score_head.')) or
+                                    (not has_mark_head and name.startswith('mark_class_head.')))
                     optimizer = torch.optim.AdamW(p for name,p in legacy.named_parameters()
                                                    if retained(name))
                     board = torch.zeros(2,5,10,16)
@@ -328,24 +327,24 @@ class KlentTests(unittest.TestCase):
                         loss = loss+legacy.score_embed(scores).square().mean()
                     else:
                         loss = loss+immediate.square().mean()
-                    if mark is not None:
+                    if has_mark_head:
                         loss = loss+mark.square().mean()
                     loss.backward()
                     optimizer.step()
                     path = Path(directory)/f'legacy-{has_mark_head}-{has_immediate_head}.pt'
                     old_weights = {k:v for k,v in legacy.state_dict().items()
                                    if retained(k)}
-                    current = ResNet(mark_classes=True)
+                    current = KataGoNet()
                     current.load_state_dict(old_weights,strict=False)
                     migrated = torch.optim.AdamW(current.parameters())
                     restore_optimizer(migrated,optimizer.state_dict(),old_weights,current)
-                    old_tower = dict(legacy.named_parameters())['tower.0.conv1.weight']
-                    new_tower = dict(current.named_parameters())['tower.0.conv1.weight']
+                    old_tower = dict(legacy.named_parameters())['tower.0.reduce.weight']
+                    new_tower = dict(current.named_parameters())['tower.0.reduce.weight']
                     torch.testing.assert_close(migrated.state[new_tower]['exp_avg'],optimizer.state[old_tower]['exp_avg'])
                     torch.save(dict(format_version=1,model=old_weights,optimizer=optimizer.state_dict(),
-                                    options=dict(self.options,model='resnet'),model_config=small,
+                                    options=dict(self.options,model='katago'),model_config=small,
                                     summary=dict(cycle=1),torch_rng=torch.get_rng_state(),cuda_rng=[]),path)
-                    results = run(LIBRARY,dict(self.options,model='resnet'),cycles=1,
+                    results = run(LIBRARY,dict(self.options,model='katago'),cycles=1,
                                   device='cpu',compile_model=False,resume=path)
                     self.assertEqual(results[0]['cycle'],2)
                     self.assertGreater(results[0]['mark_class_loss'],0)
@@ -391,7 +390,7 @@ class KlentTests(unittest.TestCase):
                          {'mark_class_loss_weight':float('inf')},{'immediate_score_weight':-1},
                          {'discounted_score_weight':-1},{'discounted_score_lambda':1.1},
                          {'discounted_mark_weight':-1},{'discounted_mark_lambda':1.1},
-                         {'opponent_policy_weight':-1}):
+                         {'opponent_policy_weight':-1},{'model':'resnet'}):
             with self.assertRaises(ValueError):
                 validate(dict(self.options,**override))
 

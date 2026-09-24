@@ -1,12 +1,14 @@
 """Owned ctypes handles and reusable CPU tensors for the Rust KLENT core."""
 import ctypes as C
+from typing import NamedTuple
 import torch
 
 
-def mark_classes_enabled(library):
-    function = C.CDLL(str(library)).klent_mark_classes_enabled
-    function.argtypes, function.restype = [], C.c_bool
-    return function()
+class ArenaStats(NamedTuple):
+    positions: int
+    wins: int
+    draws: int
+    losses: int
 
 
 def check(status):
@@ -19,9 +21,9 @@ class Arena:
     def __init__(self, library, options, *, evaluation=False, seed=None, pinned=False):
         self.lib = C.CDLL(str(library))
         signatures = {
-            'new': ([C.c_size_t]*3+[C.c_float]*6+[C.c_uint64,C.c_bool], C.c_void_p),
+            'new': ([C.c_size_t]*2+[C.c_float]*6+[C.c_uint64,C.c_bool], C.c_void_p),
             'free': ([C.c_void_p], None),
-            'inputs': ([C.c_void_p]*3, C.c_int),
+            'inputs': ([C.c_void_p]*2, C.c_int),
             'step': ([C.c_void_p]*3, C.c_int),
             'stats': ([C.c_void_p]*2, None),
             'reset': ([C.c_void_p], C.c_size_t),
@@ -33,18 +35,17 @@ class Arena:
             fn = getattr(self.lib, 'klent_'+name)
             fn.argtypes, fn.restype = args, result
         self.n = options['test_games'] if evaluation else options['n']
-        self.handle = self.lib.klent_new(self.n, options['m'], options['max_ply'],
+        self.handle = self.lib.klent_new(self.n, options['m'],
             options['alpha'], options['beta'], options['lambda'], options['discounted_score_lambda'],
             options['exploration_fraction'], options['discounted_mark_lambda'],
             options['seed'] if seed is None else seed, evaluation)
         if not self.handle:
             raise RuntimeError('Could not create Rust KLENT arena')
-        self.boards = torch.empty((2*self.n,5,10,16), dtype=torch.bfloat16, pin_memory=pinned)
-        self.scores = torch.empty((2*self.n,2), dtype=torch.bfloat16, pin_memory=pinned)
+        self.boards = torch.empty((2*self.n,5,10,16), dtype=torch.float32, pin_memory=pinned)
 
     def inputs(self):
-        check(self.lib.klent_inputs(self.handle,self.boards.data_ptr(),self.scores.data_ptr()))
-        return self.boards, self.scores
+        check(self.lib.klent_inputs(self.handle,self.boards.data_ptr()))
+        return self.boards
 
     def step(self, logits, q):
         for value in (logits,q):
@@ -55,7 +56,7 @@ class Arena:
     def stats(self):
         values = (C.c_size_t*4)()
         self.lib.klent_stats(self.handle,values)
-        return tuple(values)
+        return ArenaStats(*values)
 
     def reset(self):
         return self.lib.klent_reset(self.handle)
@@ -87,8 +88,14 @@ class Batch:
         self.rows = rows
         def empty(shape,dtype):
             return torch.empty(shape,dtype=dtype,pin_memory=pinned)
-        self.tensors = (empty((rows,5,10,16),torch.bfloat16),
-            empty((rows,2),torch.bfloat16), empty((rows,160),torch.bfloat16),
-            empty((rows,),torch.int64), empty((rows,),torch.float32),
-            empty((rows,80),torch.int8), empty((rows,2,81),torch.bfloat16),
-            empty((rows,80,8),torch.bfloat16))
+        # Keep this order aligned with Arena.batch()'s native pointer arguments.
+        self.tensors = (
+            empty((rows,5,10,16),torch.float32),   # board features
+            empty((rows,2),torch.float32),         # immediate score targets for both players
+            empty((rows,160),torch.float32),       # policy targets in the 10x16 board layout
+            empty((rows,),torch.int64),            # played action
+            empty((rows,),torch.float32),          # return for this perspective
+            empty((rows,80),torch.int8),           # mark classes for 80 squares
+            empty((rows,2,81),torch.float32),      # discounted score distributions
+            empty((rows,80,8),torch.float32),      # discounted mark class distributions
+        )

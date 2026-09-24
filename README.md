@@ -1,6 +1,6 @@
 # Alpha-lines
 
-KLENT self-play training with a Rust game engine and PyTorch KataGo/ResNet models.
+KLENT self-play training with a Rust game engine and a PyTorch KataGo model.
 Local/Verda training and Modal are supported.
 
 ## Checkpoints and logs
@@ -59,14 +59,15 @@ It connects as `root` to `/root/projects/alpha-lines/` on the box.
 `klent.cycles` is the number of **additional** cycles (0 runs until stopped).
 Current `klent` settings control self-play, buffer size, minibatches, evaluation,
 learning rate, weight decay, alpha/beta/lambda and seed. Checkpoints supply model
-type, architecture, FP32 weights, AdamW state and completed cycle number.
+architecture, FP32 weights, AdamW state and completed cycle number. Only KataGo
+checkpoints are supported.
 An unchanged seed restores torch RNG state; changing it reseeds torch.
 BF16-only legacy checkpoints are unsupported. Training retains BF16 autocast
 with FP32 weights, optimizer moments and losses.
 
 Snapshots are saved atomically after complete cycles. Native games and opponent
 history are rebuilt on resume, so restarting is not an exact replay.
-Evaluation retains 32 CPU weight snapshots in RAM and compares against snapshots
+Evaluation retains 32 weight snapshots on the model device and compares against snapshots
 aged 1, 2, 4, 8, 16 and 32 cycles when available, with balanced player assignments.
 `test_games` must be even and applies to each opponent separately.
 Metrics record losses, W/D/L, historical matchups, counts and timings; `run.json`
@@ -83,9 +84,9 @@ The auxiliary mark head predicts six classes on occupied squares: own or opponen
 mark contributing 0, 1, or 2 points. Its target is derived from the current
 border-connected diagonal runs and stored with each self-play position. The
 head is added automatically when resuming a two-head FP32 checkpoint, preserving
-existing weights and AdamW moments. To compile out mark classification and its
-storage, set `TRACK_MARK_CLASSES` to `false` in `rust/src/game.rs` and rebuild Rust;
-training detects this and omits the head and auxiliary loss.
+existing weights and AdamW moments. To compile out engine mark classification
+and its storage, set `TRACK_MARK_CLASSES` to `false` in `rust/src/game.rs` and
+rebuild Rust. The model still has mark heads; absent targets give them zero loss.
 
 The immediate-score head predicts both current scores as 81-way logits (0–80),
 ordered current player then opponent. It reads the final shared residual-tower
@@ -94,14 +95,14 @@ only board planes; scores stored with each self-play position are training
 targets, not model inputs. Cross-entropy averaged over both players joins the
 loss with `klent.immediate_score_weight`. The loss weights are configured
 as `policy_loss_weight: 1.0`, `q_loss_weight: 2.0`,
-`mark_class_loss_weight: 2.0`, and `immediate_score_weight: 1.0`.
+`mark_class_loss_weight: 1.0`, and `immediate_score_weight: 1.0`.
 The discounted-score head also outputs two 81-way score distributions from the
 shared tower. Each completed game supplies soft targets by walking scores
 backward from the final post-action score:
 `D_t = (1 - discounted_score_lambda) onehot(score_t) + discounted_score_lambda D_(t+1)`.
 The discount defaults to 0.94, independently of the Q-return `lambda`, and
 `discounted_score_weight` defaults to 1.0. The target distributions are computed
-before shuffling and stored with each position; this adds 324 bytes per buffered
+before shuffling and stored with each position; this adds 648 bytes per buffered
 position. Both score heads use cross-entropy and report their raw and weighted
 losses separately. On resume from older FP32 checkpoints, missing heads are
 added while existing weights and their AdamW moments are retained; the obsolete
@@ -114,7 +115,7 @@ After dependency setup, local training can also run directly:
 ```
 
 Omit `--resume` to train from scratch. Optional `--checkpoint-dir` and `--log-dir`
-set output paths. KataGo and ResNet have independent model settings in `config.json`.
+set output paths. KataGo model settings are in `config.json`.
 
 ## Modal
 
@@ -130,7 +131,7 @@ checkpoint is committed to the volume.
 ## Project and checks
 
 - `python/klent/`: training, native bindings, checkpointing, logging and Modal entrypoint.
-- `python/models/`: KataGo/ResNet and shared layers.
+- `python/models/`: KataGo and shared layers.
 - `rust/src/`: game engine and KLENT arena.
 - `rust/tests/`: independent game parity tests; KLENT unit tests also live in Rust source.
 - `scripts/`: GPU setup, local/Verda launchers and result downloads.

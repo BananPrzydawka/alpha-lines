@@ -39,7 +39,7 @@ class NestedBottleneck(nn.Module):
         )
         self.expand = nn.Conv2d(inner_channels, channels, 1, bias=False)
         self.expand_norm = group_norm(channels, norm)
-        # Match the existing ResNet's SE on the outer residual branch.
+        # Squeeze and excite the outer residual branch.
         self.excite = nn.Sequential(
             nn.Linear(channels, se_hidden, bias=False),
             nn.SiLU(),
@@ -62,7 +62,7 @@ class KataGoNet(nn.Module):
 
     Score logits are ordered current player then opponent. Outputs are unbounded.
     """
-    def __init__(self, mark_classes=True):
+    def __init__(self):
         super().__init__()
         options = settings["katago_model"]
         channels = options["filters"]
@@ -80,10 +80,8 @@ class KataGoNet(nn.Module):
         self.policy_head = spatial_head(channels, options["policy_filters"], norm)
         self.opponent_policy_head = spatial_head(channels, options["opponent_policy_filters"], norm)
         self.action_value_head = spatial_head(channels, options["action_value_filters"], norm)
-        self.mark_class_head = (spatial_head(channels, options.get("mark_class_filters", options["action_value_filters"]), norm, 6)
-                                if mark_classes else None)
-        self.discounted_mark_head = (spatial_head(channels, options.get("discounted_mark_filters", options["action_value_filters"]), norm, 8)
-                                     if mark_classes else None)
+        self.mark_class_head = spatial_head(channels, options.get("mark_class_filters", options["action_value_filters"]), norm, 6)
+        self.discounted_mark_head = spatial_head(channels, options.get("discounted_mark_filters", options["action_value_filters"]), norm, 8)
         self.immediate_score_head = categorical_score_head(channels, options.get("immediate_score_filters", 32), norm)
         self.discounted_score_head = categorical_score_head(channels, options.get("discounted_score_filters", 32), norm)
 
@@ -93,8 +91,8 @@ class KataGoNet(nn.Module):
         features = self.tower(features)
         return (self.policy_head(features).squeeze(1),
                 self.action_value_head(features).squeeze(1),
-                self.mark_class_head(features) if self.mark_class_head is not None else None,
+                self.mark_class_head(features),
                 self.immediate_score_head(features).reshape(-1, 2, 81),
                 self.discounted_score_head(features).reshape(-1, 2, 81),
-                self.discounted_mark_head(features) if self.discounted_mark_head is not None else None,
+                self.discounted_mark_head(features),
                 self.opponent_policy_head(features).squeeze(1))

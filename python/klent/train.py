@@ -1,6 +1,5 @@
 """Sequential KLENT self-play / fitting / sampled old-versus-new evaluation."""
 import argparse
-from collections import deque
 import copy
 import math
 import json
@@ -11,22 +10,20 @@ from time import perf_counter
 import torch
 import torch.nn.functional as F
 from config import settings
-from klent.native import Arena, Batch, mark_classes_enabled
+from klent.native import Arena, Batch
 from klent import output
 from models.katago import KataGoNet
-from models.resnet import ResNet
+MAX_PLY = 80
 
 
 def validate(options):
     if type(options['cycles']) is not int or options['cycles'] < 0:
         raise ValueError('cycles must be a nonnegative integer')
-    for key in ('n','m','max_ply','train_minibatch','test_games'):
+    for key in ('n','m','train_minibatch','test_games'):
         if type(options[key]) is not int or options[key] < 1:
             raise ValueError(f'klent.{key} must be a positive integer')
-    if options['max_ply'] != 80:
-        raise ValueError('klent.max_ply must be the game storage bound, 80')
-    if options['m'] < options['n']*options['max_ply']:
-        raise ValueError('klent.m must be at least n*max_ply')
+    if options['m'] < options['n']*MAX_PLY:
+        raise ValueError('klent.m must be at least n*80')
     if options['test_games'] % 2:
         raise ValueError('test_games must be even for balanced sides')
     if options['train_minibatch'] % 2:
@@ -41,8 +38,8 @@ def validate(options):
         raise ValueError('require alpha+beta > 0, exploration_fraction, lambda values <= 1, and lr > 0')
     if type(options['seed']) is not int or not 0 <= options['seed'] < 2**64:
         raise ValueError('seed must fit u64')
-    if options['model'] not in ('resnet','katago') or options['optimizer'].lower() != 'adamw':
-        raise ValueError('supported models: resnet, katago; optimizer: adamw')
+    if options['model'] != 'katago' or options['optimizer'].lower() != 'adamw':
+        raise ValueError('supported model: katago; optimizer: adamw')
 
 
 def losses(logits, q, target, actions, returns, valid):
@@ -137,16 +134,24 @@ def evaluation_rows(games):
 
 
 class ModelHistory:
-    """32 independent CPU weight snapshots, newest first when selecting ages."""
+    """Keep 32 independent weight snapshots on the model's device."""
     def __init__(self):
-        self.snapshots = deque(maxlen=32)
+        self.snapshots = []
+        self.next_slot = 0
 
     def remember(self, model):
-        self.snapshots.append({k: v.detach().to('cpu', copy=True)
-                               for k,v in model.state_dict().items()})
+        state = model.state_dict()
+        if len(self.snapshots) < 32:
+            self.snapshots.append({k: v.detach().clone() for k,v in state.items()})
+        else:
+            slot = self.snapshots[self.next_slot]
+            with torch.no_grad():
+                for k,v in state.items():
+                    slot[k].copy_(v)
+        self.next_slot = (self.next_slot + 1) % 32
 
     def opponents(self):
-        return [(age,self.snapshots[-age]) for age in (1,2,4,8,16,32)
+        return [(age,self.snapshots[(self.next_slot-age) % 32]) for age in (1,2,4,8,16,32)
                 if age <= len(self.snapshots)]
 
 
@@ -188,7 +193,9 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                for t in restored['model'].values()):
             raise ValueError('Resume requires an FP32 checkpoint')
         # Architecture must match the weights; runtime training settings are current.
-        options['model'] = restored['options']['model']
+        if restored['options']['model'] != 'katago':
+            raise ValueError('Only KataGo checkpoints are supported')
+        options['model'] = 'katago'
         model_key = options['model']+'_model'
         model_config = dict(restored['model_config'])
         model_config.setdefault('immediate_score_filters', settings[model_key]['immediate_score_filters'])
@@ -199,11 +206,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     validate(options)
     cycles = options['cycles']
     dev = Device(device)
-    torch.set_num_threads(1)
     torch.manual_seed(options['seed'])
-    factory = {'katago':KataGoNet,'resnet':ResNet}[options['model']]
-    use_mark_classes = mark_classes_enabled(library)
-    model = factory(mark_classes=use_mark_classes).to(device=device,dtype=torch.float32,memory_format=torch.channels_last)
+    model = KataGoNet().to(device=device,dtype=torch.float32,memory_format=torch.channels_last)
     old = copy.deepcopy(model).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(),lr=options['lr'],weight_decay=options['weight_decay'])
     if restored is not None:
@@ -248,12 +252,11 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                         resume=str(resume) if resume else None, initial_cycle=completed,
                         options=options, model_config=settings[options['model']+'_model'],
                         precision='fp32-weights-bf16-autocast', device=str(device),
-                        mark_classes_enabled=use_mark_classes,
                         gpu=torch.cuda.get_device_name(device) if dev.cuda else None,
                         torch_version=str(torch.__version__), compiled=compile_model)
         (log_dir/'run.json').write_text(json.dumps(metadata, indent=2)+'\n')
     output.setup(options, device, compile_model)
-    with Arena(library,options,pinned=dev.cuda,seed=(options['seed']+completed)%(2**64)) as arena:
+    with Arena(library, options, pinned=dev.cuda, seed=(options['seed']+completed)%(2**64)) as arena:
         output.emit(f'  Setup      {perf_counter()-run_start:.2f} s')
         model_time = cpu_time = 0.0
         arena_step = 0
@@ -262,7 +265,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 cycle_start = perf_counter()
             arena_step += 1
             t = perf_counter()
-            boards,_ = arena.inputs()
+            boards = arena.inputs()
             encoding_time = perf_counter()-t
             model.eval()
             torch.compiler.cudagraph_mark_step_begin()
@@ -276,7 +279,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 cpu_ms = (perf_counter()-t+encoding_time)*1000
                 cpu_time += cpu_ms/1000
                 continue
-            count = arena.stats()[0]
+            count = arena.stats().positions
             dropped = arena.reset()
             cpu_time += perf_counter()-t+encoding_time
             processing_start = perf_counter()
@@ -291,15 +294,11 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             for start in range(0,count,batch.rows//2):
                 valid_positions = arena.batch(start,batch)
                 b,s,target,actions,returns,classes,discounted_scores,discounted_marks = dev.transfer(batch.tensors)
-                if use_mark_classes:
-                    dev.sync(); scoring_processing_start = perf_counter()
-                    class_target = mark_class_targets(classes, indices)
-                    future_mark_target = discounted_mark_targets(discounted_marks, indices)
-                    dev.sync()
-                    scoring_processing_time += perf_counter()-scoring_processing_start
-                else:
-                    class_target = None
-                    future_mark_target = None
+                dev.sync(); scoring_processing_start = perf_counter()
+                class_target = mark_class_targets(classes, indices)
+                future_mark_target = discounted_mark_targets(discounted_marks, indices)
+                dev.sync()
+                scoring_processing_time += perf_counter()-scoring_processing_start
                 b = b.contiguous(memory_format=torch.channels_last)
                 valid = (rows < 2*valid_positions).float()
                 optimizer.zero_grad(set_to_none=True)
@@ -309,17 +308,17 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                     logits,values,mark_logits,score_logits,discounted_logits,discounted_mark_logits,opponent_logits = network(b)
                     policy_loss,value_loss = losses(logits,values,target,actions,returns,valid)
                     other_policy_loss = opponent_policy_loss(opponent_logits,target,valid)
-                    mark_loss = mark_class_loss(mark_logits,class_target,valid) if use_mark_classes else None
+                    mark_loss = mark_class_loss(mark_logits,class_target,valid)
                     score_loss = immediate_score_loss(score_logits,s,valid)
                     future_score_loss = discounted_score_loss(discounted_logits,discounted_scores,valid)
-                    future_mark_loss = discounted_mark_loss(discounted_mark_logits,future_mark_target,valid) if use_mark_classes else None
+                    future_mark_loss = discounted_mark_loss(discounted_mark_logits,future_mark_target,valid)
                     loss = (options['policy_loss_weight'] * policy_loss
                             + options['opponent_policy_weight'] * other_policy_loss
                             + options['q_loss_weight'] * value_loss
-                            + (options['mark_class_loss_weight'] * mark_loss if use_mark_classes else 0)
+                            + options['mark_class_loss_weight'] * mark_loss
                             + options['immediate_score_weight'] * score_loss
                             + options['discounted_score_weight'] * future_score_loss
-                            + (options['discounted_mark_weight'] * future_mark_loss if use_mark_classes else 0))
+                            + options['discounted_mark_weight'] * future_mark_loss)
                 forward_end = dev.stamp()
                 loss.backward()
                 backward_end = dev.stamp()
@@ -334,12 +333,10 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 policy_sum += policy_loss.item()*valid_positions
                 opponent_policy_sum += other_policy_loss.item()*valid_positions
                 value_sum += value_loss.item()*valid_positions
-                if use_mark_classes:
-                    mark_sum += mark_loss.item()*valid_positions
+                mark_sum += mark_loss.item()*valid_positions
                 immediate_score_sum += score_loss.item()*valid_positions
                 discounted_score_sum += future_score_loss.item()*valid_positions
-                if use_mark_classes:
-                    discounted_mark_sum += future_mark_loss.item()*valid_positions
+                discounted_mark_sum += future_mark_loss.item()*valid_positions
                 for j, (first, second) in enumerate(((forward_start,forward_end),
                         (forward_end,backward_end),(backward_end,optimizer_end))):
                     timing_sum[j] += dev.elapsed(first,second)
@@ -358,7 +355,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                     # sees test_games rows, including zero rows for finished slots.
                     old_rows, new_rows = evaluation_rows(options['test_games'])
                     while True:
-                        b,s = test.inputs()
+                        b = test.inputs()
                         torch.compiler.cudagraph_mark_step_begin()
                         p0,q0 = infer(previous,b[old_rows])
                         p1,q1 = infer(network,b[new_rows])
@@ -368,7 +365,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                         q[old_rows], q[new_rows] = q0, q1
                         if test.step(pi,q):
                             break
-                    _,wins,draws,losses_count = test.stats()
+                    stats = test.stats()
+                    wins,draws,losses_count = stats.wins,stats.draws,stats.losses
                 dev.sync()
                 evaluations.append(dict(age=age,opponent_cycle=completed+1-age,
                     wins=wins,draws=draws,losses=losses_count,
