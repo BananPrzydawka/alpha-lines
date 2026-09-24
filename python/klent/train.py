@@ -134,25 +134,33 @@ def evaluation_rows(games):
 
 
 class ModelHistory:
-    """Keep 32 independent weight snapshots on the model's device."""
-    def __init__(self):
-        self.snapshots = []
-        self.next_slot = 0
+    """Keep the previous model and up to three fixed eight-cycle anchors."""
+    def __init__(self, anchors=()):
+        self.previous = None
+        self.anchors = [(cycle, {k: v.clone() for k,v in weights.items()})
+                        for cycle, weights in anchors]
 
-    def remember(self, model):
-        state = model.state_dict()
-        if len(self.snapshots) < 32:
-            self.snapshots.append({k: v.detach().clone() for k,v in state.items()})
-        else:
-            slot = self.snapshots[self.next_slot]
-            with torch.no_grad():
-                for k,v in state.items():
-                    slot[k].copy_(v)
-        self.next_slot = (self.next_slot + 1) % 32
+    @staticmethod
+    def snapshot(model):
+        return {k: v.detach().clone() for k,v in model.state_dict().items()}
+
+    def remember_previous(self, model, cycle):
+        self.previous = (cycle, self.snapshot(model))
+
+    def remember_anchor(self, model, cycle):
+        if cycle % 8 == 0 and len(self.anchors) < 3:
+            self.anchors.append((cycle, self.snapshot(model)))
 
     def opponents(self):
-        return [(age,self.snapshots[(self.next_slot-age) % 32]) for age in (1,2,4,8,16,32)
-                if age <= len(self.snapshots)]
+        if self.previous is not None:
+            yield ('previous', *self.previous)
+        for cycle, weights in self.anchors:
+            if self.previous is None or cycle != self.previous[0]:
+                yield ('anchor', cycle, weights)
+
+    def checkpoint_anchors(self):
+        return [(cycle, {k: v.cpu() for k,v in weights.items()})
+                for cycle, weights in self.anchors]
 
 
 class Device:
@@ -225,8 +233,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 torch.cuda.set_rng_state(restored['cuda_rng'][0],device=device)
         else:
             torch.manual_seed(options['seed'])
-    network = torch.compile(model,mode='max-autotune',dynamic=False) if compile_model else model
-    previous = torch.compile(old,mode='max-autotune',dynamic=False) if compile_model else old
+    network = torch.compile(model,dynamic=False) if compile_model else model
+    previous = torch.compile(old,dynamic=False) if compile_model else old
     sq = torch.arange(80,device=device)
     indices = sq//8*16+2*(sq%8)+(sq//8%2)
     batch = Batch(options['train_minibatch'],pinned=dev.cuda)
@@ -234,7 +242,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     completed = 0 if restored is None else restored['summary']['cycle']
     stop_cycle = completed + cycles
     summaries = []
-    history = ModelHistory()
+    history = ModelHistory(restored.get('anchors', ()) if restored is not None else ())
 
     def infer(net, boards):
         with torch.no_grad(), torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
@@ -286,7 +294,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             arena.shuffle()
             shuffle_time = perf_counter()-processing_start
             dev.sync(); training_start = perf_counter()
-            history.remember(model)
+            history.remember_previous(model, completed)
             model.train()
             loss_sum = policy_sum = opponent_policy_sum = value_sum = mark_sum = immediate_score_sum = discounted_score_sum = discounted_mark_sum = 0.0
             scoring_processing_time = 0.0
@@ -347,7 +355,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             test_start = perf_counter()
             model.eval()
             evaluations = []
-            for age, weights in history.opponents():
+            for kind, opponent_cycle, weights in history.opponents():
                 opponent_start = perf_counter()
                 # Reuse one compiled opponent and copy into its existing tensors.
                 old.load_state_dict(weights)
@@ -369,7 +377,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                     stats = test.stats()
                     wins,draws,losses_count = stats.wins,stats.draws,stats.losses
                 dev.sync()
-                evaluations.append(dict(age=age,opponent_cycle=completed+1-age,
+                evaluations.append(dict(kind=kind,age=completed+1-opponent_cycle,
+                    opponent_cycle=opponent_cycle,
                     wins=wins,draws=draws,losses=losses_count,
                     win_rate=wins/options['test_games'],
                     score_rate=(wins+0.5*draws)/options['test_games'],
@@ -378,6 +387,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             latest = evaluations[0]
             wins,draws,losses_count = (latest[k] for k in ('wins','draws','losses'))
             completed += 1
+            history.remember_anchor(model, completed)
             summary = dict(cycle=completed,evaluations=evaluations,states=count,dropped_states=dropped,loss=loss_sum/count,
                            model_seconds=model_time,cpu_seconds=cpu_total,
                            shuffle_seconds=shuffle_time,scoring_head_processing_seconds=scoring_processing_time,
@@ -405,7 +415,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                            elapsed_seconds=perf_counter()-run_start,
                            win_rate=latest['win_rate'], score_rate=latest['score_rate'])
             if checkpoint is not None:
-                checkpoint(model, optimizer, options, summary)
+                checkpoint(model, optimizer, options, summary, history.checkpoint_anchors())
             if log_dir is not None:
                 with (log_dir/'metrics.jsonl').open('a') as stream:
                     stream.write(json.dumps(summary, allow_nan=False)+'\n')
@@ -436,8 +446,8 @@ def main():
     run_id = uuid4().hex
     directory = args.checkpoint_dir or Path('checkpoints/klent')/run_id
     log_dir = args.log_dir or Path('logs/klent')/run_id
-    def checkpoint(model,optimizer,options,summary):
-        path = save(directory,model,optimizer,options,summary)
+    def checkpoint(model,optimizer,options,summary,anchors):
+        path = save(directory,model,optimizer,options,summary,anchors)
         output.emit(f'Checkpoint saved: {path}')
     run(args.library,device=args.device,compile_model=not args.no_compile,
         checkpoint=checkpoint,resume=args.resume,log_dir=log_dir)

@@ -7,7 +7,7 @@ def emit(*lines):
 
 def setup(options, device, compiled):
     emit('', 'KLENT  |  '+options['model']+'  |  FP32 weights + BF16 autocast  |  '+device,
-         '  Compile    '+('max-autotune' if compiled else 'disabled'),
+         '  Compile    '+('default' if compiled else 'disabled'),
          f"  Arena      {options['n']:,} games   |   Buffer {options['m']:,} positions",
          f"  Minibatch  {options['train_minibatch']:,} perspectives   |   One epoch",
          f"  Test       {options['test_games']:,} games   |   Seed {options['seed']}",
@@ -17,7 +17,7 @@ def setup(options, device, compiled):
          f"  Discounted mark lambda {options['discounted_mark_lambda']:.6f}",
          f"  Optimizer  {options['optimizer']}   |   LR {options['lr']:g}   |   Decay {options['weight_decay']:g}")
     if compiled:
-        emit('  Timings include compilation/autotuning on first use.')
+        emit('  Timings include compilation on first use.')
 
 
 def summary(row, timing):
@@ -43,10 +43,12 @@ def summary(row, timing):
                        ('Model training','training_model'),
                        ('Strength test','strength_test'), ('Other','other')]:
         lines.append(f'  {label:<24}{timing[key]:>12.2f} s')
-    lines.extend(('', '  Opponent       W     D     L    Score'))
+    lines.extend(('', '  Opponent             W     D     L    Score'))
     for result in row['evaluations']:
         w,d,l = (result[k] for k in ('wins','draws','losses'))
         score = (w+0.5*d)/(w+d+l)
-        lines.append(f"  {result['age']:>2} cycles ago {w:5d} {d:5d} {l:5d}  {score:6.1%}")
+        opponent = ('Previous' if result['kind'] == 'previous'
+                    else f"Anchor cycle {result['opponent_cycle']}")
+        lines.append(f"  {opponent:<19}{w:5d} {d:5d} {l:5d}  {score:6.1%}")
     lines.append('-'*43)
     emit(*lines)

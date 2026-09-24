@@ -67,8 +67,13 @@ with FP32 weights, optimizer moments and losses.
 
 Snapshots are saved atomically after complete cycles. Native games and opponent
 history are rebuilt on resume, so restarting is not an exact replay.
-Evaluation retains 32 weight snapshots on the model device and compares against snapshots
-aged 1, 2, 4, 8, 16 and 32 cycles when available, with balanced player assignments.
+Evaluation compares each completed cycle against the immediately previous model and
+up to three fixed anchor models, saved at completed cycles divisible by eight.
+Once three anchors are collected, the panel stays fixed. Anchors are stored in each
+resumable checkpoint and survive copying that checkpoint to `resume.pt`. The first
+cycle after a restart compares against the resumed model. When an anchor is also
+the previous model, that matchup runs only once. Older checkpoints without
+anchors begin a new panel at the next cycle divisible by eight.
 `test_games` must be even and applies to each opponent separately.
 Metrics record losses, W/D/L, historical matchups, counts and timings; `run.json`
 records the effective configuration, precision, hardware and resume source.

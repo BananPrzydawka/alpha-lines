@@ -27,8 +27,8 @@ def train(smoke: bool = False):
     from uuid import uuid4
     from klent.checkpoint import save
     directory = '/checkpoints/klent/' + uuid4().hex
-    def checkpoint(model, optimizer, options, summary):
-        path = save(directory, model, optimizer, options, summary)
+    def checkpoint(model, optimizer, options, summary, anchors):
+        path = save(directory, model, optimizer, options, summary, anchors)
         volume.commit()
         print(f'Checkpoint saved: {path}', flush=True)
     return run('/root/rust/target/release/libalpha_lines_game.so',options,

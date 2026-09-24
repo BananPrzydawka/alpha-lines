@@ -222,28 +222,32 @@ class KlentTests(unittest.TestCase):
     def test_history_is_independent_bounded_and_correctly_aged(self):
         model = torch.nn.Linear(1,1)
         history = ModelHistory()
+        with torch.no_grad():
+            model.weight.fill_(0)
         for cycle in range(36):
+            history.remember_previous(model, cycle)
             with torch.no_grad():
-                model.weight.fill_(cycle)
-            history.remember(model)
-            self.assertEqual(len(history.snapshots),min(cycle+1,32))
-            self.assertEqual([age for age,_ in history.opponents()],
-                             [age for age in (1,2,4,8,16,32) if age<=cycle+1])
-            for age,weights in history.opponents():
-                self.assertEqual(weights['weight'].item(),cycle+1-age)
-            with torch.no_grad():
-                model.weight.fill_(-100)
-            self.assertEqual(history.opponents()[0][1]['weight'].item(),cycle)
+                model.weight.fill_(cycle+1)
+            history.remember_anchor(model, cycle+1)
+            self.assertEqual([c for c,_ in history.anchors],
+                             [c for c in (8,16,24) if c<=cycle+1])
+            self.assertEqual(history.previous[1]['weight'].item(),cycle)
+        restored = ModelHistory(history.checkpoint_anchors())
+        with torch.no_grad():
+            model.weight.fill_(-100)
+        self.assertEqual([c for c,_ in restored.anchors],[8,16,24])
+        self.assertEqual([w['weight'].item() for _,w in restored.anchors],[8,16,24])
 
-    def test_33_cycles_evaluate_available_history(self):
+    def test_33_cycles_evaluate_previous_and_fixed_anchors(self):
         small = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
                      policy_filters=4,action_value_filters=4)
         with patch.dict(settings,{'katago_model':small}),contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
             summaries = run(LIBRARY,dict(self.options,model='katago'),
                             cycles=33,device='cpu',compile_model=False)
         for cycle,summary in enumerate(summaries,1):
-            self.assertEqual([r['age'] for r in summary['evaluations']],
-                             [age for age in (1,2,4,8,16,32) if age<=cycle])
+            expected = [('previous',cycle-1)]
+            expected += [('anchor',c) for c in (8,16,24) if c<cycle-1]
+            self.assertEqual([(r['kind'],r['opponent_cycle']) for r in summary['evaluations']],expected)
             for result in summary['evaluations']:
                 self.assertEqual(result['opponent_cycle'],cycle-result['age'])
                 self.assertEqual(sum(result[k] for k in ('wins','draws','losses')),4)
@@ -253,11 +257,14 @@ class KlentTests(unittest.TestCase):
         small = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
                      policy_filters=4,action_value_filters=4)
         with tempfile.TemporaryDirectory() as directory, patch.dict(settings,{'katago_model':small}), contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
-            def checkpoint(model,optimizer,options,summary):
-                save(directory,model,optimizer,options,summary)
+            def checkpoint(model,optimizer,options,summary,anchors):
+                save(directory,model,optimizer,options,summary,anchors)
             run(LIBRARY,dict(self.options,model='katago'),cycles=1,device='cpu',
                 compile_model=False,checkpoint=checkpoint)
             path = Path(directory)/'cycle-000001.pt'
+            resume_state = torch.load(path,weights_only=True)
+            resume_state['anchors'] = [(0, resume_state['model'])]
+            torch.save(resume_state,path)
             # Change architecture defaults and runtime settings independently.
             settings['katago_model'] = dict(small, filters=16, blocks=2)
             current = dict(self.options,model='katago',cycles=1,n=3,m=480,
@@ -270,7 +277,10 @@ class KlentTests(unittest.TestCase):
                           checkpoint=checkpoint,log_dir=Path(directory)/'logs')
             self.assertEqual(results[0]['cycle'],2)
             self.assertEqual(results[0]['evaluations'][0]['opponent_cycle'],1)
+            self.assertEqual([(r['kind'],r['opponent_cycle']) for r in results[0]['evaluations']],
+                             [('previous',1),('anchor',0)])
             saved = torch.load(Path(directory)/'cycle-000002.pt',weights_only=True)
+            self.assertEqual([cycle for cycle,_ in saved['anchors']],[0])
             self.assertEqual(saved['options'], dict(current, model='katago'))
             for group in saved['optimizer']['param_groups']:
                 self.assertEqual(group['lr'], current['lr'])
