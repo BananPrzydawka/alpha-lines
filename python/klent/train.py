@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from config import settings
 from klent.native import Arena, Batch
-from klent import output
+from klent import output, checkpoint as checkpoint_io
 from models.katago import KataGoNet
 MAX_PLY = 80
 
@@ -147,8 +147,13 @@ class ModelHistory:
     def remember_previous(self, model, cycle):
         self.previous = (cycle, self.snapshot(model))
 
+    def remember_initial_anchor(self, model, cycle):
+        if not self.anchors:
+            self.anchors.append((cycle, self.snapshot(model)))
+
     def remember_anchor(self, model, cycle):
-        if cycle % 8 == 0 and len(self.anchors) < 3:
+        first_cycle = self.anchors[0][0] if self.anchors else 0
+        if cycle > first_cycle and (cycle-first_cycle) % 8 == 0 and len(self.anchors) < 3:
             self.anchors.append((cycle, self.snapshot(model)))
 
     def opponents(self):
@@ -159,8 +164,7 @@ class ModelHistory:
                 yield ('anchor', cycle, weights)
 
     def checkpoint_anchors(self):
-        return [(cycle, {k: v.cpu() for k,v in weights.items()})
-                for cycle, weights in self.anchors]
+        return list(self.anchors)
 
 
 class Device:
@@ -186,7 +190,7 @@ class Device:
         return first.elapsed_time(second) if self.cuda else (second-first)*1000
 
 
-def run(library, options=None, *, cycles=None, device='cuda', compile_model=True, checkpoint=None, resume=None, log_dir=None):
+def run(library, options=None, *, cycles=None, device='cuda', compile_model=True, checkpoint=None, resume=None, anchor_dir=None, log_dir=None):
     """cycles=0 runs until interrupted or the Modal function timeout expires."""
     run_start = perf_counter()
     options = dict(settings['klent'] if options is None else options)
@@ -242,7 +246,10 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     completed = 0 if restored is None else restored['summary']['cycle']
     stop_cycle = completed + cycles
     summaries = []
-    history = ModelHistory(restored.get('anchors', ()) if restored is not None else ())
+    history = ModelHistory(checkpoint_io.load_anchors(resume, restored, anchor_dir)
+                           if restored is not None else ())
+    if restored is not None:
+        history.remember_initial_anchor(model, completed)
 
     def infer(net, boards):
         with torch.no_grad(), torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
@@ -377,7 +384,9 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                     stats = test.stats()
                     wins,draws,losses_count = stats.wins,stats.draws,stats.losses
                 dev.sync()
-                evaluations.append(dict(kind=kind,age=completed+1-opponent_cycle,
+                evaluations.append(dict(kind=kind,
+                    is_anchor=any(cycle == opponent_cycle for cycle,_ in history.anchors),
+                    age=completed+1-opponent_cycle,
                     opponent_cycle=opponent_cycle,
                     wins=wins,draws=draws,losses=losses_count,
                     win_rate=wins/options['test_games'],
@@ -438,6 +447,7 @@ def main():
     parser.add_argument('--device',default='cuda')
     parser.add_argument('--no-compile',action='store_true',help='CPU smoke testing only')
     parser.add_argument('--resume',type=Path,help='Restore weights, optimizer state, architecture and cycle number')
+    parser.add_argument('--anchor-dir',type=Path,help='Directory containing anchors/ when resuming a copied checkpoint')
     parser.add_argument('--checkpoint-dir',type=Path,help='Output directory; defaults to a new local run')
     parser.add_argument('--log-dir',type=Path,help='Metrics directory; defaults to logs/klent/<run-id>')
     args = parser.parse_args()
@@ -450,7 +460,7 @@ def main():
         path = save(directory,model,optimizer,options,summary,anchors)
         output.emit(f'Checkpoint saved: {path}')
     run(args.library,device=args.device,compile_model=not args.no_compile,
-        checkpoint=checkpoint,resume=args.resume,log_dir=log_dir)
+        checkpoint=checkpoint,resume=args.resume,anchor_dir=args.anchor_dir,log_dir=log_dir)
 
 
 if __name__ == '__main__':

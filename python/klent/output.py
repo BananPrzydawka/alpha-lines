@@ -43,12 +43,14 @@ def summary(row, timing):
                        ('Model training','training_model'),
                        ('Strength test','strength_test'), ('Other','other')]:
         lines.append(f'  {label:<24}{timing[key]:>12.2f} s')
-    lines.extend(('', '  Opponent             W     D     L    Score'))
+    lines.extend(('', '  Opponent                  W     D     L    Score'))
     for result in row['evaluations']:
         w,d,l = (result[k] for k in ('wins','draws','losses'))
         score = (w+0.5*d)/(w+d+l)
-        opponent = ('Previous' if result['kind'] == 'previous'
+        opponent = (f"Previous / anchor {result['opponent_cycle']}"
+                    if result['kind'] == 'previous' and result['is_anchor']
+                    else 'Previous' if result['kind'] == 'previous'
                     else f"Anchor cycle {result['opponent_cycle']}")
-        lines.append(f"  {opponent:<19}{w:5d} {d:5d} {l:5d}  {score:6.1%}")
+        lines.append(f"  {opponent:<24}{w:5d} {d:5d} {l:5d}  {score:6.1%}")
     lines.append('-'*43)
     emit(*lines)

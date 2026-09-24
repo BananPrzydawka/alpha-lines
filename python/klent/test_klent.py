@@ -237,6 +237,11 @@ class KlentTests(unittest.TestCase):
             model.weight.fill_(-100)
         self.assertEqual([c for c,_ in restored.anchors],[8,16,24])
         self.assertEqual([w['weight'].item() for _,w in restored.anchors],[8,16,24])
+        bootstrapped = ModelHistory()
+        bootstrapped.remember_initial_anchor(model, 5)
+        for cycle in range(6, 30):
+            bootstrapped.remember_anchor(model, cycle)
+        self.assertEqual([c for c,_ in bootstrapped.anchors],[5,13,21])
 
     def test_33_cycles_evaluate_previous_and_fixed_anchors(self):
         small = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
@@ -262,6 +267,23 @@ class KlentTests(unittest.TestCase):
             run(LIBRARY,dict(self.options,model='katago'),cycles=1,device='cpu',
                 compile_model=False,checkpoint=checkpoint)
             path = Path(directory)/'cycle-000001.pt'
+            bootstrap = run(LIBRARY,dict(self.options,model='katago'),cycles=1,
+                            device='cpu',compile_model=False,resume=path,
+                            checkpoint=lambda model,optimizer,options,summary,anchors:
+                                save(Path(directory)/'bootstrap',model,optimizer,options,summary,anchors))
+            self.assertEqual([(r['kind'],r['opponent_cycle'],r['is_anchor'])
+                              for r in bootstrap[0]['evaluations']], [('previous',1,True)])
+            bootstrapped = torch.load(Path(directory)/'bootstrap/cycle-000002.pt',weights_only=True)
+            self.assertEqual(bootstrapped['anchor_cycles'],[1])
+            self.assertNotIn('anchors',bootstrapped)
+            anchor = Path(directory)/'bootstrap/anchors/anchor-000001.pt'
+            self.assertTrue(anchor.is_file())
+            continued = run(LIBRARY,dict(self.options,model='katago'),cycles=1,
+                            device='cpu',compile_model=False,
+                            resume=Path(directory)/'bootstrap/cycle-000002.pt')
+            self.assertEqual([(r['kind'],r['opponent_cycle'])
+                              for r in continued[0]['evaluations']],
+                             [('previous',2),('anchor',1)])
             resume_state = torch.load(path,weights_only=True)
             resume_state['anchors'] = [(0, resume_state['model'])]
             torch.save(resume_state,path)
@@ -280,7 +302,9 @@ class KlentTests(unittest.TestCase):
             self.assertEqual([(r['kind'],r['opponent_cycle']) for r in results[0]['evaluations']],
                              [('previous',1),('anchor',0)])
             saved = torch.load(Path(directory)/'cycle-000002.pt',weights_only=True)
-            self.assertEqual([cycle for cycle,_ in saved['anchors']],[0])
+            self.assertEqual(saved['anchor_cycles'],[0])
+            self.assertNotIn('anchors',saved)
+            self.assertTrue((Path(directory)/'anchors/anchor-000000.pt').is_file())
             self.assertEqual(saved['options'], dict(current, model='katago'))
             for group in saved['optimizer']['param_groups']:
                 self.assertEqual(group['lr'], current['lr'])
@@ -375,14 +399,25 @@ class KlentTests(unittest.TestCase):
         self.assertEqual(output.reshape(8,2)[4:].tolist(),[[20.,10.]]*4)
 
     def test_checkpoint_roundtrip(self):
-        from klent.checkpoint import save
+        from klent.checkpoint import save, load_anchors
         model = torch.nn.Linear(2,2)
         optimizer = torch.optim.AdamW(model.parameters())
         model(torch.ones(1,2)).sum().backward()
         optimizer.step()
         with tempfile.TemporaryDirectory() as directory:
-            path = save(directory,model,optimizer,self.options,dict(cycle=5))
+            path = save(directory,model,optimizer,self.options,dict(cycle=5),
+                        [(2,{k:v.detach().clone() for k,v in model.state_dict().items()})])
             saved = torch.load(path,weights_only=True)
+            self.assertNotIn('anchors',saved)
+            self.assertEqual(saved['anchor_cycles'],[2])
+            self.assertTrue((Path(directory)/'anchors/anchor-000002.pt').is_file())
+            self.assertEqual([cycle for cycle,_ in load_anchors(path,saved)],[2])
+            copied = Path(directory)/'copied/resume.pt'
+            copied.parent.mkdir()
+            torch.save(saved,copied)
+            with self.assertRaisesRegex(FileNotFoundError,'Missing anchor 2'):
+                load_anchors(copied,saved)
+            self.assertEqual([cycle for cycle,_ in load_anchors(copied,saved,directory)],[2])
             other = torch.nn.Linear(2,2)
             other.load_state_dict(saved['model'])
             torch.testing.assert_close(other.weight,model.weight)
