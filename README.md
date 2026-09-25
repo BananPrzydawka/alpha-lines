@@ -3,6 +3,67 @@
 KLENT self-play training with a Rust game engine and a PyTorch KataGo model.
 Local/Verda training and Modal are supported.
 
+## MCTS continuation
+
+MCTS training starts from the FP32 KLENT checkpoint at `checkpoints/resume.pt`
+(currently cycle 349). It creates a separate MCTS run, numbers its first cycle 1,
+and starts a fresh AdamW optimizer. Configure it under `mcts` in `config.json`.
+
+```sh
+./scripts/train_mcts_local.sh --resume checkpoints/resume.pt
+```
+
+For Verda, publish the checkpoint and config, then run
+`./scripts/train_mcts_verda.sh` on the GPU machine. `pull_verda.sh` downloads
+MCTS checkpoints and logs along with KLENT outputs. MCTS output lives under
+`checkpoints/mcts/<run-id>/` and `logs/mcts/<run-id>/`; it never replaces
+`checkpoints/resume.pt`. Resuming an MCTS cycle checkpoint restores its optimizer
+and MCTS cycle number. Every MCTS checkpoint also carries the original KLENT
+baseline weights for strength tests.
+
+The Rust PUCT search uses `g` persistent game slots, evaluates at most `b`
+positions per model call, and steps the first `t` ready games. Every search
+model call runs a `2*b` batch: both player perspectives for each board, with
+zero-filled rows when fewer than `b` states are available. It repeats this
+for `steps` search steps per training cycle, collecting exactly `t * steps`
+training positions. Search-node capacity is a separate limit. It defaults to
+`g * s * node_capacity_factor`, using the later calibrated factor of 8. A
+50-step grounded-model run peaked at about `2 * g * s` nodes, so this budget was
+roughly four times its measured peak; it is not a worst-case bound. With the
+current `g=2048` and `s=100`, the factor gives 1,638,400 nodes. To override
+the budget directly, add `node_capacity` under `mcts` in `config.json`.
+The legal softmax of the model policy head supplies
+search priors and weights the action value head into leaf state values. Terminal leaves use actual
+game results. Training uses the search visit distribution and the backed-up mean
+return for each visited action; unvisited actions carry zero value-loss weight.
+`q_visit_weighting` is `equal` by default or `visits` to weight value errors by
+visit count. Search nodes are cleared after each model update while games and
+their histories continue.
+
+`double_flip_augment` and `all_flip_augment` are independent boolean config
+toggles. Both off means identity only. Double uses identity and 180° rotation.
+All uses identity, vertical flip, horizontal flip, and 180° rotation. If both
+toggles are on, the all-flips set applies once.
+The same transform is applied to boards and both targets, without swapping
+players. Single-axis flips change the playable-square parity; they are an
+experimental augmentation. On the opening position, 180° rotation also changes
+which half is available to each player; this is accepted for training data.
+
+After each cycle, the new model plays the same direct-policy match used by KLENT
+against the original KLENT model, the directly previous MCTS model, and anchors
+captured after the two configured `anchor_after` offsets (8 and 16 by default,
+measured from the start of each run).
+The report and JSON metrics include both losses, model batch fill, node counts,
+and separate search, training, evaluation, and checkpoint times. Compiled search,
+training, and evaluation graphs are warmed before cycle timing; the one-time
+compile/warmup time appears under initial setup. Each MCTS step prints its own
+wall time and an updated collection-time estimate. More detail is
+in [the MCTS design](docs/mcts-training-design.md).
+
+Model batch fill measures how many of the `b` evaluation slots were used per
+search call. Node allocation failures count searches that tried to create a
+node after reaching node capacity. They measure different resources.
+
 ## Checkpoints and logs
 
 - `checkpoints/resume.pt`: the **manually selected FP32 input**, the only checkpoint tracked by Git. Move or copy your chosen checkpoint here before committing. It is never automatically selected or replaced.
@@ -138,6 +199,18 @@ This starts a fresh run using the configured Modal GPU and timeout. Add `--smoke
 for small batches. Checkpoints and metrics persist under
 `/checkpoints/klent/<run-id>/` on the `alphalines` Modal volume; each completed
 checkpoint is committed to the volume.
+
+For a single full MCTS cycle from the local `checkpoints/resume.pt`:
+
+```sh
+PYTHONPATH=python uv run modal run -m mcts.modal_train
+```
+
+This uses the `mcts` settings in `config.json`, overrides only `cycles` to 1,
+and runs on the configured Modal GPU. The job allows at least two hours because
+MCTS collection and strength testing can exceed the KLENT timeout. Its checkpoint
+persists under `/checkpoints/mcts/<run-id>/`, with `run.json` and `metrics.jsonl`
+under that run's `logs/` directory on the `alphalines` Modal volume.
 
 ## Project and checks
 

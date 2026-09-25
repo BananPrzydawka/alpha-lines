@@ -68,7 +68,7 @@ fn finish(history: &mut Vec<History>, reward: [f32; 2], terminal_scores: [u8; 2]
 }
 
 /// FP32 one-hot planes: unplayable, empty, removed, own, opponent.
-fn encode(cells: &[u8; 80], player: usize, board: &mut [f32]) {
+pub(crate) fn encode(cells: &[u8; 80], player: usize, board: &mut [f32]) {
     board.fill(0.0);
     for cell in 0..160 { if (cell/16 + cell%16)%2 != 0 { board[cell] = 1.0; } }
     for (sq, &mark) in cells.iter().enumerate() {

@@ -1,0 +1,716 @@
+//! The search loop: one cycle is one model call.
+//!
+//! A cycle collects positions from as many games as it takes to fill the evaluation buffer,
+//! runs the model once, writes the results back, backs up every game that was waiting, and
+//! steps the games that have done their share of simulations. Games are never advanced
+//! individually; they advance in a batch, which is what keeps the model call wide.
+
+use std::collections::HashMap;
+
+use crate::game::{Rng, Scratch, LEGAL_WORDS, SQUARES};
+use crate::mcts::arena::Arena;
+use crate::mcts::config::{Config, PENDING};
+use crate::mcts::descent::{back_up, descend, descend_traced, Descent, Selection};
+use crate::mcts::slot::Slot;
+use crate::mcts::variant::{squares, Variant};
+use crate::{zobrist, Game};
+
+/// What one descent inside a traced [`Search::collect_traced`] did, in slot order.
+///
+/// `selections` are the nodes the descent selected on, in path order, with the stats
+/// snapshots running alongside in the returned snapshot list. `fresh` names a new
+/// node this descent created (still pending — the evaluation has not landed yet);
+/// `duplicate_of` names the pending node a dup-hit landed on instead.
+pub struct Collected {
+    pub slot: usize,
+    pub outcome: Descent,
+    pub selections: Vec<(u32, [crate::mcts::variant::Choice; 2])>,
+    pub fresh: Option<u32>,
+    pub duplicate_of: Option<u32>,
+    pub abandoned: bool,
+    /// The game queued its pending root and sat out. `shared` when the root state was
+    /// already queued by another game, so this slot cost no buffer row of its own.
+    pub queued_root: bool,
+    pub queued_root_shared: bool,
+}
+
+/// A stats snapshot taken at one selection: the node's cloned statistics plus the
+/// legal masks at that position, so the caller can render the PUCT scores later.
+/// Root snapshots carry `node = ROOT`. Generic over the statistic block.
+#[derive(Clone)]
+pub struct Snapshot<S> {
+    pub slot: usize,
+    pub node: u32,
+    pub stats: S,
+    pub legal: [[u64; crate::game::LEGAL_WORDS]; 2],
+}
+
+/// The model. One call scores `positions`, both players at once.
+///
+/// `priors` is `2 * width * SQUARES` long and `values` is `2 * width`: player `p`'s row for
+/// position `r` starts at `(p * width + r) * SQUARES`, matching the `(2B, 80)` the training
+/// side produces. Rows past the ones filled this cycle are zero and their output is ignored.
+pub trait Evaluate {
+    fn evaluate(&mut self, positions: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]);
+}
+
+/// Where an evaluated row belongs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Target {
+    /// A node in the arena, named by slot.
+    Node(u32),
+    /// A root state, named by key — several games may be waiting on the same one.
+    Root(u64),
+}
+
+/// What one game produced when it stepped: the position it moved from, the search's policy
+/// there, and the move drawn from it.
+#[derive(Clone, Debug)]
+pub struct StepRecord {
+    pub id: u16,
+    pub cells: [u8; SQUARES],
+    pub policy: [[f32; SQUARES]; 2],
+    pub action_value: [[f32; SQUARES]; 2],
+    pub visits: [[u64; SQUARES]; 2],
+    pub played: [u8; 2],
+    /// The game ended on this move, and `values` is its outcome.
+    pub finished: bool,
+    pub values: [f32; 2],
+}
+
+
+/// The evaluation buffer: a fixed `B` rows, of which the first `len` are filled.
+struct Buffer {
+    positions: Vec<[u8; SQUARES]>,
+    targets: Vec<Target>,
+    priors: Vec<f32>,
+    values: Vec<f32>,
+    width: usize,
+    len: usize,
+}
+
+impl Buffer {
+    fn new(width: usize) -> Self {
+        Buffer {
+            positions: vec![[0u8; SQUARES]; width],
+            targets: Vec::with_capacity(width),
+            priors: vec![0.0; 2 * width * SQUARES],
+            values: vec![0.0; 2 * width],
+            width,
+            len: 0,
+        }
+    }
+    fn clear(&mut self) {
+        // rows past `len` stay zero, which is what the model is handed for the shortfall
+        for p in self.positions[..self.len].iter_mut() {
+            *p = [0u8; SQUARES];
+        }
+        self.targets.clear();
+        self.len = 0;
+    }
+    fn is_full(&self) -> bool {
+        self.len == self.width
+    }
+    fn push(&mut self, cells: [u8; SQUARES], target: Target) {
+        debug_assert!(!self.is_full(), "pushed into a full buffer");
+        self.positions[self.len] = cells;
+        self.targets.push(target);
+        self.len += 1;
+    }
+    fn prior_row(&self, row: usize, player: usize) -> &[f32] {
+        let at = (player * self.width + row) * SQUARES;
+        &self.priors[at..at + SQUARES]
+    }
+    fn value(&self, row: usize, player: usize) -> f32 {
+        self.values[player * self.width + row]
+    }
+}
+
+pub struct Search<V: Variant> {
+    pub cfg: Config,
+    pub arena: Arena<V::Stats>,
+    pub slots: Vec<Slot<V::Stats>>,
+    pub exhausted: usize,
+    /// Move records for each live game, retained across network updates.
+    pub histories: Vec<Vec<StepRecord>>,
+    /// Histories of games that ended on the most recent step.
+    completed_histories: Vec<Vec<StepRecord>>,
+    buffer: Buffer,
+    /// Key of an unevaluated root to the games waiting on it, so one root state costs one
+    /// buffer row however many games happen to be sitting on it (spec §3.4).
+    pending_roots: HashMap<u64, Vec<u16>>,
+    /// Values from this cycle's evaluation, by node. Only ever read in the same cycle it is
+    /// written, because a game resolves its path before any sweep can move a slot.
+    evaluated: HashMap<u32, [f32; 2]>,
+    rng: Rng,
+    scratch: Scratch,
+}
+
+impl<V: Variant> Search<V> {
+    pub fn new(cfg: Config, seed: u64) -> Self {
+        let rng = Rng::new(seed);
+        let scratch = Scratch::new();
+        let arena = Arena::new(&cfg);
+        let mut slots: Vec<Slot<V::Stats>> = (0..cfg.g).map(|_| Slot::default()).collect();
+        let histories = (0..cfg.g).map(|_| Vec::new()).collect();
+        for s in slots.iter_mut() {
+            seed_slot::<V>(s);
+        }
+        Search {
+            buffer: Buffer::new(cfg.b),
+            pending_roots: HashMap::new(),
+            evaluated: HashMap::new(),
+            cfg,
+            arena,
+            slots,
+            exhausted: 0,
+            histories,
+            completed_histories: Vec::new(),
+            rng,
+            scratch,
+        }
+    }
+
+    /// Clear statistics made by an older network, retaining games and histories.
+    /// Call only between complete search cycles, after all pending evaluations land.
+    pub fn clear_for_new_model(&mut self) {
+        assert!(self.slots.iter().all(|s| s.waiting_on.is_none() && s.path.is_empty()));
+        self.arena.clear();
+        self.buffer.clear();
+        self.pending_roots.clear();
+        self.evaluated.clear();
+        self.exhausted = 0;
+        for slot in &mut self.slots {
+            slot.root.stats = V::Stats::default();
+            slot.root.pending = true;
+            slot.sim_count = 0;
+        }
+    }
+
+    /// Take histories completed by terminal moves since the last call.
+    pub fn take_completed_histories(&mut self) -> Vec<Vec<StepRecord>> {
+        std::mem::take(&mut self.completed_histories)
+    }
+
+    /// Games that have done their share of simulations and are waiting to move.
+    pub fn ready(&self) -> usize {
+        self.slots.iter().filter(|s| s.ready(&self.cfg)).count()
+    }
+
+    /// Collect one model batch. The full width is returned; unused rows are zero.
+    pub fn prepare_evaluation(&mut self) -> (&[[u8; SQUARES]], usize) {
+        self.collect();
+        (&self.buffer.positions, self.buffer.len)
+    }
+
+    /// Consume policy logits and action values in player-major [2, B, 80] order.
+    /// Legal softmax probabilities are the priors and weight Q into leaf values.
+    pub fn complete_evaluation(&mut self, logits: &[f32], q: &[f32]) -> Vec<StepRecord>
+    where V: Variant {
+        assert_eq!(logits.len(), 2 * self.cfg.b * SQUARES);
+        assert_eq!(q.len(), logits.len());
+        for row in 0..self.buffer.len {
+            let game = match self.buffer.targets[row] {
+                Target::Node(node) => &self.arena.node(node).game,
+                Target::Root(key) => {
+                    let slot = self.pending_roots[&key][0] as usize;
+                    &self.slots[slot].root.game
+                }
+            };
+            for player in 0..2 {
+                let at = (player * self.cfg.b + row) * SQUARES;
+                let legal = game.legal_moves(player);
+                let mut max = f32::NEG_INFINITY;
+                for sq in squares(legal) {
+                    let x = logits[at + sq];
+                    assert!(x.is_finite() && q[at + sq].is_finite(), "nonfinite model output");
+                    max = max.max(x);
+                }
+                let mut sum = 0.0;
+                for sq in squares(legal) {
+                    let p = (logits[at + sq] - max).exp();
+                    self.buffer.priors[at + sq] = p;
+                    sum += p;
+                }
+                assert!(sum.is_finite() && sum > 0.0);
+                let mut value = 0.0;
+                for sq in squares(legal) {
+                    let p = self.buffer.priors[at + sq] / sum;
+                    self.buffer.priors[at + sq] = p;
+                    value += p * q[at + sq];
+                }
+                self.buffer.values[player * self.cfg.b + row] = value;
+            }
+        }
+        self.scatter();
+        self.back_up_waiters();
+        if self.ready() >= self.cfg.t { self.step() } else { Vec::new() }
+    }
+
+    /// Run the model's evaluate step plus scatter and backup, for a traced cycle: the
+    /// caller ran [`Self::collect_traced`], inspected the descents, and now wants the
+    /// same evaluate → scatter → backup sequence [`Self::cycle`] runs. Returns the eval
+    /// line items: per buffer row, the cells evaluated and a label for what it resolves.
+    /// Labels need the caller's node names; pass a lookup.
+    pub fn evaluate_scatter_backup<E: Evaluate>(
+        &mut self,
+        model: &mut E,
+        name: impl Fn(u32) -> String,
+    ) -> Vec<(usize, [u8; SQUARES], String)> {
+        model.evaluate(&self.buffer.positions, &mut self.buffer.priors, &mut self.buffer.values);
+
+        // label rows before scatter consumes the target lists
+        let mut rows = Vec::new();
+        for (row, target) in self.buffer.targets.iter().enumerate() {
+            let cells = self.buffer.positions[row];
+            let label = match *target {
+                Target::Node(node) => format!("node {}", name(node)),
+                Target::Root(key) => {
+                    let n = self.pending_roots.get(&key).map(|w| w.len()).unwrap_or(0);
+                    format!("root key={key} ({n} waiters)")
+                }
+            };
+            rows.push((row, cells, label));
+        }
+
+        self.scatter();
+        self.back_up_waiters();
+        rows
+    }
+
+    /// One model call: collect, evaluate, scatter, back up, and step if enough games are
+    /// ready. Returns the training records from the step, if one happened.
+    pub fn cycle<E: Evaluate>(&mut self, model: &mut E) -> Vec<StepRecord> {
+        self.collect();
+        model.evaluate(&self.buffer.positions, &mut self.buffer.priors, &mut self.buffer.values);
+        self.scatter();
+        self.back_up_waiters();
+
+        if self.ready() >= self.cfg.t {
+            self.step()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Walk the slots from 0, queueing pending roots and descending each other eligible
+    /// game once, and stop when the buffer is full.
+    fn collect(&mut self) {
+        self.collect_inner(None);
+    }
+
+    /// Traced variant of the collection walk: snapshots the stats at every selection,
+    /// after the choice is made but before the child is looked up, so they are what
+    /// `select` just saw. Returns one [`Collected`] per descent that ran, in slot order,
+    /// plus all snapshots in selection order.
+    pub fn collect_traced(&mut self) -> (Vec<Collected>, Vec<Snapshot<V::Stats>>) {
+        let mut out = Vec::new();
+        let mut snaps: Vec<Snapshot<V::Stats>> = Vec::new();
+        // borrow discipline: the hook reads stats out of `self` while the walk holds
+        // `&mut self`. Both go through raw pointers; the hook only reads the node it is
+        // shown (which the walk is not mutating at that point — select takes `&mut`
+        // only on the node it is selecting on, and releases it before the hook runs).
+        let self_ptr: *mut Self = self;
+        let snaps_ptr: *mut Vec<Snapshot<V::Stats>> = &mut snaps;
+        self.collect_inner(Some((&mut out, &mut |slot: usize, sel: Selection| {
+            // SAFETY: see above; `snaps` is touched only by this hook.
+            let this = unsafe { &*self_ptr };
+            let snaps = unsafe { &mut *snaps_ptr };
+            if sel.node == crate::mcts::slot::ROOT {
+                let st = this.slots[slot].root.stats.clone();
+                let g = &this.slots[slot].root.game;
+                snaps.push(Snapshot {
+                    slot,
+                    node: sel.node,
+                    stats: st,
+                    legal: [g.legal_moves(0), g.legal_moves(1)],
+                });
+            } else {
+                let n = this.arena.node(sel.node);
+                snaps.push(Snapshot {
+                    slot,
+                    node: sel.node,
+                    stats: n.stats.clone(),
+                    legal: [n.game.legal_moves(0), n.game.legal_moves(1)],
+                });
+            }
+        })));
+        (out, snaps)
+    }
+
+    /// The collection walk. When `trace` is `Some`, every descent is recorded and
+    /// `snapshot(slot, selection)` is called at each selection inside it.
+    fn collect_inner(
+        &mut self,
+        mut trace: Option<(&mut Vec<Collected>, &mut dyn FnMut(usize, Selection))>,
+    ) {
+        self.buffer.clear();
+        self.pending_roots.clear();
+        self.evaluated.clear();
+
+        for i in 0..self.slots.len() {
+            if self.buffer.is_full() {
+                break;
+            }
+            if !self.slots[i].collectable(&self.cfg) {
+                continue;
+            }
+
+            // An unevaluated root queues for the model like any other unevaluated node,
+            // but only once per root state. The game does not descend until its root's
+            // evaluation lands: cycle 0 queues the roots, cycle 1 descends from them.
+            if self.slots[i].root.pending {
+                let key = self.slots[i].root.key;
+                let shared = self.pending_roots.contains_key(&key);
+                if let Some(waiters) = self.pending_roots.get_mut(&key) {
+                    waiters.push(i as u16);
+                } else {
+                    let cells = self.slots[i].root.game.cells;
+                    self.buffer.push(cells, Target::Root(key));
+                    self.pending_roots.insert(key, vec![i as u16]);
+                }
+                if let Some((ref mut out, _)) = trace {
+                    out.push(Collected {
+                        slot: i,
+                        outcome: Descent::NoEntry,
+                        selections: Vec::new(),
+                        fresh: None,
+                        duplicate_of: None,
+                        abandoned: false,
+                        queued_root: true,
+                        queued_root_shared: shared,
+                    });
+                }
+                continue;
+            }
+
+            // One descent per game per cycle, whatever its outcome: a terminal backs up
+            // inline and the game simply waits for the next cycle rather than retrying.
+            // When tracing, selections are recorded so the caller can pair them with the
+            // snapshots its hook took.
+            let mut selections: Vec<(u32, [crate::mcts::variant::Choice; 2])> = Vec::new();
+            let r = if let Some((_, ref mut snap)) = trace {
+                // borrow the hook for this descent only; the borrow ends with the call
+                let hook: &mut dyn FnMut(usize, Selection) = &mut **snap;
+                // wrap it with the slot index fixed, recording selections alongside
+                let mut wrapped = |sel: Selection| {
+                    selections.push((sel.node, sel.choice));
+                    hook(i, sel);
+                };
+                descend_traced::<V>(
+                    i as u16,
+                    &mut self.slots[i],
+                    &mut self.arena,
+                    &self.cfg,
+                    &mut self.rng,
+                    &mut self.scratch,
+                    Some(&mut wrapped),
+                )
+            } else {
+                descend::<V>(
+                    i as u16,
+                    &mut self.slots[i],
+                    &mut self.arena,
+                    &self.cfg,
+                    &mut self.rng,
+                    &mut self.scratch,
+                )
+            };
+            // traced record for this descent, filled in by the match below
+            let mut rec = trace.as_ref().map(|_| Collected {
+                slot: i,
+                outcome: r,
+                selections,
+                fresh: None,
+                duplicate_of: None,
+                abandoned: false,
+                queued_root: false,
+                queued_root_shared: false,
+            });
+            match r {
+                Descent::Entry { node, fresh } => {
+                    if fresh {
+                        if self.buffer.is_full() {
+                            // no room to ask: give the node back rather than leave it
+                            // pending with nobody queued to evaluate it
+                            self.abandon(i, node);
+                            if let Some(ref mut c) = rec {
+                                c.abandoned = true;
+                            }
+                        } else {
+                            let cells = self.arena.node(node).game.cells;
+                            self.buffer.push(cells, Target::Node(node));
+                            if let Some(ref mut c) = rec {
+                                c.fresh = Some(node);
+                            }
+                        }
+                    } else if let Some(ref mut c) = rec {
+                        c.duplicate_of = Some(node);
+                    }
+                }
+                Descent::NoEntry => {}
+                Descent::Exhausted => { self.exhausted += 1; }
+            }
+            if let Some((ref mut out, _)) = trace {
+                out.push(rec.unwrap());
+            }
+        }
+    }
+
+    /// Undo a descent that produced a node the buffer has no room to ask about.
+    fn abandon(&mut self, slot: usize, node: u32) {
+        self.slots[slot].waiting_on = None;
+        self.slots[slot].path.clear();
+        if self.arena.drop_id(node, slot as u16) && self.arena.is_unused(node) {
+            self.arena.remove(node);
+        }
+    }
+
+    /// Write the model's output where it belongs and clear `pending`.
+    fn scatter(&mut self) {
+        for row in 0..self.buffer.len {
+            match self.buffer.targets[row] {
+                Target::Node(node) => {
+                    let n = self.arena.node_mut(node);
+                    n.flags &= !PENDING;
+                    let legal = [n.game.legal_moves(0), n.game.legal_moves(1)];
+                    for p in 0..2 {
+                        let at = (p * self.buffer.width + row) * SQUARES;
+                        let priors = &self.buffer.priors[at..at + SQUARES];
+                        V::set_priors(&mut n.stats, priors, legal[p], p);
+                    }
+                    self.evaluated
+                        .insert(node, [self.buffer.value(row, 0), self.buffer.value(row, 1)]);
+                }
+                Target::Root(key) => {
+                    let waiters = self.pending_roots.remove(&key).unwrap_or_default();
+                    for g in waiters {
+                        let s = &mut self.slots[g as usize];
+                        let legal = [s.root.game.legal_moves(0), s.root.game.legal_moves(1)];
+                        for p in 0..2 {
+                            V::set_priors(&mut s.root.stats, self.buffer.prior_row(row, p), legal[p], p);
+                        }
+                        // each waiter applies its own noise, so shared roots still diverge
+                        V::make_root(&mut s.root.stats, legal, &self.cfg, &mut self.rng);
+                        s.root.pending = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Back up every game whose awaited node was evaluated this cycle.
+    fn back_up_waiters(&mut self) {
+        for i in 0..self.slots.len() {
+            let Some(node) = self.slots[i].waiting_on else { continue };
+            let Some(&values) = self.evaluated.get(&node) else {
+                debug_assert!(false, "a game waited on a node nobody evaluated");
+                continue;
+            };
+            back_up::<V>(&mut self.slots[i], &mut self.arena, values, &self.cfg);
+        }
+    }
+
+    /// Advance every ready game by one move, then sweep and reseed. The order is mandatory:
+    /// moves first, so the sweep knows every game's new root; sweep next, so a finished
+    /// game's ids are gone before its slot is reused; seeding last.
+    pub fn step(&mut self) -> Vec<StepRecord> {
+        let g = self.slots.len();
+        let mut stepping = vec![false; g];
+        let mut finished = vec![false; g];
+        let mut records = Vec::new();
+        let mut policy = [[0.0f32; SQUARES]; 2];
+        let mut selected = 0;
+
+        // 8.1, 8.2: emit the target, play the move, mark games that ended
+        for i in 0..g {
+            if selected == self.cfg.t { break; }
+            if !self.slots[i].ready(&self.cfg) {
+                continue;
+            }
+            selected += 1;
+            let legal = {
+                let game = &self.slots[i].root.game;
+                [game.legal_moves(0), game.legal_moves(1)]
+            };
+            V::target(&self.slots[i].root.stats, legal, &mut policy);
+            let mut action_value = [[0.0; SQUARES]; 2];
+            let mut visits = [[0; SQUARES]; 2];
+            V::action_targets(&self.slots[i].root.stats, &mut action_value, &mut visits);
+            let played = [
+                draw(&policy[0], legal[0], &mut self.rng),
+                draw(&policy[1], legal[1], &mut self.rng),
+            ];
+            let cells = self.slots[i].root.game.cells;
+            let key = zobrist::step(self.slots[i].root.key, &cells, played[0], played[1]);
+
+            let s = &mut self.slots[i];
+            s.root.game.action_step(played[0], played[1], &mut self.scratch);
+            s.root.key = key;
+            s.sim_count = 0;
+            s.path.clear();
+            s.waiting_on = None;
+            stepping[i] = true;
+
+            let done = s.root.game.finished;
+            let values = if done { s.root.game.terminal_values() } else { [0.0; 2] };
+            if done {
+                s.game_over = true;
+                finished[i] = true;
+            }
+            let record = StepRecord {
+                id: i as u16,
+                cells,
+                policy,
+                action_value,
+                visits,
+                played: [played[0] as u8, played[1] as u8],
+                finished: done,
+                values,
+            };
+            self.histories[i].push(record.clone());
+            if done {
+                self.completed_histories.push(std::mem::take(&mut self.histories[i]));
+            }
+            records.push(record);
+        }
+
+        // 8.3: adopt the new root, inheriting the node for it if the search already built one
+        for i in 0..g {
+            if !stepping[i] || finished[i] {
+                continue;
+            }
+            let key = self.slots[i].root.key;
+            match self.arena.get(key) {
+                Some(node) => {
+                    debug_assert!(
+                        !self.arena.node(node).is_pending(),
+                        "an adopted node is always evaluated: fresh nodes queue their entry in the cycle that creates them"
+                    );
+                    self.slots[i].root.stats = self.arena.node(node).stats.clone();
+                    self.slots[i].root.pending = false;
+                    let legal = {
+                        let game = &self.slots[i].root.game;
+                        [game.legal_moves(0), game.legal_moves(1)]
+                    };
+                    V::make_root(&mut self.slots[i].root.stats, legal, &self.cfg, &mut self.rng);
+                }
+                None => {
+                    self.slots[i].root.stats = V::Stats::default();
+                    self.slots[i].root.pending = true;
+                }
+            }
+        }
+
+        self.sweep(&stepping, &finished);
+
+        // 8.5: reuse of a slot index is safe only because the sweep just removed that id
+        for i in 0..g {
+            if self.slots[i].game_over {
+                seed_slot::<V>(&mut self.slots[i]);
+            }
+        }
+
+        records
+    }
+
+    /// Drop each node's claim from games that can no longer reach it, and delete the nodes
+    /// nobody claims. A node is only ever tested against the games in its own id list.
+    fn sweep(&mut self, stepping: &[bool], finished: &[bool]) {
+        for slot in 0..self.arena.slot_count() as u32 {
+            if self.arena.is_unused(slot) {
+                continue; // a free slot, not a live node
+            }
+            let mut ids = [0u16; crate::mcts::config::K];
+            let n = self.arena.node(slot);
+            let count = n.ids().len();
+            ids[..count].copy_from_slice(n.ids());
+
+            for &id in &ids[..count] {
+                let i = id as usize;
+                let stale = if finished[i] {
+                    true
+                } else if stepping[i] {
+                    !self.arena.node(slot).game.reachable_from(&self.slots[i].root.game)
+                } else {
+                    false // that game's root did not move, so everything it holds is still live
+                };
+                if stale {
+                    self.arena.drop_id(slot, id);
+                }
+            }
+
+            if self.arena.is_unused(slot) {
+                self.arena.remove(slot);
+            }
+        }
+    }
+}
+
+/// Put a slot back to a fresh game at the opening, with an unevaluated root.
+/// The root carries default stats and no noise: noise is mixed in when its evaluation
+/// lands, and the game does not descend until then.
+fn seed_slot<V: Variant>(s: &mut Slot<V::Stats>) {
+    s.root.game = Game::new();
+    s.root.key = zobrist::hash(&s.root.game.cells);
+    s.root.stats = V::Stats::default();
+    s.root.pending = true;
+    s.occupied = true;
+    s.game_over = false;
+    s.sim_count = 0;
+    s.path.clear();
+    s.waiting_on = None;
+}
+
+/// Sample a square from a policy, by inverse CDF over the legal squares.
+fn draw(policy: &[f32; SQUARES], legal: [u64; LEGAL_WORDS], rng: &mut Rng) -> usize {
+    let total: f32 = squares(legal).map(|sq| policy[sq]).sum();
+    let threshold = rng.random() as f32 * total;
+    let mut cum = 0.0f32;
+    let mut last = 0usize;
+    for sq in squares(legal) {
+        cum += policy[sq];
+        last = sq;
+        if cum > threshold {
+            return sq;
+        }
+    }
+    last
+}
+
+#[cfg(test)]
+mod training_tests {
+    use super::*;
+    use crate::mcts::variant::Puct;
+
+    struct Uniform;
+    impl Evaluate for Uniform {
+        fn evaluate(&mut self, _positions: &[[u8; SQUARES]], priors: &mut [f32], values: &mut [f32]) {
+            priors.fill(1.0);
+            values.fill(0.0);
+        }
+    }
+
+    #[test]
+    fn network_update_keeps_games_and_history_but_clears_search() {
+        let cfg = Config { g: 8, b: 8, t: 4, s: 2, node_capacity: 1000, ..Config::default() };
+        let mut search = Search::<Puct>::new(cfg, 7);
+        let mut model = Uniform;
+        let mut records = Vec::new();
+        for _ in 0..20 {
+            records.extend(search.cycle(&mut model));
+            if !records.is_empty() { break; }
+        }
+        assert!(!records.is_empty());
+        let histories_before: usize = search.histories.iter().map(Vec::len).sum();
+        assert!(histories_before > 0);
+        let cells_before: Vec<_> = search.slots.iter().map(|slot| slot.root.game.cells).collect();
+        search.clear_for_new_model();
+        assert_eq!(search.arena.len(), 0);
+        assert_eq!(search.histories.iter().map(Vec::len).sum::<usize>(), histories_before);
+        assert_eq!(search.slots.iter().map(|slot| slot.root.game.cells).collect::<Vec<_>>(), cells_before);
+        assert!(search.slots.iter().all(|slot| slot.root.pending && slot.sim_count == 0));
+        search.cycle(&mut model);
+        assert!(search.slots.iter().all(|slot| !slot.root.pending));
+    }
+}

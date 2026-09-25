@@ -34,6 +34,6 @@ fi
 exec rsync -avP \
     --exclude='*.pt.tmp' \
     --exclude='/checkpoints/klent/bf16/***' \
-    --include='/checkpoints/' --include='/checkpoints/klent/***' \
+    --include='/checkpoints/' --include='/checkpoints/klent/***' --include='/checkpoints/mcts/***' \
     --include='/logs/' --include='/logs/***' --exclude='*' \
     "root@$box_ip:/root/projects/alpha-lines/" ./
