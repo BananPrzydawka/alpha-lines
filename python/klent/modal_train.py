@@ -6,11 +6,14 @@ from modal_image import base_image, project_dir, with_project_files, volume
 app = modal.App('alphalines-klent')
 # Runtime-mounted sources keep iteration cheap. The toolchain is an image layer;
 # the small native library is compiled when the function starts.
-training_image = with_project_files(
-    base_image.apt_install('build-essential')
-    .run_commands('curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh',
-                  'sh /tmp/rustup.sh -y --profile minimal')
-).add_local_dir(project_dir/'rust',remote_path='/root/rust',ignore=['target/'])
+training_image = (
+    with_project_files(
+        base_image.apt_install('build-essential')
+        .run_commands('curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh',
+                      'sh /tmp/rustup.sh -y --profile minimal')
+    ).add_local_dir(project_dir/'rust',remote_path='/root/rust',ignore=['target/'])
+    .add_local_file(project_dir/'checkpoints'/'349.pt',remote_path='/root/checkpoints/349.pt')
+)
 
 
 @app.function(image=training_image,gpu=resources['gpu'],timeout=resources['timeout'],

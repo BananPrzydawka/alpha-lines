@@ -11,6 +11,9 @@ def setup(options, device, compiled):
          f"  Arena      {options['n']:,} games   |   Buffer {options['m']:,} positions",
          f"  Minibatch  {options['train_minibatch']:,} perspectives   |   One epoch",
          f"  Test       {options['test_games']:,} games   |   Seed {options['seed']}",
+         f"  Anchors    score > {options['anchor_thresholds'][0]:.0%},"
+         f" {options['anchor_thresholds'][1]:.0%}, {options['anchor_thresholds'][2]:.0%}",
+         f"  Reference  {options['reference_checkpoint']}",
          f"  Alpha      {options['alpha']:g}   |   Beta {options['beta']:g}   |   Lambda {options['lambda']:.6f}"
          f"   |   Score lambda {options['discounted_score_lambda']:.6f}",
          f"  Self-play uniform exploration {options['exploration_fraction']:.1%}",
@@ -47,10 +50,13 @@ def summary(row, timing):
     for result in row['evaluations']:
         w,d,l = (result[k] for k in ('wins','draws','losses'))
         score = (w+0.5*d)/(w+d+l)
-        opponent = (f"Previous / anchor {result['opponent_cycle']}"
-                    if result['kind'] == 'previous' and result['is_anchor']
-                    else 'Previous' if result['kind'] == 'previous'
-                    else f"Anchor cycle {result['opponent_cycle']}")
+        opponent = ('Previous' if result['kind'] == 'previous'
+                    else f"Anchor {result['anchor_index']} (cycle {result['opponent_cycle']})"
+                    if result['kind'] == 'anchor'
+                    else f"Checkpoint {result['opponent_cycle']}")
         lines.append(f"  {opponent:<24}{w:5d} {d:5d} {l:5d}  {score:6.1%}")
+    for update in row['anchor_updates']:
+        lines.append(f"  Anchor {update['anchor']} advanced: cycle {update['old_cycle']}"
+                     f" → {update['new_cycle']} at {update['score_rate']:.1%}")
     lines.append('-'*43)
     emit(*lines)

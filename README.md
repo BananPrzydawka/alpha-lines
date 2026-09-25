@@ -1,6 +1,6 @@
 # Alpha-lines
 
-KLENT self-play training with a Rust game engine and a PyTorch KataGo model.
+KLENT self-play training with a Rust game engine and selectable PyTorch models.
 Local/Verda training and Modal are supported.
 
 ## MCTS continuation
@@ -66,9 +66,10 @@ node after reaching node capacity. They measure different resources.
 
 ## Checkpoints and logs
 
-- `checkpoints/resume.pt`: the **manually selected FP32 input**, the only checkpoint tracked by Git. Move or copy your chosen checkpoint here before committing. It is never automatically selected or replaced.
+- `checkpoints/resume.pt`: the manually selected FP32 training input. Move or copy your chosen checkpoint here before committing. It is never automatically selected or replaced.
+- `checkpoints/349.pt`: the fixed KLENT strength-test opponent. Keep this file available for local, Modal, and Verda training.
 - `checkpoints/klent/<run-id>/cycle-XXXXXX.pt`: generated checkpoints, kept locally and ignored by Git.
-- `checkpoints/klent/<run-id>/anchors/`: at most three standalone evaluation models, transferred once per run.
+- KLENT cycle checkpoints contain all three active moving anchors, so a single checkpoint can be copied to `resume.pt` without losing them.
 - `checkpoints/klent/bf16/`: older BF16 checkpoints, kept locally and excluded from result downloads.
 - `logs/klent/<run-id>/`: `console.log` (Verda), `run.json` and `metrics.jsonl`, ignored by Git.
 
@@ -80,10 +81,9 @@ To change the starting point, replace `resume.pt` yourself. For example:
 cp checkpoints/klent/RUN_ID/cycle-XXXXXX.pt checkpoints/resume.pt
 ```
 
-Previously saved anchor models are never restored from `resume.pt`. The resumed
-model itself becomes the first anchor of the new run. Older checkpoints with
-embedded anchors remain readable, but those embedded anchors are ignored; new
-checkpoints contain no anchor weights or references.
+Score-gated anchors in a new KLENT checkpoint are restored from `resume.pt`.
+Older fixed-duration anchor formats are ignored; when resuming one of those
+checkpoints, the input model initializes all three moving anchors.
 
 ## Verda workflow
 
@@ -106,6 +106,7 @@ cd ~/projects/alpha-lines &&
 ```
 
 The launcher installs dependencies, builds Rust, and trains in the foreground.
+Use `./scripts/train_verda.sh --fresh` to start a new model without `resume.pt`.
 Keep SSH connected. On an existing checkout, run `git pull --ff-only origin main`
 before launching a new experiment.
 
@@ -126,22 +127,24 @@ It connects as `root` to `/root/projects/alpha-lines/` on the box.
 `klent.cycles` is the number of **additional** cycles (0 runs until stopped).
 Current `klent` settings control self-play, buffer size, minibatches, evaluation,
 learning rate, weight decay, alpha/beta/lambda and seed. Checkpoints supply model
-architecture, FP32 weights, AdamW state and completed cycle number. Only KataGo
-checkpoints are supported.
+architecture, FP32 weights, AdamW state and completed cycle number. KLENT supports
+`katago`, `katago_tf`, `resnet`, and `maia`.
 An unchanged seed restores torch RNG state; changing it reseeds torch.
 BF16-only legacy checkpoints are unsupported. Training retains BF16 autocast
 with FP32 weights, optimizer moments and losses.
 
 Snapshots are saved atomically after complete cycles. Native games and opponent
 history are rebuilt on resume, so restarting is not an exact replay.
-Evaluation compares each completed cycle against the immediately previous model and
-up to three fixed anchor models from the current run. When resuming, the input model
-becomes the first anchor immediately; the next two are captured after 8 and 16
-completed cycles. A fresh run captures anchors after 8, 16, and 24 cycles. Each
-anchor is saved once in that run's `anchors/` directory, separate from cycle
-checkpoints. Anchors carried by an input checkpoint are ignored. When an anchor
-is also the previous model, that matchup runs only once and is labeled as both.
-`test_games` must be even and applies to each opponent separately.
+Evaluation compares each completed cycle, in order, with the immediately previous
+model, three moving anchors, and the fixed `checkpoints/349.pt` model. A fresh run
+initializes all three anchors from its first completed checkpoint (cycle 1), so
+cycle 1 tests only the previous model and checkpoint 349. Anchor 1 advances to
+the current model when its score exceeds 70%; anchors 2 and 3 use 80% and 90%.
+These thresholds are configured by `klent.anchor_thresholds` and use wins plus
+half of draws. Equality does not advance an anchor. Once initialized, anchors
+are stored in every cycle checkpoint and continue across resume. Match results
+are reused when multiple anchor slots hold the same checkpoint, while each slot
+still has its own report row. `test_games` must be even.
 Metrics record losses, W/D/L, historical matchups, counts and timings; `run.json`
 records the effective configuration, precision, hardware and resume source.
 Completed positions are shuffled before each cycle's single training epoch.
@@ -187,7 +190,17 @@ After dependency setup, local training can also run directly:
 ```
 
 Omit `--resume` to train from scratch. Optional `--checkpoint-dir` and `--log-dir`
-set output paths. KataGo model settings are in `config.json`.
+set output paths. Choose `klent.model` in `config.json` and edit its corresponding
+`<model>_model` section. `katago_tf` keeps KataGo's outer bottleneck and seven
+heads, replacing both inner residual blocks with full-board transformer blocks.
+`resnet` restores the historical squeeze-and-excitation tower and seven heads.
+`maia` attends to the 80 playable squares and zero-fills the other 80 locations
+in each spatial output; its two score heads still return full score distributions.
+`maia_model.maia_big_version` defaults to `false`, using average-pooled GAB for
+the paper's 3M/5M style. Set it to `true` for the learned GAB input projection:
+each token is projected to 32 features, all 80 tokens are flattened, then mapped
+to `gab_dim`. For the paper's 23M/79M widths, set `dim` to 512/1024 and
+`gab_dim` to 128; the switch does not change those dimensions automatically.
 
 ## Modal
 
@@ -215,7 +228,7 @@ under that run's `logs/` directory on the `alphalines` Modal volume.
 ## Project and checks
 
 - `python/klent/`: training, native bindings, checkpointing, logging and Modal entrypoint.
-- `python/models/`: KataGo and shared layers.
+- `python/models/`: KataGo, transformer KataGo, ResNet, Maia, and shared layers.
 - `rust/src/`: game engine and KLENT arena.
 - `rust/tests/`: independent game parity tests; KLENT unit tests also live in Rust source.
 - `scripts/`: GPU setup, local/Verda launchers and result downloads.

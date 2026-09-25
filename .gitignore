@@ -14,3 +14,4 @@ __pycache__/
 *.pt
 *.pt.tmp
 !/checkpoints/resume.pt
+!/checkpoints/349.pt

@@ -9,9 +9,10 @@ from time import perf_counter
 
 import torch
 import torch.nn.functional as F
-from config import settings
+from config import CONFIG_PATH, settings
 from klent.native import Arena, Batch
 from klent import output
+from models.factory import MODELS, build_model
 from models.katago import KataGoNet
 MAX_PLY = 80
 
@@ -38,8 +39,34 @@ def validate(options):
         raise ValueError('require alpha+beta > 0, exploration_fraction, lambda values <= 1, and lr > 0')
     if type(options['seed']) is not int or not 0 <= options['seed'] < 2**64:
         raise ValueError('seed must fit u64')
-    if options['model'] != 'katago' or options['optimizer'].lower() != 'adamw':
-        raise ValueError('supported model: katago; optimizer: adamw')
+    if options['model'] not in MODELS or options['optimizer'].lower() != 'adamw':
+        raise ValueError('supported models: katago, katago_tf, resnet, maia; optimizer: adamw')
+    if not isinstance(options['reference_checkpoint'], str) or not options['reference_checkpoint']:
+        raise ValueError('klent.reference_checkpoint must be a nonempty path')
+    thresholds = options['anchor_thresholds']
+    if (not isinstance(thresholds, list) or len(thresholds) != 3 or
+        any(type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 1
+            for value in thresholds) or
+        any(a >= b for a,b in zip(thresholds,thresholds[1:]))):
+        raise ValueError('klent.anchor_thresholds must be three increasing score rates in (0, 1]')
+
+
+def load_reference_model(path, device):
+    """Build the fixed opponent with its own saved architecture."""
+    checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    if checkpoint.get('format_version') != 1 or checkpoint.get('options', {}).get('model') != 'katago':
+        raise ValueError(f'Unsupported reference checkpoint: {path}')
+    if any(t.is_floating_point() and t.dtype != torch.float32 for t in checkpoint['model'].values()):
+        raise ValueError('Reference checkpoint requires FP32 weights')
+    reference = KataGoNet(checkpoint['model_config']).to(
+        device=device, dtype=torch.float32, memory_format=torch.channels_last)
+    missing, unexpected = reference.load_state_dict(checkpoint['model'], strict=False)
+    if any(not key.startswith(('mark_class_head.', 'immediate_score_head.',
+                               'discounted_score_head.', 'discounted_mark_head.',
+                               'opponent_policy_head.')) for key in missing) or any(
+            not key.startswith(('mark_class_head.', 'score_embed.')) for key in unexpected):
+        raise ValueError(f'Reference checkpoint model mismatch: missing={missing}, unexpected={unexpected}')
+    return reference.eval().requires_grad_(False), checkpoint['summary']['cycle']
 
 
 def losses(logits, q, target, actions, returns, valid):
@@ -134,11 +161,13 @@ def evaluation_rows(games):
 
 
 class ModelHistory:
-    """Keep the previous model and up to three anchors from this run."""
-    def __init__(self, start_cycle=0):
+    """Keep the previous model and three score-gated moving anchors."""
+    def __init__(self, thresholds=(0.70, 0.80, 0.90), anchors=()):
         self.previous = None
-        self.anchors = []
-        self.start_cycle = start_cycle
+        self.thresholds = tuple(thresholds)
+        self.anchors = list(anchors)
+        if self.anchors and len(self.anchors) != 3:
+            raise ValueError('Expected three saved KLENT anchors')
 
     @staticmethod
     def snapshot(model):
@@ -147,19 +176,31 @@ class ModelHistory:
     def remember_previous(self, model, cycle):
         self.previous = (cycle, self.snapshot(model))
 
-    def remember_initial_anchor(self, model):
-        self.anchors.append((self.start_cycle, self.snapshot(model)))
+    def initialize_anchors(self, model, cycle):
+        if not self.anchors:
+            weights = self.snapshot(model)
+            self.anchors = [(cycle, weights)] * 3
 
-    def remember_anchor(self, model, cycle):
-        if cycle > self.start_cycle and (cycle-self.start_cycle) % 8 == 0 and len(self.anchors) < 3:
-            self.anchors.append((cycle, self.snapshot(model)))
+    def update_anchors(self, model, cycle, evaluations):
+        updates = []
+        weights = None
+        for result in evaluations:
+            index = result.get('anchor_index')
+            if index is None or result['score_rate'] <= self.thresholds[index-1]:
+                continue
+            if weights is None:
+                weights = self.snapshot(model)
+            old_cycle = self.anchors[index-1][0]
+            self.anchors[index-1] = (cycle, weights)
+            updates.append(dict(anchor=index, old_cycle=old_cycle, new_cycle=cycle,
+                                score_rate=result['score_rate']))
+        return updates
 
     def opponents(self):
         if self.previous is not None:
-            yield ('previous', *self.previous)
-        for cycle, weights in self.anchors:
-            if self.previous is None or cycle != self.previous[0]:
-                yield ('anchor', cycle, weights)
+            yield ('previous', *self.previous, None)
+        for index, (cycle, weights) in enumerate(self.anchors, 1):
+            yield ('anchor', cycle, weights, index)
 
     def checkpoint_anchors(self):
         return list(self.anchors)
@@ -195,32 +236,38 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     if cycles is not None:
         options['cycles'] = cycles
     restored = None
+    saved_anchors = None
     if resume is not None:
         restored = torch.load(resume,map_location='cpu',weights_only=True)
         if restored['format_version'] != 1:
             raise ValueError('Unsupported checkpoint format')
-        # Anchors belong to the previous run, even in legacy checkpoints.
-        restored.pop('anchors', None)
-        restored.pop('anchor_cycles', None)
+        # Legacy fixed-duration anchors have different semantics and cannot be
+        # promoted by score. New checkpoints carry the moving anchors in full.
+        if restored.get('anchor_system') == 'score_gated_v1':
+            saved_anchors = restored['anchors']
         if any(t.is_floating_point() and t.dtype != torch.float32
                for t in restored['model'].values()):
             raise ValueError('Resume requires an FP32 checkpoint')
         # Architecture must match the weights; runtime training settings are current.
-        if restored['options']['model'] != 'katago':
-            raise ValueError('Only KataGo checkpoints are supported')
-        options['model'] = 'katago'
+        if restored['options']['model'] not in MODELS:
+            raise ValueError('Unsupported model in resume checkpoint')
+        options['model'] = restored['options']['model']
         model_key = options['model']+'_model'
         model_config = dict(restored['model_config'])
-        model_config.setdefault('immediate_score_filters', settings[model_key]['immediate_score_filters'])
-        model_config.setdefault('discounted_score_filters', settings[model_key]['discounted_score_filters'])
-        model_config.setdefault('discounted_mark_filters', settings[model_key]['discounted_mark_filters'])
-        model_config.setdefault('opponent_policy_filters', settings[model_key]['opponent_policy_filters'])
+        if options['model'] != 'maia':
+            for key in ('immediate_score_filters','discounted_score_filters',
+                        'discounted_mark_filters','opponent_policy_filters'):
+                model_config.setdefault(key, settings[model_key][key])
         settings[model_key] = model_config
     validate(options)
+    reference_path = Path(options['reference_checkpoint'])
+    if not reference_path.is_absolute():
+        reference_path = CONFIG_PATH.parent / reference_path
     cycles = options['cycles']
     dev = Device(device)
     torch.manual_seed(options['seed'])
-    model = KataGoNet().to(device=device,dtype=torch.float32,memory_format=torch.channels_last)
+    model = build_model(options['model']).to(device=device,dtype=torch.float32,
+                                            memory_format=torch.channels_last)
     old = copy.deepcopy(model).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(),lr=options['lr'],weight_decay=options['weight_decay'])
     if restored is not None:
@@ -238,8 +285,10 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 torch.cuda.set_rng_state(restored['cuda_rng'][0],device=device)
         else:
             torch.manual_seed(options['seed'])
+    reference_model, reference_cycle = load_reference_model(reference_path, device)
     network = torch.compile(model,dynamic=False) if compile_model else model
     previous = torch.compile(old,dynamic=False) if compile_model else old
+    reference_network = torch.compile(reference_model,dynamic=False) if compile_model else reference_model
     sq = torch.arange(80,device=device)
     indices = sq//8*16+2*(sq%8)+(sq//8%2)
     batch = Batch(options['train_minibatch'],pinned=dev.cuda)
@@ -247,9 +296,9 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     completed = 0 if restored is None else restored['summary']['cycle']
     stop_cycle = completed + cycles
     summaries = []
-    history = ModelHistory(start_cycle=completed)
-    if restored is not None:
-        history.remember_initial_anchor(model)
+    history = ModelHistory(options['anchor_thresholds'], saved_anchors or ())
+    if restored is not None and saved_anchors is None:
+        history.initialize_anchors(model, completed)
 
     def infer(net, boards):
         with torch.no_grad(), torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
@@ -259,6 +308,25 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             # before the native consumer finishes with the result.
             return (pi.flatten(1)[:,indices].float().cpu().contiguous(),
                     q.flatten(1)[:,indices].float().cpu().contiguous())
+
+    def match(opponent):
+        with Arena(library,options,evaluation=True,seed=(options['seed']+completed+1)%(2**64),pinned=dev.cuda) as test:
+            # First half: new P1. Second half: new P0. Each network sees
+            # test_games rows, including zero rows for finished slots.
+            old_rows, new_rows = evaluation_rows(options['test_games'])
+            while True:
+                boards = test.inputs()
+                torch.compiler.cudagraph_mark_step_begin()
+                p0,q0 = infer(opponent,boards[old_rows])
+                p1,q1 = infer(network,boards[new_rows])
+                pi = torch.empty((2*test.n,80))
+                q = torch.empty_like(pi)
+                pi[old_rows], pi[new_rows] = p0, p1
+                q[old_rows], q[new_rows] = q0, q1
+                if test.step(pi,q):
+                    break
+            stats = test.stats()
+            return stats.wins,stats.draws,stats.losses
 
     if log_dir is not None:
         log_dir = Path(log_dir)
@@ -362,42 +430,48 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             test_start = perf_counter()
             model.eval()
             evaluations = []
-            for kind, opponent_cycle, weights in history.opponents():
+            # The first three anchors initially share cycle 1. Reuse that
+            # deterministic match while keeping one report row per threshold.
+            matched_cycles = {}
+            opponents = list(history.opponents())
+            opponents.append(('reference', reference_cycle, None, None))
+            for kind, opponent_cycle, weights, anchor_index in opponents:
                 opponent_start = perf_counter()
-                # Reuse one compiled opponent and copy into its existing tensors.
-                old.load_state_dict(weights)
-                with Arena(library,options,evaluation=True,seed=(options['seed']+completed+1)%(2**64),pinned=dev.cuda) as test:
-                    # First half: new P1. Second half: new P0. Each network still
-                    # sees test_games rows, including zero rows for finished slots.
-                    old_rows, new_rows = evaluation_rows(options['test_games'])
-                    while True:
-                        b = test.inputs()
-                        torch.compiler.cudagraph_mark_step_begin()
-                        p0,q0 = infer(previous,b[old_rows])
-                        p1,q1 = infer(network,b[new_rows])
-                        pi = torch.empty((2*test.n,80))
-                        q = torch.empty_like(pi)
-                        pi[old_rows], pi[new_rows] = p0, p1
-                        q[old_rows], q[new_rows] = q0, q1
-                        if test.step(pi,q):
-                            break
-                    stats = test.stats()
-                    wins,draws,losses_count = stats.wins,stats.draws,stats.losses
+                shared_match = kind != 'reference' and opponent_cycle in matched_cycles
+                if shared_match:
+                    wins,draws,losses_count = matched_cycles[opponent_cycle]
+                else:
+                    if kind == 'reference':
+                        opponent = reference_network
+                    else:
+                        # Reuse one compiled opponent for previous and anchors.
+                        old.load_state_dict(weights)
+                        opponent = previous
+                    wins,draws,losses_count = match(opponent)
+                    if kind != 'reference':
+                        matched_cycles[opponent_cycle] = wins,draws,losses_count
                 dev.sync()
-                evaluations.append(dict(kind=kind,
-                    is_anchor=any(cycle == opponent_cycle for cycle,_ in history.anchors),
-                    age=completed+1-opponent_cycle,
+                evaluations.append(dict(kind=kind, anchor_index=anchor_index,
+                    is_anchor=anchor_index is not None,
+                    age=None if kind == 'reference' else completed+1-opponent_cycle,
                     opponent_cycle=opponent_cycle,
                     wins=wins,draws=draws,losses=losses_count,
                     win_rate=wins/options['test_games'],
                     score_rate=(wins+0.5*draws)/options['test_games'],
-                    seconds=perf_counter()-opponent_start))
+                    seconds=perf_counter()-opponent_start,
+                    shared_match=shared_match))
             dev.sync(); test_time = perf_counter()-test_start
             latest = evaluations[0]
             wins,draws,losses_count = (latest[k] for k in ('wins','draws','losses'))
             completed += 1
-            history.remember_anchor(model, completed)
+            if not history.anchors:
+                history.initialize_anchors(model, completed)
+                anchor_updates = []
+            else:
+                anchor_updates = history.update_anchors(model, completed, evaluations)
             summary = dict(cycle=completed,evaluations=evaluations,states=count,dropped_states=dropped,loss=loss_sum/count,
+                           anchor_cycles=[cycle for cycle,_ in history.anchors],
+                           anchor_updates=anchor_updates,
                            model_seconds=model_time,cpu_seconds=cpu_total,
                            shuffle_seconds=shuffle_time,scoring_head_processing_seconds=scoring_processing_time,
                            training_seconds=training_exclusive_time,

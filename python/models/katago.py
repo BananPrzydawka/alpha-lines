@@ -28,14 +28,14 @@ class InnerResidualBlock(nn.Module):
 
 class NestedBottleneck(nn.Module):
     """C -> C/2 -> two inner residual blocks -> C -> outer residual add."""
-    def __init__(self, channels, se_hidden, norm):
+    def __init__(self, channels, se_hidden, norm, inner_block_factory=InnerResidualBlock):
         super().__init__()
         inner_channels = channels // 2
         self.reduce = nn.Conv2d(channels, inner_channels, 1, bias=False)
         self.reduce_norm = group_norm(inner_channels, norm)
         self.inner_blocks = nn.Sequential(
-            InnerResidualBlock(inner_channels, norm),
-            InnerResidualBlock(inner_channels, norm),
+            inner_block_factory(inner_channels, norm),
+            inner_block_factory(inner_channels, norm),
         )
         self.expand = nn.Conv2d(inner_channels, channels, 1, bias=False)
         self.expand_norm = group_norm(channels, norm)
@@ -62,9 +62,9 @@ class KataGoNet(nn.Module):
 
     Score logits are ordered current player then opponent. Outputs are unbounded.
     """
-    def __init__(self):
+    def __init__(self, options=None, inner_block_factory=InnerResidualBlock):
         super().__init__()
-        options = settings["katago_model"]
+        options = settings["katago_model"] if options is None else options
         channels = options["filters"]
         if channels < 2 or channels % 2:
             raise ValueError("katago_model.filters must be a positive even integer")
@@ -74,7 +74,7 @@ class KataGoNet(nn.Module):
         self.norm_input = group_norm(channels, norm)
 
         self.tower = nn.Sequential(*(
-            NestedBottleneck(channels, options["se_hidden"], norm)
+            NestedBottleneck(channels, options["se_hidden"], norm, inner_block_factory)
             for _ in range(options["blocks"])
         ))
         self.policy_head = spatial_head(channels, options["policy_filters"], norm)
