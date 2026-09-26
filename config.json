@@ -29,9 +29,9 @@
     "model": "katago"
   },
   "katago_model": {
-    "filters": 128,
-    "blocks": 8,
-    "se_hidden": 32,
+    "filters": 192,
+    "blocks": 16,
+    "se_hidden": 64,
     "policy_filters": 64,
     "action_value_filters": 64,
     "group_norm": {
