@@ -11,7 +11,7 @@ from unittest.mock import patch
 import torch
 from config import settings
 from klent.native import Arena, Batch
-from klent.train import losses, opponent_policy_loss, run, validate, evaluation_rows, ModelHistory, load_reference_model, mark_class_targets, mark_class_loss, discounted_mark_targets, discounted_mark_loss, immediate_score_loss, discounted_score_loss, restore_optimizer
+from klent.train import losses, recalculated_policy, opponent_policy_loss, run, validate, evaluation_rows, ModelHistory, load_reference_model, mark_class_targets, mark_class_loss, discounted_mark_targets, discounted_mark_loss, immediate_score_loss, discounted_score_loss, restore_optimizer
 from models.katago import KataGoNet
 
 LIBRARY = Path(__file__).resolve().parents[2]/'rust/target/release/libalpha_lines_game.so'
@@ -57,6 +57,38 @@ class KlentTests(unittest.TestCase):
         self.assertEqual(q.grad.count_nonzero().item(),2)
         self.assertAlmostEqual(pl.item(),torch.tensor(160.).log().item())
         self.assertEqual(vl.item(),1)
+
+    def test_recalculated_policy_respects_opening_legality_and_detaches(self):
+        boards = torch.zeros(4,5,10,16)
+        playable = torch.arange(80)//8*16+2*(torch.arange(80)%8)+(torch.arange(80)//8%2)
+        boards[:3,1].reshape(3,160)[:,playable] = 1
+        boards[2,1,0,0] = 0  # A later board permits both halves.
+        logits = torch.zeros(4,10,16,requires_grad=True)
+        q = torch.zeros(4,10,16,requires_grad=True)
+        with torch.no_grad():
+            q[0,0,0],q[0,0,2] = 1,2
+        valid = torch.tensor([1.,1.,1.,0.])
+        target = recalculated_policy(logits,q,boards,valid,0.03,0.1)
+        self.assertFalse(target.requires_grad)
+        torch.testing.assert_close(target.sum(1),valid)
+        self.assertEqual(target[0].reshape(10,16)[:,8:].count_nonzero().item(),0)
+        self.assertEqual(target[1].reshape(10,16)[:,:8].count_nonzero().item(),0)
+        self.assertGreater(target[2].reshape(10,16)[:,8:].sum().item(),0)
+        expected_ratio = torch.exp(torch.tensor((1.-2.)/0.13))
+        torch.testing.assert_close(target[0,0]/target[0,2],expected_ratio)
+        self.assertEqual(target[3].count_nonzero().item(),0)
+
+    def test_recalculated_policy_runs_a_training_cycle(self):
+        small = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
+                     policy_filters=4,action_value_filters=4)
+        options = dict(self.options,n=2,m=160,train_minibatch=40,test_games=2,
+                       policy_recalculation=True)
+        with patch.dict(settings,{'katago_model':small}), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                torch.backends.mkldnn.flags(enabled=False):
+            summary = run(LIBRARY,options,cycles=1,device='cpu',compile_model=False)[0]
+        self.assertGreater(summary['states'],0)
+        self.assertTrue(torch.isfinite(torch.tensor(summary['policy_loss'])))
 
     def test_opponent_policy_loss_swaps_paired_targets_and_ignores_padding(self):
         target = torch.zeros(4,160)
@@ -494,7 +526,8 @@ class KlentTests(unittest.TestCase):
                          {'discounted_score_weight':-1},{'discounted_score_lambda':1.1},
                          {'discounted_mark_weight':-1},{'discounted_mark_lambda':1.1},
                          {'opponent_policy_weight':-1},{'model':'unknown'},
-                         {'reference_checkpoint':''},{'anchor_thresholds':[0.7,0.8]},
+                         {'reference_checkpoint':''},{'policy_recalculation':1},
+                         {'anchor_thresholds':[0.7,0.8]},
                          {'anchor_thresholds':[0.7,float('nan'),0.9]},
                          {'anchor_thresholds':[0.7,0.7,0.9]}):
             with self.assertRaises(ValueError):

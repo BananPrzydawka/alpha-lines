@@ -73,9 +73,10 @@ node after reaching node capacity. They measure different resources.
 - `checkpoints/klent/bf16/`: older BF16 checkpoints, kept locally and excluded from result downloads.
 - `logs/klent/<run-id>/`: `console.log` (Verda), `run.json` and `metrics.jsonl`, ignored by Git.
 
-Each invocation creates a separate run. Repeating the Verda command starts another
-experiment from the same `resume.pt`, even when newer outputs exist.
-To change the starting point, replace `resume.pt` yourself. For example:
+Each invocation creates a separate run. The plain Verda command starts from
+scratch; `--resume` starts from the manually selected `resume.pt` even when
+newer outputs exist. To change the resume starting point, replace `resume.pt`
+yourself. For example:
 
 ```sh
 cp checkpoints/klent/RUN_ID/cycle-XXXXXX.pt checkpoints/resume.pt
@@ -87,7 +88,7 @@ checkpoints, the input model initializes all three moving anchors.
 
 ## Verda workflow
 
-Edit `config.json` and select `checkpoints/resume.pt`, then publish locally:
+Edit `config.json`, include `checkpoints/349.pt`, and publish locally:
 
 ```sh
 git add .
@@ -105,8 +106,9 @@ cd ~/projects/alpha-lines &&
 ./scripts/train_verda.sh
 ```
 
-The launcher installs dependencies, builds Rust, and trains in the foreground.
-Use `./scripts/train_verda.sh --fresh` to start a new model without `resume.pt`.
+The launcher starts a fresh KLENT model by default, installs dependencies,
+builds Rust, and trains in the foreground. Use `./scripts/train_verda.sh --resume`
+only when you want to continue from `checkpoints/resume.pt`.
 Keep SSH connected. On an existing checkout, run `git pull --ff-only origin main`
 before launching a new experiment.
 
@@ -132,6 +134,12 @@ architecture, FP32 weights, AdamW state and completed cycle number. KLENT suppor
 An unchanged seed restores torch RNG state; changing it reseeds torch.
 BF16-only legacy checkpoints are unsupported. Training retains BF16 autocast
 with FP32 weights, optimizer moments and losses.
+`klent.policy_recalculation` defaults to `false`. When enabled, each training
+minibatch recomputes KLENT's legal improved-policy target from that minibatch's
+current policy and action-value outputs, using the configured `alpha` and `beta`.
+The target is detached before policy and opponent-policy losses; value training
+still uses the stored returns. The opening left/right move rule is recovered
+from the board and paired player rows.
 
 Snapshots are saved atomically after complete cycles. Native games and opponent
 history are rebuilt on resume, so restarting is not an exact replay.

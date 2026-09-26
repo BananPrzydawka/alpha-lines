@@ -29,6 +29,8 @@ def validate(options):
         raise ValueError('test_games must be even for balanced sides')
     if options['train_minibatch'] % 2:
         raise ValueError('train_minibatch counts perspectives and must be even')
+    if type(options['policy_recalculation']) is not bool:
+        raise ValueError('klent.policy_recalculation must be a boolean')
     for key in ('alpha','beta','exploration_fraction','lambda','lr','weight_decay',
                 'policy_loss_weight','opponent_policy_weight','q_loss_weight','mark_class_loss_weight',
                 'immediate_score_weight','discounted_score_weight','discounted_score_lambda',
@@ -75,6 +77,22 @@ def losses(logits, q, target, actions, returns, valid):
     value = (q.flatten(1).float().gather(1,actions[:,None]).squeeze(1)-returns).square()
     denominator = valid.sum().clamp_min(1)
     return (policy*valid).sum()/denominator, (value*valid).sum()/denominator
+
+
+def recalculated_policy(logits, q, boards, valid, alpha, beta):
+    """Recreate KLENT's legal softmax from the current minibatch forward pass."""
+    empty = boards[:,1] > 0.5
+    opening = empty.flatten(1).sum(1) == 80
+    player = torch.arange(boards.shape[0],device=boards.device) % 2
+    columns = torch.arange(16,device=boards.device).view(1,1,16)
+    opening_half = torch.where(player[:,None,None] == 0,columns < 8,columns >= 8)
+    legal = (empty & (~opening[:,None,None] | opening_half)).flatten(1)
+    # Padded rows have no legal squares; give softmax one temporary finite logit.
+    fallback = F.one_hot(torch.zeros(boards.shape[0],device=boards.device,dtype=torch.long),160).bool()
+    safe_legal = torch.where(valid[:,None] > 0,legal,fallback)
+    scores = (q.flatten(1).float() + beta*logits.flatten(1).float()) / (alpha+beta)
+    policy = scores.masked_fill(~safe_legal,float('-inf')).softmax(1)
+    return torch.where(valid[:,None] > 0,policy,torch.zeros_like(policy)).detach()
 
 
 def opponent_policy_loss(logits, target, valid):
@@ -376,7 +394,7 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             timing_sum = [0.0, 0.0, 0.0]
             for start in range(0,count,batch.rows//2):
                 valid_positions = arena.batch(start,batch)
-                b,s,target,actions,returns,classes,discounted_scores,discounted_marks = dev.transfer(batch.tensors)
+                b,s,stored_target,actions,returns,classes,discounted_scores,discounted_marks = dev.transfer(batch.tensors)
                 dev.sync(); scoring_processing_start = perf_counter()
                 class_target = mark_class_targets(classes, indices)
                 future_mark_target = discounted_mark_targets(discounted_marks, indices)
@@ -389,6 +407,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 forward_start = dev.stamp()
                 with torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
                     logits,values,mark_logits,score_logits,discounted_logits,discounted_mark_logits,opponent_logits = network(b)
+                    target = (recalculated_policy(logits,values,b,valid,options['alpha'],options['beta'])
+                              if options['policy_recalculation'] else stored_target)
                     policy_loss,value_loss = losses(logits,values,target,actions,returns,valid)
                     other_policy_loss = opponent_policy_loss(opponent_logits,target,valid)
                     mark_loss = mark_class_loss(mark_logits,class_target,valid)

@@ -25,6 +25,7 @@
     "optimizer": "adamw",
     "weight_decay": 0.0000002,
     "policy_loss_weight": 1.0,
+    "policy_recalculation": false,
     "opponent_policy_weight": 0.0,
     "q_loss_weight": 2.0,
     "mark_class_loss_weight": 0.0,

@@ -13,6 +13,7 @@ def setup(options, device, compiled):
          f"  Test       {options['test_games']:,} games   |   Seed {options['seed']}",
          f"  Anchors    score > {options['anchor_thresholds'][0]:.0%},"
          f" {options['anchor_thresholds'][1]:.0%}, {options['anchor_thresholds'][2]:.0%}",
+         f"  Policy target {'minibatch recalculation' if options['policy_recalculation'] else 'stored self-play'}",
          f"  Reference  {options['reference_checkpoint']}",
          f"  Alpha      {options['alpha']:g}   |   Beta {options['beta']:g}   |   Lambda {options['lambda']:.6f}"
          f"   |   Score lambda {options['discounted_score_lambda']:.6f}",
