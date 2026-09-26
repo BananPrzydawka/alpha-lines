@@ -83,15 +83,6 @@ fn mix_uniform(p: &[f32; 80], legal: [u64; 2], fraction: f32) -> [f32; 80] {
     })
 }
 
-// Each quarter contains two equal side assignments. The current model owns
-// the opposite side in every game; historical models only choose moves.
-fn opponent_slot(game: usize, count: usize) -> (usize, usize) {
-    if count < 8 { return (0, game % 2); }
-    let quarter = game / (count / 4);
-    let side = (game % (count / 4) >= count / 8) as usize;
-    (quarter, side)
-}
-
 pub struct Arena {
     games: Vec<Game>, histories: Vec<Vec<History>>, buffer: Vec<Position>,
     capacity: usize, alpha: f32, beta: f32, lambda: f32, exploration_fraction: f32,
@@ -100,7 +91,7 @@ pub struct Arena {
 impl Arena {
     pub fn new(n: usize, capacity: usize, alpha: f32, beta: f32, lambda: f32,
                exploration_fraction: f32, seed: u64, evaluation: bool) -> Self {
-        assert!(n > 0 && (n < 8 || n % 8 == 0));
+        assert!(n > 0);
         assert!(evaluation || capacity >= n.checked_mul(MAX_PLY).unwrap());
         assert!(alpha.is_finite() && beta.is_finite() && alpha >= 0.0 && beta >= 0.0 && alpha+beta > 0.0);
         assert!(lambda.is_finite() && (0.0..=1.0).contains(&lambda));
@@ -120,27 +111,21 @@ impl Arena {
             }
         }
     }
-    pub fn step(&mut self, logits: &[f32], q: &[f32], opponent_logits: &[f32], opponent_q: &[f32]) -> bool {
+    pub fn step(&mut self, logits: &[f32], q: &[f32]) -> bool {
         for i in 0..self.games.len() {
             if self.games[i].finished { continue; }
             let mut policies = [[0.0f32; 80]; 2];
             let mut values = [0.0; 2];
             let mut actions = [0u8; 2];
-            let (quarter, opponent_side) = opponent_slot(i, self.games.len());
             for p in 0..2 {
                 let row = (2*i+p)*80;
                 let (dist, value) = if self.evaluation {
                     policy(&self.games[i], p, &logits[row..row+80], &[0.0; 80], 0.0, 1.0)
                 } else { policy(&self.games[i], p, &logits[row..row+80], &q[row..row+80], self.alpha, self.beta) };
                 policies[p] = dist; values[p] = value;
-                let playing_dist = if !self.evaluation && p == opponent_side && quarter >= 2 {
-                    policy(&self.games[i], p, &opponent_logits[row..row+80],
-                           &opponent_q[row..row+80], self.alpha, self.beta).0
-                } else { dist };
-                let explore = !self.evaluation && quarter == 1;
-                let sampling_dist = if explore {
-                    mix_uniform(&playing_dist, self.games[i].legal_moves(p), self.exploration_fraction)
-                } else { playing_dist };
+                let sampling_dist = if self.evaluation { dist } else {
+                    mix_uniform(&dist, self.games[i].legal_moves(p), self.exploration_fraction)
+                };
                 actions[p] = sample(&sampling_dist, &mut self.rng) as u8;
             }
             if !self.evaluation {
@@ -198,12 +183,8 @@ pub unsafe extern "C" fn klent_inputs(h: *mut Arena, b: *mut f32) -> i32 {
     })).unwrap_or(-1)
 }
 #[no_mangle]
-pub unsafe extern "C" fn klent_step(h: *mut Arena, logits: *const f32, q: *const f32,
-                                     opponent_logits: *const f32, opponent_q: *const f32) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| { let a=&mut *h; let len=a.games.len()*160;
-        a.step(std::slice::from_raw_parts(logits,len),std::slice::from_raw_parts(q,len),
-               std::slice::from_raw_parts(opponent_logits,len),std::slice::from_raw_parts(opponent_q,len)) as i32
-    })).unwrap_or(-1)
+pub unsafe extern "C" fn klent_step(h: *mut Arena, logits: *const f32, q: *const f32) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| { let a=&mut *h; let len=a.games.len()*160; a.step(std::slice::from_raw_parts(logits,len),std::slice::from_raw_parts(q,len)) as i32 })).unwrap_or(-1)
 }
 #[no_mangle]
 /// Writes buffered positions, then evaluation wins, draws, and losses.
@@ -316,7 +297,7 @@ mod tests {
     fn collection_returns_capacity_and_evaluation() {
         for lambda in [0.0,0.5,1.0] {
             let mut a=Arena::new(4,640,0.03,0.1,lambda,0.1,1,false);
-            for _ in 0..1000 { if a.step(&[0.0;640],&[0.25;640],&[0.0;640],&[0.25;640]) { break; } }
+            for _ in 0..1000 { if a.step(&[0.0;640],&[0.25;640]) { break; } }
             assert!(a.buffer.len()>320 && a.buffer.len()<=640);
             for pos in &a.buffer { for p in 0..2 {
                 assert_eq!(pos.board[pos.actions[p] as usize],0);
@@ -326,7 +307,7 @@ mod tests {
             let dropped=a.reset(); assert!(dropped<320); assert!(a.histories.iter().all(Vec::is_empty));
         }
         let mut a=Arena::new(4,0,0.03,0.1,0.8,0.1,1,true);
-        for _ in 0..80 { if a.step(&[0.0;640],&[0.0;640],&[0.0;640],&[0.0;640]) { break; } }
+        for _ in 0..80 { if a.step(&[0.0;640],&[0.0;640]) { break; } }
         assert_eq!(a.results.iter().sum::<usize>(),4);
         let mut expected = [0;3];
         for (i,g) in a.games.iter().enumerate() {
@@ -336,31 +317,5 @@ mod tests {
         assert_eq!(a.results,expected);
         let mut b=vec![1.0;6400]; a.inputs(&mut b);
         assert!(b.iter().all(|&x| x==0.0));
-    }
-
-    #[test]
-    fn historical_opponent_changes_moves_but_not_targets() {
-        let mut a=Arena::new(8,640,0.0,1.0,0.8,0.0,1,false);
-        let current=[0.0;1280];
-        let mut old=[0.0;1280];
-        let old_q=[2.0;1280];
-        for row in 0..16 { old[row*80+1]=100.0; old[row*80+5]=100.0; }
-        a.step(&current,&current,&old,&old_q);
-        assert_eq!(a.histories[4][0].actions[0],1);
-        assert_eq!(a.histories[5][0].actions[1],5);
-        assert!((a.histories[4][0].policy[0][1]-1.0/40.0).abs()<1e-6);
-        assert!((a.histories[5][0].policy[1][5]-1.0/40.0).abs()<1e-6);
-        assert_eq!(a.histories[4][0].returns[0],0.0);
-        assert_eq!(a.histories[5][0].returns[1],0.0);
-        assert_eq!(opponent_slot(0,1024),(0,0));
-        assert_eq!(opponent_slot(127,1024),(0,0));
-        assert_eq!(opponent_slot(128,1024),(0,1));
-        assert_eq!(opponent_slot(512,1024),(2,0));
-        assert_eq!(opponent_slot(1023,1024),(3,1));
-        for quarter in 0..4 {
-            for side in 0..2 {
-                assert_eq!((0..1024).filter(|&i| opponent_slot(i,1024)==(quarter,side)).count(),128);
-            }
-        }
     }
 }

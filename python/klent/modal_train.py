@@ -14,6 +14,8 @@ training_image = (
     ).add_local_dir(project_dir/'rust',remote_path='/root/rust',ignore=['target/'])
     .add_local_file(project_dir/'checkpoints'/'349.pt',remote_path='/root/checkpoints/349.pt')
 )
+gradient_image = training_image.add_local_file(
+    project_dir/'checkpoints'/'resume.pt', remote_path='/root/checkpoints/resume.pt')
 
 
 @app.function(image=training_image,gpu=resources['gpu'],timeout=resources['timeout'],
@@ -35,9 +37,30 @@ def train(smoke: bool = False):
         volume.commit()
         print(f'Checkpoint saved: {path}', flush=True)
     return run('/root/rust/target/release/libalpha_lines_game.so',options,
-               checkpoint=checkpoint,log_dir=directory,history_dir=directory)
+               checkpoint=checkpoint,log_dir=directory)
 
 
 @app.local_entrypoint()
 def main(smoke: bool = False):
     train.remote(smoke)
+
+
+@app.function(image=gradient_image, gpu=resources['gpu'], timeout=resources['timeout'])
+def compare_checkpoint_gradients(chunks: int = 16):
+    import subprocess
+    from klent.gradient_compare import compare
+    subprocess.run(['/root/.cargo/bin/cargo', 'build', '--release', '--locked',
+                    '--manifest-path', '/root/rust/Cargo.toml'], check=True)
+    result = compare('/root/rust/target/release/libalpha_lines_game.so',
+                     '/root/checkpoints/resume.pt', chunks=chunks)
+    for row in result['results']:
+        print(f"{row['perspectives']:>6,} perspectives  "
+              f"mean cosine {row['mean_cosine']:+.4f}  "
+              f"positive pairs {row['positive_fraction']:.1%}", flush=True)
+    return result
+
+
+@app.local_entrypoint()
+def gradient_comparison(chunks: int = 16):
+    import json
+    print(json.dumps(compare_checkpoint_gradients.remote(chunks), indent=2))

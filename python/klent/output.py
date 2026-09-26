@@ -9,8 +9,8 @@ def setup(options, device, compiled):
     emit('', 'KLENT  |  '+options['model']+'  |  FP32 weights + BF16 autocast  |  '+device,
          '  Compile    '+('default' if compiled else 'disabled'),
          f"  Arena      {options['n']:,} games   |   Buffer {options['m']:,} positions",
-         '  Training opponents: 1/4 current quiet, 1/4 current exploring, 1/4 checkpoint 1, 1/4 checkpoint 2',
          f"  Minibatch  {options['train_minibatch']:,} perspectives   |   One epoch",
+         f"  Gradient accumulation {'enabled' if options['gradient_accumulation'] else 'disabled'}",
          f"  Test       {options['test_games']:,} games   |   Seed {options['seed']}",
          f"  Anchors    score > {options['anchor_thresholds'][0]:.0%},"
          f" {options['anchor_thresholds'][1]:.0%}, {options['anchor_thresholds'][2]:.0%}",
@@ -32,7 +32,6 @@ def summary(row, timing):
         raw, weight = row[loss_key], row[weight_key]
         loss_lines.append(f'    {label:<16}{raw:>8.4f} × {weight} = {raw*weight:.4f}')
     lines = ['', f"Cycle {row['cycle']} complete", '-'*43,
-         f"  Training opponents  cycles {row['training_opponent_cycles'][0]}, {row['training_opponent_cycles'][1]}",
          f"  Positions     {row['states']:>12,}",
          f"  Dropped       {row['dropped_states']:>12,}",
          f"  Mean loss     {row['loss']:>12.4f}",

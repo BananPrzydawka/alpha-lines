@@ -3,23 +3,19 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-resume_checkpoint=""
+resume=false
 case "${1:-}" in
-    --resume)
-        if (($# < 2)) || [[ -z "$2" ]]; then
-            echo 'Usage: ./scripts/train_verda.sh --resume PATH' >&2
-            exit 1
-        fi
-        resume_checkpoint="$2"; shift 2 ;;
+    --resume) resume=true; shift ;;
     --fresh) shift ;; # Backward-compatible spelling; fresh is the default.
 esac
 if (($#)); then
-    echo 'Usage: ./scripts/train_verda.sh [--resume PATH|--fresh]' >&2
+    echo 'Usage: ./scripts/train_verda.sh [--resume|--fresh]' >&2
     exit 1
 fi
 # Resuming is explicit; fresh training needs only the fixed evaluation model.
-if [[ -n "$resume_checkpoint" && ! -f "$resume_checkpoint" ]]; then
-    echo 'Provide a checkpoint file with its historical cycle files in the same directory.' >&2
+checkpoint="$PWD/checkpoints/resume.pt"
+if [[ "$resume" == true && ! -f "$checkpoint" ]]; then
+    echo 'Place your chosen FP32 checkpoint at checkpoints/resume.pt and commit it before deploying.' >&2
     exit 1
 fi
 if [[ ! -f "$PWD/checkpoints/349.pt" ]]; then
@@ -32,9 +28,9 @@ log_dir="$PWD/logs/klent/$run_id"
 checkpoint_dir="$PWD/checkpoints/klent/$run_id"
 mkdir -p "$log_dir"
 train_args=()
-if [[ -n "$resume_checkpoint" ]]; then
-    train_args+=(--resume "$resume_checkpoint")
-    echo "Resuming $resume_checkpoint"
+if [[ "$resume" == true ]]; then
+    train_args+=(--resume "$checkpoint")
+    echo "Resuming $checkpoint"
 else
     echo 'Starting a fresh KLENT model'
 fi

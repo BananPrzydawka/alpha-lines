@@ -10,7 +10,8 @@ from unittest.mock import patch
 import torch
 from config import settings
 from klent.native import Arena, Batch
-from klent.train import losses, recalculated_policy, run, validate, evaluation_rows, historical_cycles, historical_rows, ModelHistory, load_reference_model, restore_optimizer
+from klent.gradient_compare import compare as compare_gradients
+from klent.train import losses, recalculated_policy, run, validate, evaluation_rows, ModelHistory, load_reference_model, restore_optimizer
 from models.katago import KataGoNet
 
 LIBRARY = Path(__file__).resolve().parents[2]/'rust/target/release/libalpha_lines_game.so'
@@ -33,7 +34,7 @@ class KlentTests(unittest.TestCase):
 
     def setUp(self):
         torch.set_num_threads(1)
-        self.options = dict(settings['klent'],n=8,m=1280,train_minibatch=30,test_games=4,
+        self.options = dict(settings['klent'],n=2,m=320,train_minibatch=30,test_games=4,
                             reference_checkpoint=str(self.reference_path))
 
     def test_reference_uses_its_saved_architecture(self):
@@ -80,7 +81,7 @@ class KlentTests(unittest.TestCase):
     def test_recalculated_policy_runs_a_training_cycle(self):
         small = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
                      policy_filters=4,action_value_filters=4)
-        options = dict(self.options,n=8,m=640,train_minibatch=40,test_games=2,
+        options = dict(self.options,n=2,m=160,train_minibatch=40,test_games=2,
                        policy_recalculation=True)
         with patch.dict(settings,{'katago_model':small}), \
                 contextlib.redirect_stdout(io.StringIO()), \
@@ -89,9 +90,40 @@ class KlentTests(unittest.TestCase):
         self.assertGreater(summary['states'],0)
         self.assertTrue(torch.isfinite(torch.tensor(summary['policy_loss'])))
 
+    def test_gradient_accumulation_takes_one_step_per_cycle_and_can_resume(self):
+        from klent.checkpoint import save
+        small = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
+                     policy_filters=4,action_value_filters=4)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(settings,{'katago_model':small}), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                torch.backends.mkldnn.flags(enabled=False):
+            first = run(LIBRARY,dict(self.options,train_minibatch=38,
+                                     gradient_accumulation=False),cycles=1,
+                        device='cpu',compile_model=False,
+                        checkpoint=lambda model,optimizer,options,summary,anchors:
+                            save(directory,model,optimizer,options,summary,anchors))[0]
+            self.assertGreater(first['batches'],1)
+            self.assertEqual(first['optimizer_steps'],first['batches'])
+            initial_path = Path(directory)/'cycle-000001.pt'
+            initial = torch.load(initial_path,weights_only=True)
+            initial_step = next(iter(initial['optimizer']['state'].values()))['step'].item()
+            self.assertEqual(initial_step,first['batches'])
+            second = run(LIBRARY,dict(self.options,train_minibatch=38,
+                                      gradient_accumulation=True),cycles=1,
+                         device='cpu',compile_model=False,resume=initial_path,
+                         checkpoint=lambda model,optimizer,options,summary,anchors:
+                             save(directory,model,optimizer,options,summary,anchors))[0]
+            self.assertGreater(second['batches'],1)
+            self.assertEqual(second['optimizer_steps'],1)
+            resumed = torch.load(Path(directory)/'cycle-000002.pt',weights_only=True)
+            self.assertTrue(resumed['options']['gradient_accumulation'])
+            self.assertEqual(next(iter(resumed['optimizer']['state'].values()))['step'].item(),
+                             initial_step+1)
+
     def test_native_batch_reproducibility_and_perspectives(self):
         with Arena(LIBRARY,self.options) as a, Arena(LIBRARY,self.options) as other:
-            pi = torch.zeros(16,80)
+            pi = torch.zeros(4,80)
             for _ in range(160):
                 ab = a.inputs()
                 bb = other.inputs()
@@ -127,7 +159,6 @@ class KlentTests(unittest.TestCase):
             with patch.dict(settings,{key:small}),contextlib.redirect_stdout(report), torch.backends.mkldnn.flags(enabled=False):
                 summaries = run(LIBRARY,options,cycles=2,device='cpu',compile_model=False)
             self.assertEqual(len(summaries),2)
-            self.assertEqual([s['training_opponent_cycles'] for s in summaries],[[0,0],[1,0]])
             self.assertEqual(report.getvalue().count(' complete\n'),2)
             for label in ('Setup', 'Total', 'CPU', 'Model self play', 'Model training', 'Strength test', 'Other'):
                 expected = 1 if label == 'Setup' else 2
@@ -225,12 +256,11 @@ class KlentTests(unittest.TestCase):
                     patch.dict(settings,{f'{name}_model':configuration}), \
                     contextlib.redirect_stdout(io.StringIO()), \
                     torch.backends.mkldnn.flags(enabled=False):
-                options = dict(self.options,model=name,n=8,m=640,train_minibatch=40,test_games=2)
+                options = dict(self.options,model=name,n=2,m=160,train_minibatch=40,test_games=2)
                 first_dir = Path(directory)/'first'
                 first = run(LIBRARY,options,cycles=1,device='cpu',compile_model=False,
                             checkpoint=lambda model,optimizer,o,summary,anchors:
-                                save(first_dir,model,optimizer,o,summary,anchors),
-                            history_dir=first_dir)[0]
+                                save(first_dir,model,optimizer,o,summary,anchors))[0]
                 path = first_dir/'cycle-000001.pt'
                 saved = torch.load(path,weights_only=True)
                 self.assertEqual(saved['model_config'],configuration)
@@ -241,10 +271,6 @@ class KlentTests(unittest.TestCase):
                 self.assertEqual(second['cycle'],2)
                 self.assertEqual([r['kind'] for r in second['evaluations']],
                                  ['previous','anchor','anchor','anchor','reference'])
-                if name == 'resnet':
-                    (first_dir/'cycle-000000-weights.pt').unlink()
-                    with self.assertRaisesRegex(FileNotFoundError,'Missing historical opponent'):
-                        run(LIBRARY,options,cycles=1,device='cpu',compile_model=False,resume=path)
 
     def test_resume_restores_architecture_but_uses_current_training_settings(self):
         from klent.checkpoint import save
@@ -254,13 +280,12 @@ class KlentTests(unittest.TestCase):
             def checkpoint(model,optimizer,options,summary,anchors):
                 save(directory,model,optimizer,options,summary,anchors)
             run(LIBRARY,dict(self.options,model='katago'),cycles=1,device='cpu',
-                compile_model=False,checkpoint=checkpoint,history_dir=directory)
+                compile_model=False,checkpoint=checkpoint)
             path = Path(directory)/'cycle-000001.pt'
             bootstrap = run(LIBRARY,dict(self.options,model='katago'),cycles=1,
                             device='cpu',compile_model=False,resume=path,
                             checkpoint=lambda model,optimizer,options,summary,anchors:
-                                save(Path(directory)/'bootstrap',model,optimizer,options,summary,anchors),
-                            history_dir=Path(directory)/'bootstrap')
+                                save(Path(directory)/'bootstrap',model,optimizer,options,summary,anchors))
             self.assertEqual([(r['kind'],r['opponent_cycle'])
                               for r in bootstrap[0]['evaluations']],
                              [('previous',1)]+[('anchor',1)]*3+[('reference',349)])
@@ -276,7 +301,7 @@ class KlentTests(unittest.TestCase):
                              [cycle for cycle,_ in bootstrapped['anchors']])
             # Change architecture defaults and runtime settings independently.
             settings['katago_model'] = dict(small, filters=16, blocks=2)
-            current = dict(self.options,model='katago',cycles=1,n=8,m=640,
+            current = dict(self.options,model='katago',cycles=1,n=3,m=480,
                            train_minibatch=40,test_games=6,lr=0.001,
                            weight_decay=0.02,alpha=0.04,beta=0.2,
                            **{'lambda':0.8,'seed':7})
@@ -334,10 +359,10 @@ class KlentTests(unittest.TestCase):
             path = Path(directory)/'legacy.pt'
             torch.save(dict(format_version=1,model=legacy.state_dict(),optimizer=optimizer.state_dict(),
                             options=dict(self.options,model='katago'),model_config=small,
-                            summary=dict(cycle=0),torch_rng=torch.get_rng_state(),cuda_rng=[]),path)
+                            summary=dict(cycle=1),torch_rng=torch.get_rng_state(),cuda_rng=[]),path)
             result = run(LIBRARY,dict(self.options,model='katago'),cycles=1,
                          device='cpu',compile_model=False,resume=path)
-            self.assertEqual(result[0]['cycle'],1)
+            self.assertEqual(result[0]['cycle'],2)
 
     def test_balanced_assignment(self):
         old,new = evaluation_rows(8)
@@ -350,15 +375,27 @@ class KlentTests(unittest.TestCase):
         self.assertEqual(output.reshape(8,2)[:4].tolist(),[[10.,20.]]*4)
         self.assertEqual(output.reshape(8,2)[4:].tolist(),[[20.,10.]]*4)
 
-    def test_geometric_training_opponents_and_side_assignment(self):
-        expected = {1:(0,0),2:(1,0),3:(2,1),4:(2,0),5:(3,1),
-                    6:(4,2),7:(5,3),8:(4,0),48:(32,16),
-                    104:(72,40),204:(172,140)}
-        self.assertEqual({cycle:historical_cycles(cycle) for cycle in expected},expected)
-        self.assertEqual(historical_rows(1024,2).tolist(),
-                         [2*i+(i>=640) for i in range(512,768)])
-        self.assertEqual(historical_rows(1024,3).tolist(),
-                         [2*i+(i>=896) for i in range(768,1024)])
+    def test_gradient_comparison_uses_core_weights_and_no_optimizer_steps(self):
+        small = dict(settings['katago_model'], filters=8, blocks=1, se_hidden=4,
+                     policy_filters=4, action_value_filters=4)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(settings, {'katago_model':small}), \
+                torch.backends.mkldnn.flags(enabled=False):
+            model = KataGoNet(small)
+            model.opponent_policy_head = torch.nn.Conv2d(8,1,1)
+            path = Path(directory)/'legacy.pt'
+            torch.save(dict(format_version=1, options={'model':'katago'},
+                            model_config=small, model=model.state_dict(),
+                            summary={'cycle':55}), path)
+            result = compare_gradients(LIBRARY, path,
+                options=dict(self.options,train_minibatch=20), chunks=2, device='cpu')
+            self.assertEqual(result['cycle'],55)
+            self.assertEqual(result['auxiliary_tensors_ignored'],2)
+            self.assertEqual([row['perspectives'] for row in result['results']],[20,40])
+            self.assertTrue(all(torch.isfinite(torch.tensor(row['mean_cosine']))
+                                for row in result['results']))
+            torch.testing.assert_close(torch.load(path,weights_only=True)['model']['conv_input.weight'],
+                                       model.conv_input.weight)
 
     def test_checkpoint_roundtrip(self):
         from klent.checkpoint import save
@@ -384,11 +421,12 @@ class KlentTests(unittest.TestCase):
 
     def test_validation(self):
         validate(self.options)
-        for override in ({'train_minibatch':3},{'test_games':3},{'m':1},{'n':9},{'lambda':1.1},{'alpha':0,'beta':0},
+        for override in ({'train_minibatch':3},{'test_games':3},{'m':1},{'lambda':1.1},{'alpha':0,'beta':0},
                          {'exploration_fraction':-0.1},{'exploration_fraction':1.1},
                          {'policy_loss_weight':-1},{'q_loss_weight':float('nan')},
                          {'model':'unknown'},
                          {'reference_checkpoint':''},{'policy_recalculation':1},
+                         {'gradient_accumulation':1},
                          {'anchor_thresholds':[0.7,0.8]},
                          {'anchor_thresholds':[0.7,float('nan'),0.9]},
                          {'anchor_thresholds':[0.7,0.7,0.9]}):

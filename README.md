@@ -13,11 +13,21 @@ cargo build --release --manifest-path rust/Cargo.toml
 
 For a CPU smoke run, use `--device cpu --no-compile`. The default configuration is in `config.json`. `klent.cycles` is the number of additional cycles; zero runs until stopped. Checkpoints and logs are written under `checkpoints/klent/<run-id>/` and `logs/klent/<run-id>/`.
 
-Resume with `--resume checkpoints/klent/<run-id>/cycle-XXXXXX.pt`. The resume checkpoint supplies the architecture, weights, optimizer state, completed cycle, and moving anchors. The preceding 64 cycle files, including `cycle-000000-weights.pt` when needed, must be beside it; training loads them into system RAM. If you resume into a new checkpoint directory, those files are linked or copied there. Current training settings come from `config.json`. Older checkpoints with auxiliary heads can still supply their policy, action-value, and tower weights; the removed head weights are ignored. The fixed strength-test opponent is selected by `klent.reference_checkpoint`.
+Resume with `--resume checkpoints/resume.pt`. This compact cycle-55 checkpoint supplies the architecture, core model weights, optimizer state, and completed cycle. Its moving anchors were removed to keep the file below GitHub's size limit; on resume, all three anchors start from the cycle-55 model. Current training settings come from `config.json`. Older checkpoints with auxiliary heads can still supply their policy, action-value, and tower weights; the removed head weights are ignored. The fixed strength-test opponent is selected by `klent.reference_checkpoint`, which is a separate checkpoint file.
 
-The 1024-game arena has four equal partitions. Side 1 uses the current model throughout. Side 2 uses the current model without uniform exploration in the first partition, the current model with uniform exploration in the second, then two historical checkpoints without uniform exploration. Side 1 mirrors the exploration setting of each partition. Each partition balances player 0 and player 1 assignments. The historical checkpoints are `d` and `2d` cycles old, where `d` is the largest power of two at most half the current cycle, capped at 32. The current model generates policy and value targets for both perspectives; historical models only select moves. KLENT collects improved-policy targets and discounted action-value returns. `klent.policy_recalculation` optionally recomputes improved-policy targets for each minibatch. The loss uses `policy_loss_weight` and `q_loss_weight`.
+KLENT collects improved-policy targets and discounted action-value returns. `klent.policy_recalculation` optionally recomputes improved-policy targets for each minibatch. The loss uses `policy_loss_weight` and `q_loss_weight`.
+
+Set `klent.gradient_accumulation` to `true` to average gradients over every position in a cycle and take one AdamW step after all minibatches. The final partial minibatch is weighted by its valid positions. `false` keeps one optimizer step per minibatch. The setting can be changed when resuming; the checkpoint's optimizer state is retained.
 
 Each cycle tests the new model against the previous model, three score-gated anchors, and the fixed reference checkpoint. The thresholds are configured by `klent.anchor_thresholds`.
+
+To compare training-gradient directions from the cycle-55 `checkpoints/resume.pt` without updating its weights, run:
+
+```bash
+PYTHONPATH=python uv run --no-sync modal run -m klent.modal_train::gradient_comparison
+```
+
+The diagnostic collects two independently seeded arenas. It reports the mean gradient dot product, cosine similarity, and fraction of positive dot products between the arenas for effective batches of 2,048 through 32,768 perspectives. `--chunks 8` shortens the run. It loads only the current policy and action-value heads from the checkpoint; the source checkpoint is untouched.
 
 ## GPU and Modal
 

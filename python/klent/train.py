@@ -3,8 +3,6 @@ import argparse
 import copy
 import math
 import json
-import os
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -27,14 +25,14 @@ def validate(options):
             raise ValueError(f'klent.{key} must be a positive integer')
     if options['m'] < options['n']*MAX_PLY:
         raise ValueError('klent.m must be at least n*80')
-    if options['n'] % 8:
-        raise ValueError('klent.n must be divisible by eight for balanced opponent partitions')
     if options['test_games'] % 2:
         raise ValueError('test_games must be even for balanced sides')
     if options['train_minibatch'] % 2:
         raise ValueError('train_minibatch counts perspectives and must be even')
     if type(options['policy_recalculation']) is not bool:
         raise ValueError('klent.policy_recalculation must be a boolean')
+    if type(options['gradient_accumulation']) is not bool:
+        raise ValueError('klent.gradient_accumulation must be a boolean')
     for key in ('alpha','beta','exploration_fraction','lambda','lr','weight_decay',
                 'policy_loss_weight','q_loss_weight'):
         if not math.isfinite(options[key]) or options[key] < 0:
@@ -129,44 +127,6 @@ def evaluation_rows(games):
     return 2*slot + 1 - (new % 2), new
 
 
-def historical_cycles(cycle):
-    """Geometric opponents at distances d and 2d, up to 64 cycles old."""
-    if cycle < 1:
-        raise ValueError('cycle must be positive')
-    distance = min(32, 1 << (max(1, cycle//2).bit_length()-1))
-    return max(0, cycle-distance), max(0, cycle-2*distance)
-
-
-def historical_rows(games, quarter):
-    """Side-2 rows for one 256-game quarter of a 1024-game arena."""
-    if games % 8 or quarter not in (2, 3):
-        raise ValueError('historical partitions require a multiple of eight games')
-    slots = torch.arange(quarter*games//4, (quarter+1)*games//4)
-    return 2*slots + (slots >= (2*quarter+1)*games//8).long()
-
-
-def historical_file(directory, cycle):
-    name = 'cycle-000000-weights.pt' if cycle == 0 else f'cycle-{cycle:06d}.pt'
-    return Path(directory)/name
-
-
-def load_historical_window(resume, completed, model):
-    """Restore the CPU model snapshots needed for the next 64 cycles."""
-    recent = {completed: ModelHistory.snapshot(model)}
-    for cycle in range(max(0, completed-64), completed):
-        path = historical_file(Path(resume).parent, cycle)
-        if not path.is_file():
-            raise FileNotFoundError(f'Missing historical opponent for resume: {path}')
-        saved = torch.load(path, map_location='cpu', weights_only=True)
-        if cycle and saved.get('summary', {}).get('cycle') != cycle:
-            raise ValueError(f'Historical checkpoint has the wrong cycle: {path}')
-        weights = saved if cycle == 0 else saved['model']
-        if any(t.is_floating_point() and t.dtype != torch.float32 for t in weights.values()):
-            raise ValueError(f'Historical opponent requires FP32 weights: {path}')
-        recent[cycle] = {name: weights[name] for name in model.state_dict()}
-    return recent
-
-
 class ModelHistory:
     """Keep the previous model and three score-gated moving anchors."""
     def __init__(self, thresholds=(0.70, 0.80, 0.90), anchors=()):
@@ -178,7 +138,7 @@ class ModelHistory:
 
     @staticmethod
     def snapshot(model):
-        return {k: v.detach().cpu().clone() for k,v in model.state_dict().items()}
+        return {k: v.detach().clone() for k,v in model.state_dict().items()}
 
     def remember_previous(self, model, cycle):
         self.previous = (cycle, self.snapshot(model))
@@ -236,7 +196,7 @@ class Device:
         return first.elapsed_time(second) if self.cuda else (second-first)*1000
 
 
-def run(library, options=None, *, cycles=None, device='cuda', compile_model=True, checkpoint=None, resume=None, log_dir=None, history_dir=None):
+def run(library, options=None, *, cycles=None, device='cuda', compile_model=True, checkpoint=None, resume=None, log_dir=None):
     """cycles=0 runs until interrupted or the Modal function timeout expires."""
     run_start = perf_counter()
     options = dict(settings['klent'] if options is None else options)
@@ -273,7 +233,6 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     model = build_model(options['model']).to(device=device,dtype=torch.float32,
                                             memory_format=torch.channels_last)
     old = copy.deepcopy(model).eval().requires_grad_(False)
-    second_old = copy.deepcopy(model).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(),lr=options['lr'],weight_decay=options['weight_decay'])
     if restored is not None:
         load_core_weights(model, restored['model'])
@@ -295,7 +254,6 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     reference_model, reference_cycle = load_reference_model(reference_path, device)
     network = torch.compile(model,dynamic=False) if compile_model else model
     previous = torch.compile(old,dynamic=False) if compile_model else old
-    second_previous = torch.compile(second_old,dynamic=False) if compile_model else second_old
     reference_network = torch.compile(reference_model,dynamic=False) if compile_model else reference_model
     sq = torch.arange(80,device=device)
     indices = sq//8*16+2*(sq%8)+(sq//8%2)
@@ -347,40 +305,13 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                         torch_version=str(torch.__version__), compiled=compile_model)
         (log_dir/'run.json').write_text(json.dumps(metadata, indent=2)+'\n')
     output.setup(options, device, compile_model)
-    recent = (load_historical_window(resume, completed, model) if resume is not None
-              else {0: ModelHistory.snapshot(model)})
-    if history_dir is not None:
-        history_dir = Path(history_dir)
-        history_dir.mkdir(parents=True, exist_ok=True)
-        if resume is None:
-            path = historical_file(history_dir,0)
-            if path.exists():
-                raise FileExistsError(f'Refusing to overwrite initial historical model: {path}')
-            temporary = path.with_suffix('.pt.tmp')
-            torch.save(recent[0], temporary)
-            temporary.replace(path)
-        elif history_dir.resolve() != Path(resume).parent.resolve():
-            for cycle in range(max(0, completed-64), completed+1):
-                source = Path(resume) if cycle == completed else historical_file(Path(resume).parent, cycle)
-                target = historical_file(history_dir, cycle)
-                if target.exists():
-                    raise FileExistsError(f'Refusing to overwrite historical model: {target}')
-                try:
-                    os.link(source,target)
-                except OSError:
-                    shutil.copy2(source,target)
     with Arena(library, options, pinned=dev.cuda, seed=(options['seed']+completed)%(2**64)) as arena:
         output.emit(f'  Setup      {perf_counter()-run_start:.2f} s')
-        historical_indices = (historical_rows(arena.n,2),historical_rows(arena.n,3))
         model_time = cpu_time = 0.0
         arena_step = 0
         while cycles == 0 or completed < stop_cycle:
             if arena_step == 0:
                 cycle_start = perf_counter()
-                opponent_cycles = historical_cycles(completed+1)
-                for opponent_cycle, opponent_model in zip(opponent_cycles,(old,second_old)):
-                    if opponent_cycle != completed:
-                        load_core_weights(opponent_model,recent[opponent_cycle])
             arena_step += 1
             t = perf_counter()
             boards = arena.inputs()
@@ -389,16 +320,10 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             torch.compiler.cudagraph_mark_step_begin()
             dev.sync(); t = perf_counter()
             pi,q = infer(network,boards)
-            opponent_pi,opponent_q = pi.clone(),q.clone()
-            for selected, opponent_cycle, opponent_net in zip(
-                    historical_indices,opponent_cycles,(previous,second_previous)):
-                if opponent_cycle == completed:
-                    continue
-                opponent_pi[selected],opponent_q[selected] = infer(opponent_net,boards[selected])
             dev.sync(); model_ms = (perf_counter()-t)*1000
             model_time += model_ms/1000
             t = perf_counter()
-            full = arena.step(pi,q,opponent_pi,opponent_q)
+            full = arena.step(pi,q)
             if not full:
                 cpu_ms = (perf_counter()-t+encoding_time)*1000
                 cpu_time += cpu_ms/1000
@@ -414,12 +339,16 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             model.train()
             loss_sum = policy_sum = value_sum = 0.0
             timing_sum = [0.0, 0.0, 0.0]
+            accumulate = options['gradient_accumulation']
+            if accumulate:
+                optimizer.zero_grad(set_to_none=True)
             for start in range(0,count,batch.rows//2):
                 valid_positions = arena.batch(start,batch)
                 b,stored_target,actions,returns = dev.transfer(batch.tensors)
                 b = b.contiguous(memory_format=torch.channels_last)
                 valid = (rows < 2*valid_positions).float()
-                optimizer.zero_grad(set_to_none=True)
+                if not accumulate:
+                    optimizer.zero_grad(set_to_none=True)
                 torch.compiler.cudagraph_mark_step_begin()
                 forward_start = dev.stamp()
                 with torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
@@ -430,9 +359,13 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                     loss = (options['policy_loss_weight'] * policy_loss
                             + options['q_loss_weight'] * value_loss)
                 forward_end = dev.stamp()
-                loss.backward()
+                # Each minibatch loss is a mean over valid perspectives. Weight
+                # by its position count so the accumulated gradient is the mean
+                # over the whole cycle, including the final partial minibatch.
+                (loss * (valid_positions/count) if accumulate else loss).backward()
                 backward_end = dev.stamp()
-                optimizer.step()
+                if not accumulate:
+                    optimizer.step()
                 optimizer_end = dev.stamp()
                 dev.sync()
                 loss_value = loss.item()
@@ -445,6 +378,13 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 for j, (first, second) in enumerate(((forward_start,forward_end),
                         (forward_end,backward_end),(backward_end,optimizer_end))):
                     timing_sum[j] += dev.elapsed(first,second)
+            if accumulate:
+                optimizer_start = dev.stamp()
+                optimizer.step()
+                optimizer_end = dev.stamp()
+                dev.sync()
+                timing_sum[2] += dev.elapsed(optimizer_start,optimizer_end)
+            optimizer_steps = 1 if accumulate else batch_number
             arena.clear()
             dev.sync(); training_time = perf_counter()-training_start
             training_exclusive_time = training_time
@@ -486,17 +426,12 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             latest = evaluations[0]
             wins,draws,losses_count = (latest[k] for k in ('wins','draws','losses'))
             completed += 1
-            recent[completed] = ModelHistory.snapshot(model)
-            for old_cycle in list(recent):
-                if old_cycle < completed-64:
-                    del recent[old_cycle]
             if not history.anchors:
                 history.initialize_anchors(model, completed)
                 anchor_updates = []
             else:
                 anchor_updates = history.update_anchors(model, completed, evaluations)
             summary = dict(cycle=completed,evaluations=evaluations,states=count,dropped_states=dropped,loss=loss_sum/count,
-                           training_opponent_cycles=list(opponent_cycles),
                            anchor_cycles=[cycle for cycle,_ in history.anchors],
                            anchor_updates=anchor_updates,
                            model_seconds=model_time,cpu_seconds=cpu_total,
@@ -504,11 +439,12 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                            training_seconds=training_exclusive_time,
                            strength_test_seconds=test_time,wins=wins,draws=draws,losses=losses_count,
                            selfplay_steps=arena_step,batches=batch_number,
+                           optimizer_steps=optimizer_steps,
                            mean_cpu_ms=cpu_total*1000/arena_step,
                            mean_model_ms=model_time*1000/arena_step,
                            mean_forward_ms=timing_sum[0]/batch_number,
                            mean_backward_ms=timing_sum[1]/batch_number,
-                           mean_optimizer_ms=timing_sum[2]/batch_number,
+                           mean_optimizer_ms=timing_sum[2]/optimizer_steps,
                            policy_loss=policy_sum/count,q_loss=value_sum/count,
                            policy_loss_weight=options['policy_loss_weight'],
                            q_loss_weight=options['q_loss_weight'])
@@ -551,7 +487,7 @@ def main():
         path = save(directory,model,optimizer,options,summary,anchors)
         output.emit(f'Checkpoint saved: {path}')
     run(args.library,device=args.device,compile_model=not args.no_compile,
-        checkpoint=checkpoint,resume=args.resume,log_dir=log_dir,history_dir=directory)
+        checkpoint=checkpoint,resume=args.resume,log_dir=log_dir)
 
 
 if __name__ == '__main__':

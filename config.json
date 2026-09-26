@@ -4,7 +4,7 @@
     "width": 16
   },
   "modal": {
-    "gpu": "H100",
+    "gpu": "RTX-PRO-6000",
     "timeout": 1200
   },
   "klent": {
@@ -14,9 +14,10 @@
     "alpha": 0.001,
     "beta": 0.1,
     "exploration_fraction": 0.1,
-    "lambda": 0.9,
+    "lambda": 0.90,
     "train_minibatch": 2048,
-    "lr": 0.0001,
+    "gradient_accumulation": false,
+    "lr": 4e-07,
     "test_games": 1024,
     "reference_checkpoint": "checkpoints/349.pt",
     "anchor_thresholds": [0.92, 0.96, 0.98],

@@ -24,7 +24,7 @@ class Arena:
             'new': ([C.c_size_t]*2+[C.c_float]*4+[C.c_uint64,C.c_bool], C.c_void_p),
             'free': ([C.c_void_p], None),
             'inputs': ([C.c_void_p]*2, C.c_int),
-            'step': ([C.c_void_p]*5, C.c_int),
+            'step': ([C.c_void_p]*3, C.c_int),
             'stats': ([C.c_void_p]*2, None),
             'reset': ([C.c_void_p], C.c_size_t),
             'shuffle': ([C.c_void_p], None),
@@ -46,16 +46,11 @@ class Arena:
         check(self.lib.klent_inputs(self.handle,self.boards.data_ptr()))
         return self.boards
 
-    def step(self, logits, q, opponent_logits=None, opponent_q=None):
-        if opponent_logits is None:
-            opponent_logits = logits
-        if opponent_q is None:
-            opponent_q = q
-        for value in (logits,q,opponent_logits,opponent_q):
+    def step(self, logits, q):
+        for value in (logits,q):
             if value.device.type != 'cpu' or value.dtype != torch.float32 or not value.is_contiguous() or value.shape != (2*self.n,80):
                 raise ValueError('native outputs must be contiguous CPU float32 [2*n,80]')
-        return bool(check(self.lib.klent_step(self.handle,logits.data_ptr(),q.data_ptr(),
-                                              opponent_logits.data_ptr(),opponent_q.data_ptr())))
+        return bool(check(self.lib.klent_step(self.handle,logits.data_ptr(),q.data_ptr())))
 
     def stats(self):
         values = (C.c_size_t*4)()
