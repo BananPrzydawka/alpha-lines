@@ -1,4 +1,4 @@
-"""KataGo-inspired nested bottlenecks with spatial action and score heads.
+"""KataGo-inspired nested bottlenecks with spatial policy and value heads.
 
 Uses our GroupNorm, SiLU, and outer squeeze-excitation, not a full reproduction
 of KataGo's normalization, global pooling, heads, or training recipe.
@@ -7,7 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from config import settings
-from models.common import group_norm, spatial_head, categorical_score_head, prepare_inputs
+from models.common import group_norm, spatial_head, prepare_inputs
 
 
 class InnerResidualBlock(nn.Module):
@@ -58,10 +58,7 @@ class NestedBottleneck(nn.Module):
 
 
 class KataGoNet(nn.Module):
-    """forward(board) -> policy, values, mark/score heads, and opponent policy.
-
-    Score logits are ordered current player then opponent. Outputs are unbounded.
-    """
+    """Predict policy and action value on the board grid."""
     def __init__(self, options=None, inner_block_factory=InnerResidualBlock):
         super().__init__()
         options = settings["katago_model"] if options is None else options
@@ -78,21 +75,11 @@ class KataGoNet(nn.Module):
             for _ in range(options["blocks"])
         ))
         self.policy_head = spatial_head(channels, options["policy_filters"], norm)
-        self.opponent_policy_head = spatial_head(channels, options["opponent_policy_filters"], norm)
         self.action_value_head = spatial_head(channels, options["action_value_filters"], norm)
-        self.mark_class_head = spatial_head(channels, options.get("mark_class_filters", options["action_value_filters"]), norm, 6)
-        self.discounted_mark_head = spatial_head(channels, options.get("discounted_mark_filters", options["action_value_filters"]), norm, 8)
-        self.immediate_score_head = categorical_score_head(channels, options.get("immediate_score_filters", 32), norm)
-        self.discounted_score_head = categorical_score_head(channels, options.get("discounted_score_filters", 32), norm)
 
     def forward(self, board):
         board = prepare_inputs(board)
         features = F.silu(self.norm_input(self.conv_input(board)))
         features = self.tower(features)
         return (self.policy_head(features).squeeze(1),
-                self.action_value_head(features).squeeze(1),
-                self.mark_class_head(features),
-                self.immediate_score_head(features).reshape(-1, 2, 81),
-                self.discounted_score_head(features).reshape(-1, 2, 81),
-                self.discounted_mark_head(features),
-                self.opponent_policy_head(features).squeeze(1))
+                self.action_value_head(features).squeeze(1))

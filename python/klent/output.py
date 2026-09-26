@@ -9,16 +9,15 @@ def setup(options, device, compiled):
     emit('', 'KLENT  |  '+options['model']+'  |  FP32 weights + BF16 autocast  |  '+device,
          '  Compile    '+('default' if compiled else 'disabled'),
          f"  Arena      {options['n']:,} games   |   Buffer {options['m']:,} positions",
+         '  Training opponents: 1/4 current quiet, 1/4 current exploring, 1/4 checkpoint 1, 1/4 checkpoint 2',
          f"  Minibatch  {options['train_minibatch']:,} perspectives   |   One epoch",
          f"  Test       {options['test_games']:,} games   |   Seed {options['seed']}",
          f"  Anchors    score > {options['anchor_thresholds'][0]:.0%},"
          f" {options['anchor_thresholds'][1]:.0%}, {options['anchor_thresholds'][2]:.0%}",
          f"  Policy target {'minibatch recalculation' if options['policy_recalculation'] else 'stored self-play'}",
          f"  Reference  {options['reference_checkpoint']}",
-         f"  Alpha      {options['alpha']:g}   |   Beta {options['beta']:g}   |   Lambda {options['lambda']:.6f}"
-         f"   |   Score lambda {options['discounted_score_lambda']:.6f}",
+         f"  Alpha      {options['alpha']:g}   |   Beta {options['beta']:g}   |   Lambda {options['lambda']:.6f}",
          f"  Self-play uniform exploration {options['exploration_fraction']:.1%}",
-         f"  Discounted mark lambda {options['discounted_mark_lambda']:.6f}",
          f"  Optimizer  {options['optimizer']}   |   LR {options['lr']:g}   |   Decay {options['weight_decay']:g}")
     if compiled:
         emit('  Timings include compilation on first use.')
@@ -28,16 +27,12 @@ def summary(row, timing):
     loss_lines = []
     for label, loss_key, weight_key in (
         ('Policy', 'policy_loss', 'policy_loss_weight'),
-        ('Opponent policy', 'opponent_policy_loss', 'opponent_policy_weight'),
         ('Action value', 'q_loss', 'q_loss_weight'),
-        ('Mark', 'mark_class_loss', 'mark_class_loss_weight'),
-        ('Future mark', 'discounted_mark_loss', 'discounted_mark_weight'),
-        ('Score', 'immediate_score_loss', 'immediate_score_weight'),
-        ('Future score', 'discounted_score_loss', 'discounted_score_weight'),
     ):
         raw, weight = row[loss_key], row[weight_key]
         loss_lines.append(f'    {label:<16}{raw:>8.4f} × {weight} = {raw*weight:.4f}')
     lines = ['', f"Cycle {row['cycle']} complete", '-'*43,
+         f"  Training opponents  cycles {row['training_opponent_cycles'][0]}, {row['training_opponent_cycles'][1]}",
          f"  Positions     {row['states']:>12,}",
          f"  Dropped       {row['dropped_states']:>12,}",
          f"  Mean loss     {row['loss']:>12.4f}",

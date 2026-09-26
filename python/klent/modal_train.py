@@ -35,7 +35,7 @@ def train(smoke: bool = False):
         volume.commit()
         print(f'Checkpoint saved: {path}', flush=True)
     return run('/root/rust/target/release/libalpha_lines_game.so',options,
-               checkpoint=checkpoint,log_dir=directory)
+               checkpoint=checkpoint,log_dir=directory,history_dir=directory)
 
 
 @app.local_entrypoint()

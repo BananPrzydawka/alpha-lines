@@ -1,4 +1,4 @@
-"""Contracts for spatial action models and their shared score head."""
+"""Contracts for policy and action-value models."""
 import copy
 import unittest
 from unittest.mock import patch
@@ -20,15 +20,12 @@ class ActionModelTests(unittest.TestCase):
 
     def test_outputs_shared_gradients_and_compile(self):
         conv = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
-                    policy_filters=4,opponent_policy_filters=4,action_value_filters=4,
-                    mark_class_filters=4,discounted_mark_filters=4,
-                    immediate_score_filters=4,discounted_score_filters=4)
+                    policy_filters=4,action_value_filters=4)
         configs = (
             ('katago',KataGoNet,conv),
             ('katago_tf',KataGoTFNet,dict(conv,attention_heads=2,mlp_ratio=2)),
             ('resnet',ResNet,conv),
-            ('maia',MaiaNet,dict(dim=16,layers=1,head_dim=8,mlp_ratio=2,gab_dim=4,
-                                  score_head=dict(square_features=4,hidden_dim=8))),
+            ('maia',MaiaNet,dict(dim=16,layers=1,head_dim=8,mlp_ratio=2,gab_dim=4)),
         )
         for name,model_class,options in configs:
             with self.subTest(model=model_class.__name__):
@@ -37,21 +34,12 @@ class ActionModelTests(unittest.TestCase):
                 board = torch.randn(2, 5, 10, 16)
                 outputs = net(board)
                 for i, output in enumerate(outputs):
-                    self.assertEqual(output.shape, [(2, 10, 16), (2, 10, 16),
-                                                    (2, 6, 10, 16), (2, 2, 81), (2, 2, 81),
-                                                    (2, 8, 10, 16), (2, 10, 16)][i])
+                    self.assertEqual(output.shape, [(2, 10, 16), (2, 10, 16)][i])
                     self.assertTrue(torch.isfinite(output).all())
                 sum(x.square().mean() for x in outputs).backward()
                 for name, parameter in net.named_parameters():
                     self.assertIsNotNone(parameter.grad, name)
                     self.assertTrue(torch.isfinite(parameter.grad).all(), name)
-                net.zero_grad(set_to_none=True)
-                net(board)[3].square().mean().backward()
-                shared = net.layers if isinstance(net,MaiaNet) else net.tower
-                self.assertGreater(next(shared.parameters()).grad.abs().sum(), 0)
-                net.zero_grad(set_to_none=True)
-                net(board)[4].square().mean().backward()
-                self.assertGreater(next(shared.parameters()).grad.abs().sum(), 0)
                 net.eval()
                 alone = net(board[0])
                 for full, single in zip(outputs, alone):
@@ -74,8 +62,7 @@ class ActionModelTests(unittest.TestCase):
                                 for inner in outer.inner_blocks))
 
     def test_maia_uses_only_playable_squares_and_zero_fills_other_outputs(self):
-        options = dict(dim=16,layers=1,head_dim=8,mlp_ratio=2,gab_dim=4,
-                       score_head=dict(square_features=4,hidden_dim=8))
+        options = dict(dim=16,layers=1,head_dim=8,mlp_ratio=2,gab_dim=4)
         net = MaiaNet(options).eval()
         board = torch.randn(2,5,10,16)
         invalid = torch.ones(160,dtype=torch.bool)
@@ -87,12 +74,11 @@ class ActionModelTests(unittest.TestCase):
             changed_outputs = net(changed.reshape_as(board))
         for original, altered in zip(original_outputs, changed_outputs):
             torch.testing.assert_close(original,altered)
-        for output in (original_outputs[i] for i in (0,1,2,5,6)):
+        for output in original_outputs:
             self.assertEqual(output.reshape(output.shape[0],-1,160)[:,:,invalid].count_nonzero().item(),0)
 
     def test_maia_big_version_uses_learned_gab_input_compression(self):
-        options = dict(dim=16,layers=1,head_dim=8,mlp_ratio=2,gab_dim=8,
-                       score_head=dict(square_features=4,hidden_dim=8))
+        options = dict(dim=16,layers=1,head_dim=8,mlp_ratio=2,gab_dim=8)
         small = MaiaNet(dict(options,maia_big_version=False))
         big = MaiaNet(dict(options,maia_big_version=True))
         self.assertIsNone(small.layers[0].gab_input)

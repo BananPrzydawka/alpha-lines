@@ -17,8 +17,7 @@ board_size = height * width
 for name in ("katago_model", "katago_tf_model", "resnet_model"):
     options = settings[name]
     for key in ("filters", "blocks", "se_hidden",
-                "policy_filters", "opponent_policy_filters", "action_value_filters", "mark_class_filters", "immediate_score_filters",
-                "discounted_score_filters", "discounted_mark_filters"):
+                "policy_filters", "action_value_filters"):
         if type(options[key]) is not int or options[key] < 1:
             raise ValueError(f"{name}.{key} must be a positive integer")
     norm = options["group_norm"]
@@ -44,6 +43,3 @@ for key in ("dim", "layers", "head_dim", "mlp_ratio", "gab_dim"):
         raise ValueError(f"maia_model.{key} must be a positive integer")
 if maia["dim"] % maia["head_dim"]:
     raise ValueError("maia_model.head_dim must divide dim")
-for key in ("square_features", "hidden_dim"):
-    if type(maia["score_head"][key]) is not int or maia["score_head"][key] < 1:
-        raise ValueError(f"maia_model.score_head.{key} must be a positive integer")

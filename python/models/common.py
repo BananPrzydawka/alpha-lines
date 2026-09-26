@@ -18,21 +18,6 @@ def spatial_head(channels, hidden, norm, outputs=1):
     )
 
 
-def categorical_score_head(channels, hidden, norm):
-    """Predict a categorical score distribution from the shared residual tower."""
-    return nn.Sequential(
-        nn.Conv2d(channels, hidden, 3, padding=1, bias=False),
-        group_norm(hidden, norm),
-        nn.SiLU(),
-        nn.Conv2d(hidden, hidden, 3, padding=1, bias=False),
-        group_norm(hidden, norm),
-        nn.SiLU(),
-        nn.AdaptiveAvgPool2d((5, 8)),
-        nn.Flatten(),
-        nn.Linear(hidden * 5 * 8, 2 * 81),
-    )
-
-
 def prepare_inputs(board):
     if board.dim() == 3:
         board = board.unsqueeze(0)

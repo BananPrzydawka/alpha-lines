@@ -4,14 +4,13 @@ import io
 import json
 import unittest
 import tempfile
-from collections import OrderedDict
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
 from config import settings
 from klent.native import Arena, Batch
-from klent.train import losses, recalculated_policy, opponent_policy_loss, run, validate, evaluation_rows, ModelHistory, load_reference_model, mark_class_targets, mark_class_loss, discounted_mark_targets, discounted_mark_loss, immediate_score_loss, discounted_score_loss, restore_optimizer
+from klent.train import losses, recalculated_policy, run, validate, evaluation_rows, historical_cycles, historical_rows, ModelHistory, load_reference_model, restore_optimizer
 from models.katago import KataGoNet
 
 LIBRARY = Path(__file__).resolve().parents[2]/'rust/target/release/libalpha_lines_game.so'
@@ -34,7 +33,7 @@ class KlentTests(unittest.TestCase):
 
     def setUp(self):
         torch.set_num_threads(1)
-        self.options = dict(settings['klent'],n=2,m=320,train_minibatch=30,test_games=4,
+        self.options = dict(settings['klent'],n=8,m=1280,train_minibatch=30,test_games=4,
                             reference_checkpoint=str(self.reference_path))
 
     def test_reference_uses_its_saved_architecture(self):
@@ -81,7 +80,7 @@ class KlentTests(unittest.TestCase):
     def test_recalculated_policy_runs_a_training_cycle(self):
         small = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
                      policy_filters=4,action_value_filters=4)
-        options = dict(self.options,n=2,m=160,train_minibatch=40,test_games=2,
+        options = dict(self.options,n=8,m=640,train_minibatch=40,test_games=2,
                        policy_recalculation=True)
         with patch.dict(settings,{'katago_model':small}), \
                 contextlib.redirect_stdout(io.StringIO()), \
@@ -90,83 +89,9 @@ class KlentTests(unittest.TestCase):
         self.assertGreater(summary['states'],0)
         self.assertTrue(torch.isfinite(torch.tensor(summary['policy_loss'])))
 
-    def test_opponent_policy_loss_swaps_paired_targets_and_ignores_padding(self):
-        target = torch.zeros(4,160)
-        target[0,2],target[1,4] = 1,1
-        logits = torch.zeros(4,10,16,requires_grad=True)
-        with torch.no_grad():
-            logits[0,0,4] = 6
-            logits[1,0,2] = 6
-        loss = opponent_policy_loss(logits,target,torch.tensor([1.,1.,0.,0.]))
-        own_targets = target.reshape(-1,2,160).flip(1).reshape(-1,160)
-        wrong = opponent_policy_loss(logits,own_targets,torch.tensor([1.,1.,0.,0.]))
-        self.assertLess(loss.item(),wrong.item())
-        loss.backward()
-        self.assertLess(logits.grad[0,0,4].item(),0)
-        self.assertLess(logits.grad[1,0,2].item(),0)
-        self.assertEqual(logits.grad[2:].count_nonzero().item(),0)
-
-    def test_mark_class_targets_and_masked_loss(self):
-        indices = torch.arange(80)//8*16+2*(torch.arange(80)%8)+(torch.arange(80)//8%2)
-        classes = torch.full((2,80),-1,dtype=torch.int8)
-        classes[0,0],classes[0,1],classes[0,2] = 0,2,5
-        target = mark_class_targets(classes,indices)
-        self.assertEqual(target.shape,(2,6,10,16))
-        self.assertEqual(target[0,0,0,0].item(),1)
-        self.assertEqual(target[0,2,0,2].item(),1)
-        self.assertEqual(target[0,5,0,4].item(),1)
-        self.assertEqual(target.sum().item(),3)
-        logits = torch.zeros_like(target,requires_grad=True)
-        loss = mark_class_loss(logits,target,torch.tensor([1.,0.]))
-        loss.backward()
-        self.assertAlmostEqual(loss.item(),torch.tensor(6.).log().item())
-        self.assertEqual(logits.grad[1].count_nonzero().item(),0)
-        self.assertEqual(logits.grad[0,:,0,1].count_nonzero().item(),0)
-
-    def test_immediate_score_loss_both_players_and_padding(self):
-        logits = torch.zeros(3,2,81,requires_grad=True)
-        scores = torch.tensor([[0,80],[15,20],[80,80]])
-        valid = torch.tensor([1.,1.,0.])
-        loss = immediate_score_loss(logits,scores,valid)
-        self.assertAlmostEqual(loss.item(),torch.tensor(81.).log().item(),places=5)
-        loss.backward()
-        self.assertEqual(logits.grad[2].count_nonzero().item(),0)
-        self.assertLess(logits.grad[0,0,0].item(),0)
-        self.assertLess(logits.grad[0,1,80].item(),0)
-
-    def test_discounted_score_loss_uses_soft_targets_and_masks_padding(self):
-        logits = torch.zeros(2,2,81,requires_grad=True)
-        target = torch.zeros(2,2,81,dtype=torch.bfloat16)
-        target[0,0,2],target[0,0,5] = 0.25,0.75
-        target[0,1,7] = 1
-        loss = discounted_score_loss(logits,target,torch.tensor([1.,0.]))
-        self.assertAlmostEqual(loss.item(),torch.tensor(81.).log().item(),places=5)
-        loss.backward()
-        self.assertEqual(logits.grad[1].count_nonzero().item(),0)
-        self.assertLess(logits.grad[0,0,5].item(),logits.grad[0,0,2].item())
-
-    def test_discounted_mark_head_uses_eight_soft_classes_on_playable_squares(self):
-        indices = torch.arange(80)//8*16+2*(torch.arange(80)%8)+(torch.arange(80)//8%2)
-        distributions = torch.zeros(2,80,8,dtype=torch.bfloat16)
-        distributions[0,:,7] = 1
-        distributions[0,0,7] = 0.25
-        distributions[0,0,6] = 0.75
-        target = discounted_mark_targets(distributions,indices)
-        self.assertEqual(target.shape,(2,8,10,16))
-        self.assertEqual(target[0,6,0,0].item(),0.75)
-        self.assertEqual(target[0,7,0,0].item(),0.25)
-        self.assertEqual(target[0,:,0,1].count_nonzero().item(),0)
-        logits = torch.zeros_like(target,requires_grad=True)
-        loss = discounted_mark_loss(logits,target,torch.tensor([1.,0.]))
-        self.assertAlmostEqual(loss.item(),torch.tensor(8.).log().item(),places=5)
-        loss.backward()
-        self.assertEqual(logits.grad[1].count_nonzero().item(),0)
-        self.assertEqual(logits.grad[0,:,0,1].count_nonzero().item(),0)
-        self.assertLess(logits.grad[0,6,0,0].item(),logits.grad[0,7,0,0].item())
-
     def test_native_batch_reproducibility_and_perspectives(self):
         with Arena(LIBRARY,self.options) as a, Arena(LIBRARY,self.options) as other:
-            pi = torch.zeros(4,80)
+            pi = torch.zeros(16,80)
             for _ in range(160):
                 ab = a.inputs()
                 bb = other.inputs()
@@ -182,36 +107,12 @@ class KlentTests(unittest.TestCase):
             for start in range(0,count,15):
                 size = a.batch(start,batch)
                 seen += size
-                b,s,target,actions,returns,classes,discounted,discounted_marks = batch.tensors
+                b,target,actions,returns = batch.tensors
                 torch.testing.assert_close(b[0:2*size:2,3],b[1:2*size:2,4])
-                torch.testing.assert_close(s[:2*size:2],s[1:2*size:2].flip(1))
                 torch.testing.assert_close(target[:2*size].float().sum(1),torch.ones(2*size),atol=.004,rtol=0)
                 self.assertTrue((target[:2*size].gather(1,actions[:2*size,None])>0).all())
                 self.assertEqual(b[2*size:].count_nonzero().item(),0)
                 self.assertEqual(target[2*size:].count_nonzero().item(),0)
-                self.assertTrue((classes[2*size:] == -1).all())
-                self.assertEqual(discounted[2*size:].count_nonzero().item(),0)
-                self.assertEqual(discounted_marks[2*size:].count_nonzero().item(),0)
-                torch.testing.assert_close(discounted[:2*size].float().sum(-1),
-                    torch.ones(2*size,2),atol=.025,rtol=0)
-                torch.testing.assert_close(discounted[0:2*size:2,0],discounted[1:2*size:2,1])
-                torch.testing.assert_close(discounted[0:2*size:2,1],discounted[1:2*size:2,0])
-                torch.testing.assert_close(discounted_marks[:2*size].float().sum(-1),
-                    torch.ones(2*size,80),atol=.025,rtol=0)
-                for class_id in range(6):
-                    torch.testing.assert_close(discounted_marks[0:2*size:2,:,class_id],
-                        discounted_marks[1:2*size:2,:,(class_id+3)%6])
-                torch.testing.assert_close(discounted_marks[0:2*size:2,:,6:],
-                    discounted_marks[1:2*size:2,:,6:])
-                self.assertTrue(((classes[:2*size] >= -1) & (classes[:2*size] <= 5)).all())
-                swapped = classes[1:2*size:2]
-                own = classes[:2*size:2]
-                torch.testing.assert_close(swapped,torch.where(own < 0,own,(own+3)%6))
-                for row in range(2*size):
-                    # Class 2 contributes two points, class 1 one, class 0 none.
-                    own_score = sum(int(c) for c in classes[row].tolist() if 0 <= c < 3)
-                    opponent_score = sum(int(c)-3 for c in classes[row].tolist() if 3 <= c < 6)
-                    self.assertEqual((own_score,opponent_score),tuple(int(x) for x in s[row]))
             self.assertEqual(seen,count)
             a.reset(); a.clear()
             self.assertEqual(a.stats().positions,0)
@@ -226,17 +127,13 @@ class KlentTests(unittest.TestCase):
             with patch.dict(settings,{key:small}),contextlib.redirect_stdout(report), torch.backends.mkldnn.flags(enabled=False):
                 summaries = run(LIBRARY,options,cycles=2,device='cpu',compile_model=False)
             self.assertEqual(len(summaries),2)
+            self.assertEqual([s['training_opponent_cycles'] for s in summaries],[[0,0],[1,0]])
             self.assertEqual(report.getvalue().count(' complete\n'),2)
             for label in ('Setup', 'Total', 'CPU', 'Model self play', 'Model training', 'Strength test', 'Other'):
                 expected = 1 if label == 'Setup' else 2
                 self.assertEqual(sum(line.strip().startswith(label+' ') for line in report.getvalue().splitlines()),expected)
             for label, weight in (('Policy',self.options['policy_loss_weight']),
-                                  ('Opponent policy',self.options['opponent_policy_weight']),
-                                  ('Action value',self.options['q_loss_weight']),
-                                  ('Mark',self.options['mark_class_loss_weight']),
-                                  ('Future mark',self.options['discounted_mark_weight']),
-                                  ('Score',self.options['immediate_score_weight']),
-                                  ('Future score',self.options['discounted_score_weight'])):
+                                  ('Action value',self.options['q_loss_weight'])):
                 lines = [line for line in report.getvalue().splitlines()
                          if line.startswith(f'    {label} ')]
                 self.assertEqual(len(lines),2)
@@ -257,22 +154,12 @@ class KlentTests(unittest.TestCase):
                 self.assertGreater(summary['states'],0)
                 self.assertGreater(summary['loss'],0)
                 self.assertGreaterEqual(summary['shuffle_seconds'],0)
-                self.assertGreaterEqual(summary['scoring_head_processing_seconds'],0)
                 self.assertGreaterEqual(summary['cpu_seconds'],
-                                        summary['shuffle_seconds']+summary['scoring_head_processing_seconds'])
-                self.assertGreaterEqual(summary['mark_class_loss'],0)
-                self.assertGreater(summary['immediate_score_loss'],0)
-                self.assertGreater(summary['discounted_score_loss'],0)
-                self.assertGreater(summary['discounted_mark_loss'],0)
-                self.assertGreater(summary['opponent_policy_loss'],0)
+                                        summary['shuffle_seconds'])
                 self.assertAlmostEqual(summary['loss'],
                     summary['policy_loss_weight']*summary['policy_loss']+
-                    summary['opponent_policy_weight']*summary['opponent_policy_loss']+
-                    summary['q_loss_weight']*summary['q_loss']+
-                    summary['mark_class_loss_weight']*summary['mark_class_loss']+
-                    summary['immediate_score_weight']*summary['immediate_score_loss']+
-                    summary['discounted_score_weight']*summary['discounted_score_loss']+
-                    summary['discounted_mark_weight']*summary['discounted_mark_loss'],places=4)
+                    summary['q_loss_weight']*summary['q_loss'],places=4)
+
 
     def test_history_is_independent_bounded_and_correctly_aged(self):
         model = torch.nn.Linear(1,1)
@@ -326,26 +213,24 @@ class KlentTests(unittest.TestCase):
     def test_new_architectures_train_checkpoint_and_resume(self):
         from klent.checkpoint import save
         conv = dict(settings['resnet_model'],filters=8,blocks=1,se_hidden=4,
-                    policy_filters=4,opponent_policy_filters=4,action_value_filters=4,
-                    mark_class_filters=4,discounted_mark_filters=4,
-                    immediate_score_filters=4,discounted_score_filters=4)
+                    policy_filters=4,action_value_filters=4)
         configurations = {
             'resnet': conv,
             'katago_tf': dict(conv,attention_heads=2,mlp_ratio=2),
             'maia': dict(dim=16,layers=1,head_dim=8,mlp_ratio=2,gab_dim=4,
-                         maia_big_version=True,
-                         score_head=dict(square_features=4,hidden_dim=8)),
+                         maia_big_version=True),
         }
         for name, configuration in configurations.items():
             with self.subTest(model=name), tempfile.TemporaryDirectory() as directory, \
                     patch.dict(settings,{f'{name}_model':configuration}), \
                     contextlib.redirect_stdout(io.StringIO()), \
                     torch.backends.mkldnn.flags(enabled=False):
-                options = dict(self.options,model=name,n=2,m=160,train_minibatch=40,test_games=2)
+                options = dict(self.options,model=name,n=8,m=640,train_minibatch=40,test_games=2)
                 first_dir = Path(directory)/'first'
                 first = run(LIBRARY,options,cycles=1,device='cpu',compile_model=False,
                             checkpoint=lambda model,optimizer,o,summary,anchors:
-                                save(first_dir,model,optimizer,o,summary,anchors))[0]
+                                save(first_dir,model,optimizer,o,summary,anchors),
+                            history_dir=first_dir)[0]
                 path = first_dir/'cycle-000001.pt'
                 saved = torch.load(path,weights_only=True)
                 self.assertEqual(saved['model_config'],configuration)
@@ -356,6 +241,10 @@ class KlentTests(unittest.TestCase):
                 self.assertEqual(second['cycle'],2)
                 self.assertEqual([r['kind'] for r in second['evaluations']],
                                  ['previous','anchor','anchor','anchor','reference'])
+                if name == 'resnet':
+                    (first_dir/'cycle-000000-weights.pt').unlink()
+                    with self.assertRaisesRegex(FileNotFoundError,'Missing historical opponent'):
+                        run(LIBRARY,options,cycles=1,device='cpu',compile_model=False,resume=path)
 
     def test_resume_restores_architecture_but_uses_current_training_settings(self):
         from klent.checkpoint import save
@@ -365,12 +254,13 @@ class KlentTests(unittest.TestCase):
             def checkpoint(model,optimizer,options,summary,anchors):
                 save(directory,model,optimizer,options,summary,anchors)
             run(LIBRARY,dict(self.options,model='katago'),cycles=1,device='cpu',
-                compile_model=False,checkpoint=checkpoint)
+                compile_model=False,checkpoint=checkpoint,history_dir=directory)
             path = Path(directory)/'cycle-000001.pt'
             bootstrap = run(LIBRARY,dict(self.options,model='katago'),cycles=1,
                             device='cpu',compile_model=False,resume=path,
                             checkpoint=lambda model,optimizer,options,summary,anchors:
-                                save(Path(directory)/'bootstrap',model,optimizer,options,summary,anchors))
+                                save(Path(directory)/'bootstrap',model,optimizer,options,summary,anchors),
+                            history_dir=Path(directory)/'bootstrap')
             self.assertEqual([(r['kind'],r['opponent_cycle'])
                               for r in bootstrap[0]['evaluations']],
                              [('previous',1)]+[('anchor',1)]*3+[('reference',349)])
@@ -386,11 +276,10 @@ class KlentTests(unittest.TestCase):
                              [cycle for cycle,_ in bootstrapped['anchors']])
             # Change architecture defaults and runtime settings independently.
             settings['katago_model'] = dict(small, filters=16, blocks=2)
-            current = dict(self.options,model='katago',cycles=1,n=3,m=480,
+            current = dict(self.options,model='katago',cycles=1,n=8,m=640,
                            train_minibatch=40,test_games=6,lr=0.001,
                            weight_decay=0.02,alpha=0.04,beta=0.2,
-                           **{'lambda':0.8,'discounted_score_lambda':0.7,
-                              'discounted_mark_lambda':0.6,'seed':7})
+                           **{'lambda':0.8,'seed':7})
             results = run(LIBRARY,current,
                           device='cpu',compile_model=False,resume=path,
                           checkpoint=checkpoint,log_dir=Path(directory)/'logs')
@@ -430,59 +319,25 @@ class KlentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'FP32 checkpoint'):
                 run(LIBRARY, self.options, cycles=1, device='cpu', compile_model=False, resume=path)
 
-    def test_resume_adds_head_to_legacy_checkpoint(self):
+    def test_resume_drops_legacy_auxiliary_heads(self):
         from models.katago import KataGoNet
         small = dict(settings['katago_model'],filters=8,blocks=1,se_hidden=4,
                      policy_filters=4,action_value_filters=4)
-        with tempfile.TemporaryDirectory() as directory, patch.dict(settings,{'katago_model':small}), contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
-            for has_mark_head, has_immediate_head in ((False,False),(True,False),(True,True)):
-                with self.subTest(has_mark_head=has_mark_head,has_immediate_head=has_immediate_head):
-                    legacy = KataGoNet()
-                    if not has_immediate_head:
-                        legacy.score_embed = torch.nn.Sequential(torch.nn.Linear(2,8),torch.nn.SiLU(),torch.nn.Linear(8,8))
-                        modules = list(legacy._modules.items())
-                        legacy._modules = OrderedDict(modules[:2]+[modules[-1]]+modules[2:-1])
-                    def retained(name):
-                        return not (name.startswith('discounted_score_head.') or
-                                    name.startswith('discounted_mark_head.') or
-                                    name.startswith('opponent_policy_head.') or
-                                    (not has_immediate_head and name.startswith('immediate_score_head.')) or
-                                    (not has_mark_head and name.startswith('mark_class_head.')))
-                    optimizer = torch.optim.AdamW(p for name,p in legacy.named_parameters()
-                                                   if retained(name))
-                    board = torch.zeros(2,5,10,16)
-                    scores = torch.zeros(2,2)
-                    pi,q,mark,immediate,_,_,_ = legacy(board)
-                    loss = pi.square().mean()+q.square().mean()
-                    if not has_immediate_head:
-                        loss = loss+legacy.score_embed(scores).square().mean()
-                    else:
-                        loss = loss+immediate.square().mean()
-                    if has_mark_head:
-                        loss = loss+mark.square().mean()
-                    loss.backward()
-                    optimizer.step()
-                    path = Path(directory)/f'legacy-{has_mark_head}-{has_immediate_head}.pt'
-                    old_weights = {k:v for k,v in legacy.state_dict().items()
-                                   if retained(k)}
-                    current = KataGoNet()
-                    current.load_state_dict(old_weights,strict=False)
-                    migrated = torch.optim.AdamW(current.parameters())
-                    restore_optimizer(migrated,optimizer.state_dict(),old_weights,current)
-                    old_tower = dict(legacy.named_parameters())['tower.0.reduce.weight']
-                    new_tower = dict(current.named_parameters())['tower.0.reduce.weight']
-                    torch.testing.assert_close(migrated.state[new_tower]['exp_avg'],optimizer.state[old_tower]['exp_avg'])
-                    torch.save(dict(format_version=1,model=old_weights,optimizer=optimizer.state_dict(),
-                                    options=dict(self.options,model='katago'),model_config=small,
-                                    summary=dict(cycle=1),torch_rng=torch.get_rng_state(),cuda_rng=[]),path)
-                    results = run(LIBRARY,dict(self.options,model='katago'),cycles=1,
-                                  device='cpu',compile_model=False,resume=path)
-                    self.assertEqual(results[0]['cycle'],2)
-                    self.assertGreater(results[0]['mark_class_loss'],0)
-                    self.assertGreater(results[0]['immediate_score_loss'],0)
-                    self.assertGreater(results[0]['discounted_score_loss'],0)
-                    self.assertGreater(results[0]['discounted_mark_loss'],0)
-                    self.assertGreater(results[0]['opponent_policy_loss'],0)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(settings,{'katago_model':small}), \
+                contextlib.redirect_stdout(io.StringIO()), torch.backends.mkldnn.flags(enabled=False):
+            legacy = KataGoNet()
+            legacy.mark_class_head = torch.nn.Conv2d(8,6,1)
+            optimizer = torch.optim.AdamW(legacy.parameters())
+            pi,q = legacy(torch.zeros(2,5,10,16))
+            (pi.square().mean()+q.square().mean()).backward()
+            optimizer.step()
+            path = Path(directory)/'legacy.pt'
+            torch.save(dict(format_version=1,model=legacy.state_dict(),optimizer=optimizer.state_dict(),
+                            options=dict(self.options,model='katago'),model_config=small,
+                            summary=dict(cycle=0),torch_rng=torch.get_rng_state(),cuda_rng=[]),path)
+            result = run(LIBRARY,dict(self.options,model='katago'),cycles=1,
+                         device='cpu',compile_model=False,resume=path)
+            self.assertEqual(result[0]['cycle'],1)
 
     def test_balanced_assignment(self):
         old,new = evaluation_rows(8)
@@ -494,6 +349,16 @@ class KlentTests(unittest.TestCase):
         output[old],output[new] = 10.,20.
         self.assertEqual(output.reshape(8,2)[:4].tolist(),[[10.,20.]]*4)
         self.assertEqual(output.reshape(8,2)[4:].tolist(),[[20.,10.]]*4)
+
+    def test_geometric_training_opponents_and_side_assignment(self):
+        expected = {1:(0,0),2:(1,0),3:(2,1),4:(2,0),5:(3,1),
+                    6:(4,2),7:(5,3),8:(4,0),48:(32,16),
+                    104:(72,40),204:(172,140)}
+        self.assertEqual({cycle:historical_cycles(cycle) for cycle in expected},expected)
+        self.assertEqual(historical_rows(1024,2).tolist(),
+                         [2*i+(i>=640) for i in range(512,768)])
+        self.assertEqual(historical_rows(1024,3).tolist(),
+                         [2*i+(i>=896) for i in range(768,1024)])
 
     def test_checkpoint_roundtrip(self):
         from klent.checkpoint import save
@@ -519,13 +384,10 @@ class KlentTests(unittest.TestCase):
 
     def test_validation(self):
         validate(self.options)
-        for override in ({'train_minibatch':3},{'test_games':3},{'m':1},{'lambda':1.1},{'alpha':0,'beta':0},
+        for override in ({'train_minibatch':3},{'test_games':3},{'m':1},{'n':9},{'lambda':1.1},{'alpha':0,'beta':0},
                          {'exploration_fraction':-0.1},{'exploration_fraction':1.1},
                          {'policy_loss_weight':-1},{'q_loss_weight':float('nan')},
-                         {'mark_class_loss_weight':float('inf')},{'immediate_score_weight':-1},
-                         {'discounted_score_weight':-1},{'discounted_score_lambda':1.1},
-                         {'discounted_mark_weight':-1},{'discounted_mark_lambda':1.1},
-                         {'opponent_policy_weight':-1},{'model':'unknown'},
+                         {'model':'unknown'},
                          {'reference_checkpoint':''},{'policy_recalculation':1},
                          {'anchor_thresholds':[0.7,0.8]},
                          {'anchor_thresholds':[0.7,float('nan'),0.9]},

@@ -1,4 +1,4 @@
-"""Maia-style square-token encoder adapted to the KLENT seven-head interface."""
+"""Maia-style square-token encoder for policy and action value."""
 
 import torch
 from torch import nn
@@ -76,26 +76,10 @@ class MaiaNet(nn.Module):
         ])
         self.policy_head = self.square_head(dim,1)
         self.action_value_head = self.square_head(dim,1)
-        self.mark_class_head = self.square_head(dim,6)
-        self.discounted_mark_head = self.square_head(dim,8)
-        self.opponent_policy_head = self.square_head(dim,1)
-        self.immediate_score_head = self.score_head(dim,options['score_head'])
-        self.discounted_score_head = self.score_head(dim,options['score_head'])
 
     @staticmethod
     def square_head(dim, outputs):
         return nn.Sequential(nn.LayerNorm(dim),nn.Linear(dim,outputs))
-
-    @staticmethod
-    def score_head(dim, options):
-        square_features, hidden = options['square_features'], options['hidden_dim']
-        if any(type(value) is not int or value < 1 for value in (square_features,hidden)):
-            raise ValueError('maia_model.score_head dimensions must be positive integers')
-        return nn.Sequential(
-            nn.LayerNorm(dim),nn.Linear(dim,square_features),nn.GELU(),
-            nn.Flatten(start_dim=1),nn.Linear(80*square_features,hidden),nn.GELU(),
-            nn.Linear(hidden,2*81),
-        )
 
     def expand_spatial(self, logits):
         batch, _, channels = logits.shape
@@ -105,15 +89,9 @@ class MaiaNet(nn.Module):
 
     def forward(self, board):
         board = prepare_inputs(board)
-        batch = board.shape[0]
         playable = board.flatten(2).index_select(2,self.indices)
         tokens = self.embedding(playable.transpose(1,2))
         for layer in self.layers:
             tokens = layer(tokens,self.templates)
         return (self.expand_spatial(self.policy_head(tokens)).squeeze(1),
-                self.expand_spatial(self.action_value_head(tokens)).squeeze(1),
-                self.expand_spatial(self.mark_class_head(tokens)),
-                self.immediate_score_head(tokens).reshape(batch,2,81),
-                self.discounted_score_head(tokens).reshape(batch,2,81),
-                self.expand_spatial(self.discounted_mark_head(tokens)),
-                self.expand_spatial(self.opponent_policy_head(tokens)).squeeze(1))
+                self.expand_spatial(self.action_value_head(tokens)).squeeze(1))

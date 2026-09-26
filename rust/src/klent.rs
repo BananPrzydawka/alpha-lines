@@ -1,68 +1,33 @@
 //! Single-threaded KLENT collection and Python tensor encoding.
-use crate::{game::{board_index, Rng, MARK_CLASS_SQUARES, NO_MARK_CLASS, TRACK_MARK_CLASSES}, Game, Scratch};
+use crate::{game::{board_index, Rng}, Game, Scratch};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-const MARK_TARGET_CLASSES: usize = 8;
 const MAX_PLY: usize = crate::game::SQUARES;
-const ABSENT_MARK_CLASS: usize = 6;
-const UNPLAYED_MARK_CLASS: usize = 7;
-fn mark_target_class(class: i8, cell: u8) -> usize {
-    if class >= 0 { class as usize }
-    else if cell == 3 { ABSENT_MARK_CLASS }
-    else { assert_eq!(cell, 0); UNPLAYED_MARK_CLASS }
-}
 
-#[repr(C)]
 #[derive(Clone)]
-pub struct Record<D, M> {
+pub struct Position {
     board: [u8; 80],
-    scores: [u8; 2],
-    mark_classes: [i8; MARK_CLASS_SQUARES],
     actions: [u8; 2],
     policy: [[f32; 80]; 2],
     returns: [f32; 2],
-    discounted_scores: D,
-    discounted_marks: M,
 }
-// History keeps value estimates; Position adds targets available after the game ends.
-type Position = Record<[[f32; 81]; 2], [[f32; MARK_TARGET_CLASSES]; MARK_CLASS_SQUARES]>;
-type History = Record<(), ()>;
-const _: () = assert!(std::mem::size_of::<Position>() == 84 + MARK_CLASS_SQUARES + 2*80*4 + 2*4 + 2*81*4 + MARK_CLASS_SQUARES*MARK_TARGET_CLASSES*4);
-const _: () = assert!(std::mem::size_of::<History>() == 84 + MARK_CLASS_SQUARES + 2*80*4 + 2*4);
 
-fn finish(history: &mut Vec<History>, reward: [f32; 2], terminal_scores: [u8; 2],
-          terminal_cells: [u8; 80], terminal_marks: [i8; MARK_CLASS_SQUARES], lambda: f32, score_lambda: f32,
-          mark_lambda: f32, buffer: &mut Vec<Position>) {
+type History = Position;
+
+fn finish(history: &mut Vec<History>, reward: [f32; 2], lambda: f32,
+          buffer: &mut Vec<Position>) {
     let mut ret = reward;
-    let mut score_dist = [[0.0f32; 81]; 2];
-    for p in 0..2 {
-        assert!(terminal_scores[p] <= 80);
-        score_dist[p][terminal_scores[p] as usize] = 1.0;
-    }
-    let mut mark_dist = [[0.0f32; MARK_TARGET_CLASSES]; MARK_CLASS_SQUARES];
-    for (sq, &class) in terminal_marks.iter().enumerate() {
-        mark_dist[sq][mark_target_class(class, terminal_cells[sq])] = 1.0;
-    }
     for t in (0..history.len()).rev() {
-        if t+1 < history.len() {
-            for p in 0..2 { ret[p] = (1.0-lambda)*history[t+1].returns[p] + lambda*ret[p]; }
+        if t + 1 < history.len() {
+            for p in 0..2 {
+                ret[p] = (1.0-lambda)*history[t+1].returns[p] + lambda*ret[p];
+            }
         }
-        // The following iteration needs V_t, so write into a separate destination.
-        let h = &history[t];
-        for p in 0..2 {
-            assert!(h.scores[p] <= 80);
-            for value in &mut score_dist[p] { *value *= score_lambda; }
-            score_dist[p][h.scores[p] as usize] += 1.0-score_lambda;
-        }
-        for (sq, &class) in h.mark_classes.iter().enumerate() {
-            for value in &mut mark_dist[sq] { *value *= mark_lambda; }
-            mark_dist[sq][mark_target_class(class, h.board[sq])] += 1.0-mark_lambda;
-        }
-        buffer.push(Position { board: h.board, scores: h.scores, mark_classes: h.mark_classes,
-            actions: h.actions, policy: h.policy, returns: ret,
-            discounted_scores: score_dist, discounted_marks: mark_dist });
+        let mut position = history[t].clone();
+        position.returns = ret;
+        buffer.push(position);
     }
-    let start = buffer.len()-history.len();
+    let start = buffer.len() - history.len();
     buffer[start..].reverse();
     history.clear();
 }
@@ -118,25 +83,30 @@ fn mix_uniform(p: &[f32; 80], legal: [u64; 2], fraction: f32) -> [f32; 80] {
     })
 }
 
+// Each quarter contains two equal side assignments. The current model owns
+// the opposite side in every game; historical models only choose moves.
+fn opponent_slot(game: usize, count: usize) -> (usize, usize) {
+    if count < 8 { return (0, game % 2); }
+    let quarter = game / (count / 4);
+    let side = (game % (count / 4) >= count / 8) as usize;
+    (quarter, side)
+}
+
 pub struct Arena {
     games: Vec<Game>, histories: Vec<Vec<History>>, buffer: Vec<Position>,
-    capacity: usize, alpha: f32, beta: f32, lambda: f32, score_lambda: f32,
-    exploration_fraction: f32, mark_lambda: f32,
+    capacity: usize, alpha: f32, beta: f32, lambda: f32, exploration_fraction: f32,
     rng: Rng, shuffle_rng: Rng, scratch: Scratch, evaluation: bool, pub results: [usize; 3],
 }
 impl Arena {
     pub fn new(n: usize, capacity: usize, alpha: f32, beta: f32, lambda: f32,
-               score_lambda: f32, exploration_fraction: f32, mark_lambda: f32, seed: u64, evaluation: bool) -> Self {
-        assert!(n > 0);
+               exploration_fraction: f32, seed: u64, evaluation: bool) -> Self {
+        assert!(n > 0 && (n < 8 || n % 8 == 0));
         assert!(evaluation || capacity >= n.checked_mul(MAX_PLY).unwrap());
         assert!(alpha.is_finite() && beta.is_finite() && alpha >= 0.0 && beta >= 0.0 && alpha+beta > 0.0);
         assert!(lambda.is_finite() && (0.0..=1.0).contains(&lambda));
-        assert!(score_lambda.is_finite() && (0.0..=1.0).contains(&score_lambda));
         assert!(exploration_fraction.is_finite() && (0.0..=1.0).contains(&exploration_fraction));
-        assert!(mark_lambda.is_finite() && (0.0..=1.0).contains(&mark_lambda));
         Self { games: vec![Game::new(); n], histories: (0..n).map(|_| Vec::with_capacity(if evaluation {0} else {MAX_PLY})).collect(),
-            buffer: Vec::with_capacity(if evaluation {0} else {capacity}), capacity, alpha, beta, lambda, score_lambda,
-            exploration_fraction, mark_lambda,
+            buffer: Vec::with_capacity(if evaluation {0} else {capacity}), capacity, alpha, beta, lambda, exploration_fraction,
             rng: Rng::new(seed), shuffle_rng: Rng::new(seed ^ 0x9e37_79b9_7f4a_7c15),
             scratch: Scratch::new(), evaluation, results: [0; 3] }
     }
@@ -150,29 +120,33 @@ impl Arena {
             }
         }
     }
-    pub fn step(&mut self, logits: &[f32], q: &[f32]) -> bool {
+    pub fn step(&mut self, logits: &[f32], q: &[f32], opponent_logits: &[f32], opponent_q: &[f32]) -> bool {
         for i in 0..self.games.len() {
             if self.games[i].finished { continue; }
             let mut policies = [[0.0f32; 80]; 2];
             let mut values = [0.0; 2];
             let mut actions = [0u8; 2];
+            let (quarter, opponent_side) = opponent_slot(i, self.games.len());
             for p in 0..2 {
                 let row = (2*i+p)*80;
                 let (dist, value) = if self.evaluation {
                     policy(&self.games[i], p, &logits[row..row+80], &[0.0; 80], 0.0, 1.0)
                 } else { policy(&self.games[i], p, &logits[row..row+80], &q[row..row+80], self.alpha, self.beta) };
                 policies[p] = dist; values[p] = value;
-                let sampling_dist = if self.evaluation { dist } else {
-                    mix_uniform(&dist, self.games[i].legal_moves(p), self.exploration_fraction)
-                };
+                let playing_dist = if !self.evaluation && p == opponent_side && quarter >= 2 {
+                    policy(&self.games[i], p, &opponent_logits[row..row+80],
+                           &opponent_q[row..row+80], self.alpha, self.beta).0
+                } else { dist };
+                let explore = !self.evaluation && quarter == 1;
+                let sampling_dist = if explore {
+                    mix_uniform(&playing_dist, self.games[i].legal_moves(p), self.exploration_fraction)
+                } else { playing_dist };
                 actions[p] = sample(&sampling_dist, &mut self.rng) as u8;
             }
             if !self.evaluation {
                 assert!(self.histories[i].len() < MAX_PLY);
                 self.histories[i].push(History { board: self.games[i].cells,
-                    scores: self.games[i].scores.map(|s| u8::try_from(s).unwrap()),
-                    mark_classes: self.games[i].mark_classes, actions, policy: policies, returns: values,
-                    discounted_scores: (), discounted_marks: () });
+                    actions, policy: policies, returns: values });
             }
             self.games[i].action_step(actions[0] as usize, actions[1] as usize, &mut self.scratch);
             if self.games[i].finished {
@@ -184,9 +158,7 @@ impl Arena {
                 else {
                     let history = &mut self.histories[i];
                     assert!(self.buffer.len()+history.len() <= self.capacity);
-                    let terminal_scores = self.games[i].scores.map(|s| u8::try_from(s).unwrap());
-                    finish(history, reward, terminal_scores, self.games[i].cells, self.games[i].mark_classes,
-                           self.lambda, self.score_lambda, self.mark_lambda, &mut self.buffer);
+                    finish(history, reward, self.lambda, &mut self.buffer);
                     self.games[i] = Game::new();
                 }
             }
@@ -211,8 +183,8 @@ impl Arena {
 // All fallible calls catch Rust panics rather than unwinding across the C boundary.
 #[no_mangle]
 pub extern "C" fn klent_new(n: usize, m: usize, alpha: f32, beta: f32, lambda: f32,
-                            score_lambda: f32, exploration_fraction: f32, mark_lambda: f32, seed: u64, evaluation: bool) -> *mut Arena {
-    catch_unwind(|| Box::into_raw(Box::new(Arena::new(n,m,alpha,beta,lambda,score_lambda,exploration_fraction,mark_lambda,seed,evaluation)))).unwrap_or(std::ptr::null_mut())
+                            exploration_fraction: f32, seed: u64, evaluation: bool) -> *mut Arena {
+    catch_unwind(|| Box::into_raw(Box::new(Arena::new(n,m,alpha,beta,lambda,exploration_fraction,seed,evaluation)))).unwrap_or(std::ptr::null_mut())
 }
 #[no_mangle]
 pub unsafe extern "C" fn klent_free(h: *mut Arena) { if !h.is_null() { drop(Box::from_raw(h)); } }
@@ -226,8 +198,12 @@ pub unsafe extern "C" fn klent_inputs(h: *mut Arena, b: *mut f32) -> i32 {
     })).unwrap_or(-1)
 }
 #[no_mangle]
-pub unsafe extern "C" fn klent_step(h: *mut Arena, logits: *const f32, q: *const f32) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| { let a=&mut *h; let len=a.games.len()*160; a.step(std::slice::from_raw_parts(logits,len),std::slice::from_raw_parts(q,len)) as i32 })).unwrap_or(-1)
+pub unsafe extern "C" fn klent_step(h: *mut Arena, logits: *const f32, q: *const f32,
+                                     opponent_logits: *const f32, opponent_q: *const f32) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| { let a=&mut *h; let len=a.games.len()*160;
+        a.step(std::slice::from_raw_parts(logits,len),std::slice::from_raw_parts(q,len),
+               std::slice::from_raw_parts(opponent_logits,len),std::slice::from_raw_parts(opponent_q,len)) as i32
+    })).unwrap_or(-1)
 }
 #[no_mangle]
 /// Writes buffered positions, then evaluation wins, draws, and losses.
@@ -241,48 +217,26 @@ pub unsafe extern "C" fn klent_shuffle(h: *mut Arena) { (&mut *h).shuffle() }
 #[no_mangle]
 pub unsafe extern "C" fn klent_clear(h: *mut Arena) { (&mut *h).buffer.clear(); }
 #[no_mangle]
-pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize, b: *mut f32, s: *mut f32, pi: *mut f32, actions: *mut i64, returns: *mut f32, classes: *mut i8, discounted: *mut f32, discounted_marks_out: *mut f32) -> i32 {
+pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize,
+    b: *mut f32, pi: *mut f32, actions: *mut i64, returns: *mut f32) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        let a=&*h;
-        let boards=std::slice::from_raw_parts_mut(b,count*1600);
-        let scores=std::slice::from_raw_parts_mut(s,count*4);
-        let policies=std::slice::from_raw_parts_mut(pi,count*320);
-        let moves=std::slice::from_raw_parts_mut(actions,count*2);
-        let targets=std::slice::from_raw_parts_mut(returns,count*2);
-        let mark_classes=std::slice::from_raw_parts_mut(classes,count*160);
-        let discounted_scores=std::slice::from_raw_parts_mut(discounted,count*324);
-        let discounted_marks=std::slice::from_raw_parts_mut(discounted_marks_out,count*2*80*MARK_TARGET_CLASSES);
-        boards.fill(0.0); scores.fill(0.0); policies.fill(0.0); moves.fill(0); targets.fill(0.0);
-        mark_classes.fill(NO_MARK_CLASS);
-        discounted_scores.fill(0.0);
-        discounted_marks.fill(0.0);
-        let end=(start+count).min(a.buffer.len());
-        for (i,pos) in a.buffer[start..end].iter().enumerate() {
+        let a = &*h;
+        let boards = std::slice::from_raw_parts_mut(b, count*1600);
+        let policies = std::slice::from_raw_parts_mut(pi, count*320);
+        let moves = std::slice::from_raw_parts_mut(actions, count*2);
+        let targets = std::slice::from_raw_parts_mut(returns, count*2);
+        boards.fill(0.0);
+        policies.fill(0.0);
+        moves.fill(0);
+        targets.fill(0.0);
+        let end = (start+count).min(a.buffer.len());
+        for (i, pos) in a.buffer[start..end].iter().enumerate() {
             for p in 0..2 {
-                let row=2*i+p;
-                encode(&pos.board,p,&mut boards[row*800..(row+1)*800]);
-                scores[row*2] = pos.scores[p] as f32;
-                scores[row*2+1] = pos.scores[1-p] as f32;
-                for sq in 0..80 { policies[row*160+board_index(sq)]=pos.policy[p][sq]; }
-                moves[row]=board_index(pos.actions[p] as usize) as i64;
-                targets[row]=pos.returns[p];
-                for q in 0..2 {
-                    let start=row*162+q*81;
-                    discounted_scores[start..start+81].copy_from_slice(&pos.discounted_scores[(p+q)%2]);
-                }
-                if TRACK_MARK_CLASSES {
-                    for sq in 0..80 {
-                        let class=pos.mark_classes[sq];
-                        mark_classes[row*80+sq] = if class < 0 { class }
-                            else if p == 0 { class }
-                            else if class < 3 { class+3 } else { class-3 };
-                        for class in 0..MARK_TARGET_CLASSES {
-                            let source = if p == 0 || class >= ABSENT_MARK_CLASS { class }
-                                else if class < 3 { class+3 } else { class-3 };
-                            discounted_marks[(row*80+sq)*MARK_TARGET_CLASSES+class] = pos.discounted_marks[sq][source];
-                        }
-                    }
-                }
+                let row = 2*i+p;
+                encode(&pos.board, p, &mut boards[row*800..(row+1)*800]);
+                for sq in 0..80 { policies[row*160+board_index(sq)] = pos.policy[p][sq]; }
+                moves[row] = board_index(pos.actions[p] as usize) as i64;
+                targets[row] = pos.returns[p];
             }
         }
         (end-start) as i32
@@ -292,15 +246,15 @@ pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn exact_returns_use_next_state_and_preserve_order() {
+    #[test]
+    fn exact_returns_use_next_state_and_preserve_order() {
         for lambda in [0.0, 0.5, 1.0] {
             let mut history: Vec<History> = (0..3).map(|i| History {
-                board: [0;80], scores: [0;2], mark_classes: [NO_MARK_CLASS;MARK_CLASS_SQUARES], actions: [i;2], policy: [[0.0;80];2],
-                returns: [i as f32 * 0.25, -(i as f32)*0.25], discounted_scores: (), discounted_marks: (),
+                board: [0;80], actions: [i;2], policy: [[0.0;80];2],
+                returns: [i as f32 * 0.25, -(i as f32)*0.25],
             }).collect();
             let mut buffer = Vec::new();
-            finish(&mut history, [1.0,-1.0], [2, 3], [0;80], [NO_MARK_CLASS;MARK_CLASS_SQUARES],
-                   lambda, 0.94, 0.94, &mut buffer);
+            finish(&mut history, [1.0,-1.0], lambda, &mut buffer);
             let g1=(1.0-lambda)*0.5+lambda;
             let g0=(1.0-lambda)*0.25+lambda*g1;
             for (i,g) in [g0,g1,1.0].into_iter().enumerate() {
@@ -311,74 +265,18 @@ mod tests {
         }
     }
     #[test]
-    fn discounted_scores_include_current_and_terminal_positions() {
-        for score_lambda in [0.0, 0.5, 1.0] {
-            let mut history: Vec<History> = [[0, 3], [1, 2]].into_iter().map(|scores| History {
-                board: [0;80], scores, mark_classes: [NO_MARK_CLASS;MARK_CLASS_SQUARES],
-                actions: [0;2], policy: [[0.0;80];2], returns: [0.0;2], discounted_scores: (), discounted_marks: (),
-            }).collect();
-            let mut buffer = Vec::new();
-            finish(&mut history, [0.0;2], [2, 1], [0;80], [NO_MARK_CLASS;MARK_CLASS_SQUARES],
-                   0.94, score_lambda, 0.94, &mut buffer);
-            for p in 0..2 {
-                let current = [0usize, 3][p];
-                let next = [1usize, 2][p];
-                let terminal = [2usize, 1][p];
-                let d0 = &buffer[0].discounted_scores[p];
-                let d1 = &buffer[1].discounted_scores[p];
-                let expected_current = 1.0-score_lambda;
-                let expected_next = score_lambda*(1.0-score_lambda);
-                let expected_terminal = score_lambda*score_lambda;
-                assert_eq!(d0[current],expected_current);
-                assert_eq!(d0[next],expected_next);
-                assert_eq!(d0[terminal],expected_terminal);
-                assert_eq!(d1[next],expected_current);
-                assert_eq!(d1[terminal],score_lambda);
-                assert!((d0.iter().sum::<f32>()-1.0).abs()<1e-6);
-            }
-        }
-    }
-    #[test] fn discounted_marks_include_future_removal_and_new_placement() {
-        if !TRACK_MARK_CLASSES { return; }
-        let mut first = [0u8;80]; first[0] = 1;
-        let mut second = first; second[1] = 2;
-        let mut terminal = second; terminal[0] = 3;
-        let mut classes0 = [NO_MARK_CLASS;MARK_CLASS_SQUARES]; classes0[0] = 0;
-        let mut classes1 = classes0; classes1[0] = 1; classes1[1] = 3;
-        let mut terminal_classes = classes1; terminal_classes[0] = NO_MARK_CLASS; terminal_classes[1] = 4;
-        let mut history = vec![
-            History { board: first, scores: [0;2], mark_classes: classes0,
-                actions: [0;2], policy: [[0.0;80];2], returns: [0.0;2],
-                discounted_scores: (), discounted_marks: () },
-            History { board: second, scores: [0;2], mark_classes: classes1,
-                actions: [0;2], policy: [[0.0;80];2], returns: [0.0;2],
-                discounted_scores: (), discounted_marks: () },
-        ];
-        let mut buffer = Vec::new();
-        finish(&mut history, [0.0;2], [0;2], terminal, terminal_classes,
-               0.94, 0.94, 0.5, &mut buffer);
-        let expected0 = [(0,0.5),(1,0.25),(ABSENT_MARK_CLASS,0.25)];
-        let expected1 = [(UNPLAYED_MARK_CLASS,0.5),(3,0.25),(4,0.25)];
-        for (class, weight) in expected0 { assert_eq!(buffer[0].discounted_marks[0][class],weight); }
-        for (class, weight) in expected1 { assert_eq!(buffer[0].discounted_marks[1][class],weight); }
-        assert_eq!(buffer[1].discounted_marks[0][ABSENT_MARK_CLASS],0.5);
-        assert_eq!(buffer[1].discounted_marks[1][4],0.5);
-    }
-    #[test] fn board_layout() {
+    fn board_layout() {
         let cells=std::array::from_fn(|i| (i%4) as u8);
-        assert_eq!(std::mem::size_of::<Position>(),84 + MARK_CLASS_SQUARES + 2*80*4 + 2*4 + 2*81*4 + MARK_CLASS_SQUARES*MARK_TARGET_CLASSES*4);
         let mut b=vec![0.0;1600];
         encode(&cells,0,&mut b[..800]);
         encode(&cells,1,&mut b[800..]);
         assert_eq!(&b[480..640],&b[1440..1600]);
     }
-    #[test] fn shuffle_reorders_whole_positions() {
-        let mut arena=Arena::new(1,80,0.03,0.1,0.8,0.94,0.0,0.94,1,false);
+    #[test]
+    fn shuffle_reorders_whole_positions() {
+        let mut arena=Arena::new(1,80,0.03,0.1,0.8,0.0,1,false);
         arena.buffer=(0..40).map(|i| Position {
-            board: [i;80], scores: [i,i], mark_classes: [i as i8;MARK_CLASS_SQUARES], actions: [i,i],
-            policy: [[i as f32;80];2], returns: [i as f32;2],
-            discounted_scores: [[i as f32;81];2],
-            discounted_marks: [[i as f32;MARK_TARGET_CLASSES];MARK_CLASS_SQUARES],
+            board: [i;80], actions: [i,i], policy: [[i as f32;80];2], returns: [i as f32;2],
         }).collect();
         arena.shuffle();
         let order: Vec<_> = arena.buffer.iter().map(|p| p.board[0]).collect();
@@ -387,16 +285,13 @@ mod tests {
         assert_eq!(sorted,(0..40).collect::<Vec<_>>());
         for p in &arena.buffer {
             let i=p.board[0];
-            assert_eq!(p.scores,[i,i]);
-            assert_eq!(p.mark_classes,[i as i8;MARK_CLASS_SQUARES]);
             assert_eq!(p.actions,[i,i]);
             assert_eq!(p.policy[0][0],i as f32);
             assert_eq!(p.returns,[i as f32;2]);
-            assert_eq!(p.discounted_scores[0][0],i as f32);
-            if TRACK_MARK_CLASSES { assert_eq!(p.discounted_marks[0][0],i as f32); }
         }
     }
-    #[test] fn policy_mask_and_formula() {
+    #[test]
+    fn policy_mask_and_formula() {
         let g=Game::new(); let logits=std::array::from_fn::<_,80,_>(|i| i as f32/80.0);
         let (p,v)=policy(&g,0,&logits,&[0.25;80],0.03,0.1);
         assert!((p.iter().sum::<f32>()-1.0).abs()<1e-6);
@@ -404,7 +299,8 @@ mod tests {
         for i in 0..80 { if i%8>=4 { assert_eq!(p[i],0.0); } }
         assert!((p[1]/p[0]-(0.1*(logits[1]-logits[0])/0.13).exp()).abs()<1e-5);
     }
-    #[test] fn self_play_exploration_mixes_only_legal_moves() {
+    #[test]
+    fn self_play_exploration_mixes_only_legal_moves() {
         let g=Game::new();
         let logits=std::array::from_fn::<_,80,_>(|i| i as f32);
         let (p,_) = policy(&g,0,&logits,&[0.0;80],0.03,0.1);
@@ -416,10 +312,11 @@ mod tests {
         }
         assert_eq!(mix_uniform(&p,g.legal_moves(0),0.0),p);
     }
-    #[test] fn collection_returns_capacity_and_evaluation() {
+    #[test]
+    fn collection_returns_capacity_and_evaluation() {
         for lambda in [0.0,0.5,1.0] {
-            let mut a=Arena::new(4,640,0.03,0.1,lambda,0.94,0.1,0.94,1,false);
-            for _ in 0..1000 { if a.step(&[0.0;640],&[0.25;640]) { break; } }
+            let mut a=Arena::new(4,640,0.03,0.1,lambda,0.1,1,false);
+            for _ in 0..1000 { if a.step(&[0.0;640],&[0.25;640],&[0.0;640],&[0.25;640]) { break; } }
             assert!(a.buffer.len()>320 && a.buffer.len()<=640);
             for pos in &a.buffer { for p in 0..2 {
                 assert_eq!(pos.board[pos.actions[p] as usize],0);
@@ -428,8 +325,8 @@ mod tests {
             } }
             let dropped=a.reset(); assert!(dropped<320); assert!(a.histories.iter().all(Vec::is_empty));
         }
-        let mut a=Arena::new(4,0,0.03,0.1,0.8,0.94,0.1,0.94,1,true);
-        for _ in 0..80 { if a.step(&[0.0;640],&[0.0;640]) { break; } }
+        let mut a=Arena::new(4,0,0.03,0.1,0.8,0.1,1,true);
+        for _ in 0..80 { if a.step(&[0.0;640],&[0.0;640],&[0.0;640],&[0.0;640]) { break; } }
         assert_eq!(a.results.iter().sum::<usize>(),4);
         let mut expected = [0;3];
         for (i,g) in a.games.iter().enumerate() {
@@ -439,5 +336,31 @@ mod tests {
         assert_eq!(a.results,expected);
         let mut b=vec![1.0;6400]; a.inputs(&mut b);
         assert!(b.iter().all(|&x| x==0.0));
+    }
+
+    #[test]
+    fn historical_opponent_changes_moves_but_not_targets() {
+        let mut a=Arena::new(8,640,0.0,1.0,0.8,0.0,1,false);
+        let current=[0.0;1280];
+        let mut old=[0.0;1280];
+        let old_q=[2.0;1280];
+        for row in 0..16 { old[row*80+1]=100.0; old[row*80+5]=100.0; }
+        a.step(&current,&current,&old,&old_q);
+        assert_eq!(a.histories[4][0].actions[0],1);
+        assert_eq!(a.histories[5][0].actions[1],5);
+        assert!((a.histories[4][0].policy[0][1]-1.0/40.0).abs()<1e-6);
+        assert!((a.histories[5][0].policy[1][5]-1.0/40.0).abs()<1e-6);
+        assert_eq!(a.histories[4][0].returns[0],0.0);
+        assert_eq!(a.histories[5][0].returns[1],0.0);
+        assert_eq!(opponent_slot(0,1024),(0,0));
+        assert_eq!(opponent_slot(127,1024),(0,0));
+        assert_eq!(opponent_slot(128,1024),(0,1));
+        assert_eq!(opponent_slot(512,1024),(2,0));
+        assert_eq!(opponent_slot(1023,1024),(3,1));
+        for quarter in 0..4 {
+            for side in 0..2 {
+                assert_eq!((0..1024).filter(|&i| opponent_slot(i,1024)==(quarter,side)).count(),128);
+            }
+        }
     }
 }
