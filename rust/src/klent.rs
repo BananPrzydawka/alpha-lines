@@ -10,6 +10,7 @@ pub struct Position {
     actions: [u8; 2],
     policy: [[f32; 80]; 2],
     returns: [f32; 2],
+    current_player: u8,
 }
 
 type History = Position;
@@ -86,7 +87,7 @@ fn mix_uniform(p: &[f32; 80], legal: [u64; 2], fraction: f32) -> [f32; 80] {
 pub struct Arena {
     games: Vec<Game>, histories: Vec<Vec<History>>, buffer: Vec<Position>,
     capacity: usize, alpha: f32, beta: f32, lambda: f32, exploration_fraction: f32,
-    rng: Rng, shuffle_rng: Rng, scratch: Scratch, evaluation: bool, pub results: [usize; 3],
+    rng: Rng, shuffle_rng: Rng, scratch: Scratch, evaluation: bool, fixed_opponent: bool, pub results: [usize; 3],
 }
 impl Arena {
     pub fn new(n: usize, capacity: usize, alpha: f32, beta: f32, lambda: f32,
@@ -99,7 +100,7 @@ impl Arena {
         Self { games: vec![Game::new(); n], histories: (0..n).map(|_| Vec::with_capacity(if evaluation {0} else {MAX_PLY})).collect(),
             buffer: Vec::with_capacity(if evaluation {0} else {capacity}), capacity, alpha, beta, lambda, exploration_fraction,
             rng: Rng::new(seed), shuffle_rng: Rng::new(seed ^ 0x9e37_79b9_7f4a_7c15),
-            scratch: Scratch::new(), evaluation, results: [0; 3] }
+            scratch: Scratch::new(), evaluation, fixed_opponent: false, results: [0; 3] }
     }
     pub fn inputs(&self, boards: &mut [f32]) {
         boards.fill(0.0);
@@ -112,17 +113,27 @@ impl Arena {
         }
     }
     pub fn step(&mut self, logits: &[f32], q: &[f32]) -> bool {
+        self.step_with_targets(logits, q, logits, q)
+    }
+    pub fn step_with_targets(&mut self, logits: &[f32], q: &[f32], target_logits: &[f32], target_q: &[f32]) -> bool {
         for i in 0..self.games.len() {
             if self.games[i].finished { continue; }
             let mut policies = [[0.0f32; 80]; 2];
             let mut values = [0.0; 2];
             let mut actions = [0u8; 2];
+            let current_player = if self.fixed_opponent && i >= self.games.len()/2 { 1 } else { 0 };
             for p in 0..2 {
                 let row = (2*i+p)*80;
                 let (dist, value) = if self.evaluation {
                     policy(&self.games[i], p, &logits[row..row+80], &[0.0; 80], 0.0, 1.0)
                 } else { policy(&self.games[i], p, &logits[row..row+80], &q[row..row+80], self.alpha, self.beta) };
-                policies[p] = dist; values[p] = value;
+                if self.fixed_opponent {
+                    let (target_dist, target_value) = policy(&self.games[i], p,
+                        &target_logits[row..row+80], &target_q[row..row+80], self.alpha, self.beta);
+                    policies[p] = target_dist; values[p] = target_value;
+                } else {
+                    policies[p] = dist; values[p] = value;
+                }
                 let sampling_dist = if self.evaluation { dist } else {
                     mix_uniform(&dist, self.games[i].legal_moves(p), self.exploration_fraction)
                 };
@@ -131,7 +142,7 @@ impl Arena {
             if !self.evaluation {
                 assert!(self.histories[i].len() < MAX_PLY);
                 self.histories[i].push(History { board: self.games[i].cells,
-                    actions, policy: policies, returns: values });
+                    actions, policy: policies, returns: values, current_player: current_player as u8 });
             }
             self.games[i].action_step(actions[0] as usize, actions[1] as usize, &mut self.scratch);
             if self.games[i].finished {
@@ -172,6 +183,10 @@ pub extern "C" fn klent_new(n: usize, m: usize, alpha: f32, beta: f32, lambda: f
     catch_unwind(|| Box::into_raw(Box::new(Arena::new(n,m,alpha,beta,lambda,exploration_fraction,seed,evaluation)))).unwrap_or(std::ptr::null_mut())
 }
 #[no_mangle]
+pub unsafe extern "C" fn klent_set_fixed_opponent(h: *mut Arena, fixed: bool) {
+    (&mut *h).fixed_opponent = fixed;
+}
+#[no_mangle]
 pub unsafe extern "C" fn klent_free(h: *mut Arena) { if !h.is_null() { drop(Box::from_raw(h)); } }
 #[no_mangle]
 pub unsafe extern "C" fn klent_inputs(h: *mut Arena, b: *mut f32) -> i32 {
@@ -187,6 +202,15 @@ pub unsafe extern "C" fn klent_step(h: *mut Arena, logits: *const f32, q: *const
     catch_unwind(AssertUnwindSafe(|| { let a=&mut *h; let len=a.games.len()*160; a.step(std::slice::from_raw_parts(logits,len),std::slice::from_raw_parts(q,len)) as i32 })).unwrap_or(-1)
 }
 #[no_mangle]
+pub unsafe extern "C" fn klent_step_with_targets(h: *mut Arena, logits: *const f32, q: *const f32,
+    target_logits: *const f32, target_q: *const f32) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let a=&mut *h; let len=a.games.len()*160;
+        a.step_with_targets(std::slice::from_raw_parts(logits,len),std::slice::from_raw_parts(q,len),
+            std::slice::from_raw_parts(target_logits,len),std::slice::from_raw_parts(target_q,len)) as i32
+    })).unwrap_or(-1)
+}
+#[no_mangle]
 /// Writes buffered positions, then evaluation wins, draws, and losses.
 pub unsafe extern "C" fn klent_stats(h: *mut Arena, out: *mut usize) {
     let a=&*h; std::slice::from_raw_parts_mut(out,4).copy_from_slice(&[a.buffer.len(),a.results[0],a.results[1],a.results[2]]);
@@ -199,19 +223,22 @@ pub unsafe extern "C" fn klent_shuffle(h: *mut Arena) { (&mut *h).shuffle() }
 pub unsafe extern "C" fn klent_clear(h: *mut Arena) { (&mut *h).buffer.clear(); }
 #[no_mangle]
 pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize,
-    b: *mut f32, pi: *mut f32, actions: *mut i64, returns: *mut f32) -> i32 {
+    b: *mut f32, pi: *mut f32, actions: *mut i64, returns: *mut f32, players: *mut i64) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         let a = &*h;
         let boards = std::slice::from_raw_parts_mut(b, count*1600);
         let policies = std::slice::from_raw_parts_mut(pi, count*320);
         let moves = std::slice::from_raw_parts_mut(actions, count*2);
         let targets = std::slice::from_raw_parts_mut(returns, count*2);
+        let players = std::slice::from_raw_parts_mut(players, count);
         boards.fill(0.0);
         policies.fill(0.0);
         moves.fill(0);
         targets.fill(0.0);
+        players.fill(0);
         let end = (start+count).min(a.buffer.len());
         for (i, pos) in a.buffer[start..end].iter().enumerate() {
+            players[i] = pos.current_player as i64;
             for p in 0..2 {
                 let row = 2*i+p;
                 encode(&pos.board, p, &mut boards[row*800..(row+1)*800]);
@@ -219,6 +246,32 @@ pub unsafe extern "C" fn klent_batch(h: *mut Arena, start: usize, count: usize,
                 moves[row] = board_index(pos.actions[p] as usize) as i64;
                 targets[row] = pos.returns[p];
             }
+        }
+        (end-start) as i32
+    })).unwrap_or(-1)
+}
+
+/// Write only the perspective controlled by the trainable model.
+#[no_mangle]
+pub unsafe extern "C" fn klent_batch_one_side(h: *mut Arena, start: usize, count: usize,
+    b: *mut f32, pi: *mut f32, actions: *mut i64, returns: *mut f32) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let a = &*h;
+        let boards = std::slice::from_raw_parts_mut(b, count*800);
+        let policies = std::slice::from_raw_parts_mut(pi, count*160);
+        let moves = std::slice::from_raw_parts_mut(actions, count);
+        let targets = std::slice::from_raw_parts_mut(returns, count);
+        boards.fill(0.0);
+        policies.fill(0.0);
+        moves.fill(0);
+        targets.fill(0.0);
+        let end = (start+count).min(a.buffer.len());
+        for (i, pos) in a.buffer[start..end].iter().enumerate() {
+            let p = pos.current_player as usize;
+            encode(&pos.board, p, &mut boards[i*800..(i+1)*800]);
+            for sq in 0..80 { policies[i*160+board_index(sq)] = pos.policy[p][sq]; }
+            moves[i] = board_index(pos.actions[p] as usize) as i64;
+            targets[i] = pos.returns[p];
         }
         (end-start) as i32
     })).unwrap_or(-1)
@@ -232,7 +285,7 @@ mod tests {
         for lambda in [0.0, 0.5, 1.0] {
             let mut history: Vec<History> = (0..3).map(|i| History {
                 board: [0;80], actions: [i;2], policy: [[0.0;80];2],
-                returns: [i as f32 * 0.25, -(i as f32)*0.25],
+                returns: [i as f32 * 0.25, -(i as f32)*0.25], current_player: 0,
             }).collect();
             let mut buffer = Vec::new();
             finish(&mut history, [1.0,-1.0], lambda, &mut buffer);
@@ -257,7 +310,7 @@ mod tests {
     fn shuffle_reorders_whole_positions() {
         let mut arena=Arena::new(1,80,0.03,0.1,0.8,0.0,1,false);
         arena.buffer=(0..40).map(|i| Position {
-            board: [i;80], actions: [i,i], policy: [[i as f32;80];2], returns: [i as f32;2],
+            board: [i;80], actions: [i,i], policy: [[i as f32;80];2], returns: [i as f32;2], current_player: 0,
         }).collect();
         arena.shuffle();
         let order: Vec<_> = arena.buffer.iter().map(|p| p.board[0]).collect();

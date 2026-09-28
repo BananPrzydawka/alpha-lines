@@ -8,19 +8,17 @@ from pathlib import Path
 from time import perf_counter
 
 import torch
-import torch.nn.functional as F
 from config import CONFIG_PATH, settings
 from klent.native import Arena, Batch
 from klent import output
 from models.factory import MODELS, build_model
-from models.katago import KataGoNet
 MAX_PLY = 80
 
 
 def validate(options):
     if type(options['cycles']) is not int or options['cycles'] < 0:
         raise ValueError('cycles must be a nonnegative integer')
-    for key in ('n','m','train_minibatch','test_games'):
+    for key in ('n','m','train_minibatch','test_games','anchor_interval','test_interval','opponent_interval'):
         if type(options[key]) is not int or options[key] < 1:
             raise ValueError(f'klent.{key} must be a positive integer')
     if options['m'] < options['n']*MAX_PLY:
@@ -29,12 +27,17 @@ def validate(options):
         raise ValueError('test_games must be even for balanced sides')
     if options['train_minibatch'] % 2:
         raise ValueError('train_minibatch counts perspectives and must be even')
-    if type(options['policy_recalculation']) is not bool:
-        raise ValueError('klent.policy_recalculation must be a boolean')
-    if type(options['gradient_accumulation']) is not bool:
-        raise ValueError('klent.gradient_accumulation must be a boolean')
-    for key in ('alpha','beta','exploration_fraction','lambda','lr','weight_decay',
-                'policy_loss_weight','q_loss_weight'):
+    if type(options.get('both_sides', False)) is not bool:
+        raise ValueError('klent.both_sides must be a boolean')
+    if type(options.get('fixed_opponent', False)) is not bool:
+        raise ValueError('klent.fixed_opponent must be a boolean')
+    if options.get('fixed_opponent', False) and options['n'] % 2:
+        raise ValueError('fixed-opponent training requires an even klent.n')
+    if type(options.get('compile_model', True)) is not bool:
+        raise ValueError('klent.compile_model must be a boolean')
+    if type(options.get('compile_max_autotune', False)) is not bool:
+        raise ValueError('klent.compile_max_autotune must be a boolean')
+    for key in ('alpha','beta','exploration_fraction','lambda','lr','weight_decay'):
         if not math.isfinite(options[key]) or options[key] < 0:
             raise ValueError(f'klent.{key} must be nonnegative and finite')
     if options['alpha']+options['beta'] <= 0 or options['exploration_fraction'] > 1 or options['lambda'] > 1 or options['lr'] <= 0:
@@ -43,24 +46,21 @@ def validate(options):
         raise ValueError('seed must fit u64')
     if options['model'] not in MODELS or options['optimizer'].lower() != 'adamw':
         raise ValueError('supported models: katago, katago_tf, resnet, maia; optimizer: adamw')
-    if not isinstance(options['reference_checkpoint'], str) or not options['reference_checkpoint']:
-        raise ValueError('klent.reference_checkpoint must be a nonempty path')
-    thresholds = options['anchor_thresholds']
-    if (not isinstance(thresholds, list) or len(thresholds) != 3 or
-        any(type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 1
-            for value in thresholds) or
-        any(a >= b for a,b in zip(thresholds,thresholds[1:]))):
-        raise ValueError('klent.anchor_thresholds must be three increasing score rates in (0, 1]')
+    references = options['reference_checkpoints']
+    if (not isinstance(references, list) or
+        any(not isinstance(path, str) or not path for path in references)):
+        raise ValueError('klent.reference_checkpoints must be a list of paths')
 
 
 def load_reference_model(path, device):
     """Build the fixed opponent with its own saved architecture."""
     checkpoint = torch.load(path, map_location='cpu', weights_only=True)
-    if checkpoint.get('format_version') != 1 or checkpoint.get('options', {}).get('model') != 'katago':
+    name = checkpoint.get('options', {}).get('model')
+    if checkpoint.get('format_version') not in (1, 2) or name not in MODELS:
         raise ValueError(f'Unsupported reference checkpoint: {path}')
     if any(t.is_floating_point() and t.dtype != torch.float32 for t in checkpoint['model'].values()):
         raise ValueError('Reference checkpoint requires FP32 weights')
-    reference = KataGoNet(checkpoint['model_config']).to(
+    reference = MODELS[name](checkpoint['model_config']).to(
         device=device, dtype=torch.float32, memory_format=torch.channels_last)
     load_core_weights(reference, checkpoint['model'])
     return reference.eval().requires_grad_(False), checkpoint['summary']['cycle']
@@ -72,22 +72,6 @@ def losses(logits, q, target, actions, returns, valid):
     value = (q.flatten(1).float().gather(1,actions[:,None]).squeeze(1)-returns).square()
     denominator = valid.sum().clamp_min(1)
     return (policy*valid).sum()/denominator, (value*valid).sum()/denominator
-
-
-def recalculated_policy(logits, q, boards, valid, alpha, beta):
-    """Recreate KLENT's legal softmax from the current minibatch forward pass."""
-    empty = boards[:,1] > 0.5
-    opening = empty.flatten(1).sum(1) == 80
-    player = torch.arange(boards.shape[0],device=boards.device) % 2
-    columns = torch.arange(16,device=boards.device).view(1,1,16)
-    opening_half = torch.where(player[:,None,None] == 0,columns < 8,columns >= 8)
-    legal = (empty & (~opening[:,None,None] | opening_half)).flatten(1)
-    # Padded rows have no legal squares; give softmax one temporary finite logit.
-    fallback = F.one_hot(torch.zeros(boards.shape[0],device=boards.device,dtype=torch.long),160).bool()
-    safe_legal = torch.where(valid[:,None] > 0,legal,fallback)
-    scores = (q.flatten(1).float() + beta*logits.flatten(1).float()) / (alpha+beta)
-    policy = scores.masked_fill(~safe_legal,float('-inf')).softmax(1)
-    return torch.where(valid[:,None] > 0,policy,torch.zeros_like(policy)).detach()
 
 
 def load_core_weights(model, weights):
@@ -128,13 +112,11 @@ def evaluation_rows(games):
 
 
 class ModelHistory:
-    """Keep the previous model and three score-gated moving anchors."""
-    def __init__(self, thresholds=(0.70, 0.80, 0.90), anchors=()):
+    """Keep the previous model and every cycle-spaced anchor."""
+    def __init__(self, interval, anchors=()):
         self.previous = None
-        self.thresholds = tuple(thresholds)
+        self.interval = interval
         self.anchors = list(anchors)
-        if self.anchors and len(self.anchors) != 3:
-            raise ValueError('Expected three saved KLENT anchors')
 
     @staticmethod
     def snapshot(model):
@@ -145,29 +127,19 @@ class ModelHistory:
 
     def initialize_anchors(self, model, cycle):
         if not self.anchors:
-            weights = self.snapshot(model)
-            self.anchors = [(cycle, weights)] * 3
+            self.anchors = [(cycle, self.snapshot(model))]
 
-    def update_anchors(self, model, cycle, evaluations):
-        updates = []
-        weights = None
-        for result in evaluations:
-            index = result.get('anchor_index')
-            if index is None or result['score_rate'] <= self.thresholds[index-1]:
-                continue
-            if weights is None:
-                weights = self.snapshot(model)
-            old_cycle = self.anchors[index-1][0]
-            self.anchors[index-1] = (cycle, weights)
-            updates.append(dict(anchor=index, old_cycle=old_cycle, new_cycle=cycle,
-                                score_rate=result['score_rate']))
-        return updates
+    def maybe_add_anchor(self, model, cycle):
+        if cycle % self.interval == 0 and cycle > self.anchors[-1][0]:
+            self.anchors.append((cycle, self.snapshot(model)))
+            return cycle
+        return None
 
     def opponents(self):
         if self.previous is not None:
-            yield ('previous', *self.previous, None)
-        for index, (cycle, weights) in enumerate(self.anchors, 1):
-            yield ('anchor', cycle, weights, index)
+            yield ('previous', *self.previous)
+        for cycle, weights in self.anchors:
+            yield ('anchor', cycle, weights)
 
     def checkpoint_anchors(self):
         return list(self.anchors)
@@ -196,22 +168,26 @@ class Device:
         return first.elapsed_time(second) if self.cuda else (second-first)*1000
 
 
-def run(library, options=None, *, cycles=None, device='cuda', compile_model=True, checkpoint=None, resume=None, log_dir=None):
+def run(library, options=None, *, cycles=None, device='cuda', compile_model=None, checkpoint=None, resume=None, log_dir=None, fixed_opponent=None, references=None, opponent=None, max_seconds=None):
     """cycles=0 runs until interrupted or the Modal function timeout expires."""
     run_start = perf_counter()
+    if max_seconds is not None and max_seconds <= 0:
+        raise ValueError('max_seconds must be positive')
     options = dict(settings['klent'] if options is None else options)
     if cycles is not None:
         options['cycles'] = cycles
+    if fixed_opponent is not None:
+        options['fixed_opponent'] = fixed_opponent
+    if references is not None:
+        options['reference_checkpoints'] = list(references)
+    if opponent is not None:
+        options['fixed_opponent'] = True
+        options['opponent_checkpoint'] = str(opponent)
     restored = None
-    saved_anchors = None
     if resume is not None:
         restored = torch.load(resume,map_location='cpu',weights_only=True)
-        if restored['format_version'] != 1:
+        if restored['format_version'] not in (1, 2):
             raise ValueError('Unsupported checkpoint format')
-        # Legacy fixed-duration anchors have different semantics and cannot be
-        # promoted by score. New checkpoints carry the moving anchors in full.
-        if restored.get('anchor_system') == 'score_gated_v1':
-            saved_anchors = restored['anchors']
         if any(t.is_floating_point() and t.dtype != torch.float32
                for t in restored['model'].values()):
             raise ValueError('Resume requires an FP32 checkpoint')
@@ -224,9 +200,13 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                         if key in settings[model_key]}
         settings[model_key] = model_config
     validate(options)
-    reference_path = Path(options['reference_checkpoint'])
-    if not reference_path.is_absolute():
-        reference_path = CONFIG_PATH.parent / reference_path
+    if compile_model is None:
+        compile_model = options.get('compile_model', True)
+    fixed_opponent = options['fixed_opponent']
+    external_opponent = opponent is not None
+    reference_paths = [Path(path) for path in options['reference_checkpoints']]
+    reference_paths = [path if path.is_absolute() else CONFIG_PATH.parent / path
+                       for path in reference_paths]
     cycles = options['cycles']
     dev = Device(device)
     torch.manual_seed(options['seed'])
@@ -236,10 +216,6 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
     optimizer = torch.optim.AdamW(model.parameters(),lr=options['lr'],weight_decay=options['weight_decay'])
     if restored is not None:
         load_core_weights(model, restored['model'])
-        if saved_anchors is not None:
-            core_names = model.state_dict().keys()
-            saved_anchors = [(cycle, {name: weights[name] for name in core_names})
-                             for cycle, weights in saved_anchors]
         restore_optimizer(optimizer, restored['optimizer'], restored['model'], model)
         # Loading AdamW also restores param-group settings: apply current config.
         for group in optimizer.param_groups:
@@ -251,20 +227,54 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                 torch.cuda.set_rng_state(restored['cuda_rng'][0],device=device)
         else:
             torch.manual_seed(options['seed'])
-    reference_model, reference_cycle = load_reference_model(reference_path, device)
-    network = torch.compile(model,dynamic=False) if compile_model else model
-    previous = torch.compile(old,dynamic=False) if compile_model else old
-    reference_network = torch.compile(reference_model,dynamic=False) if compile_model else reference_model
+    with torch.random.fork_rng(devices=[]):
+        reference_models = [(str(path), *load_reference_model(path, device)) for path in reference_paths]
+        if opponent is not None:
+            opponent_path = Path(opponent)
+            if not opponent_path.is_absolute():
+                opponent_path = CONFIG_PATH.parent / opponent_path
+            opponent_checkpoint = torch.load(opponent_path, map_location='cpu', weights_only=True)
+            if (opponent_checkpoint.get('format_version') not in (1, 2) or
+                opponent_checkpoint.get('options', {}).get('model') not in MODELS):
+                raise ValueError(f'Unsupported opponent checkpoint: {opponent_path}')
+            if any(t.is_floating_point() and t.dtype != torch.float32
+                   for t in opponent_checkpoint['model'].values()):
+                raise ValueError('Opponent checkpoint requires FP32 weights')
+            opponent_name = opponent_checkpoint['options']['model']
+            opponent_config = opponent_checkpoint['model_config']
+            opponent_model = MODELS[opponent_name](opponent_config).to(
+                device=device, dtype=torch.float32, memory_format=torch.channels_last)
+            load_core_weights(opponent_model, opponent_checkpoint['model'])
+            opponent_model.eval().requires_grad_(False)
+            training_opponent = (opponent_checkpoint['summary']['cycle'],
+                                 ModelHistory.snapshot(opponent_model),
+                                 opponent_name, opponent_config)
+    compile_options = {'dynamic': False}
+    if options.get('compile_max_autotune', False):
+        compile_options['mode'] = 'max-autotune'
+    network = torch.compile(model,**compile_options) if compile_model else model
+    previous = torch.compile(old,**compile_options) if compile_model else old
+    reference_networks = [(path, torch.compile(net,**compile_options) if compile_model else net, cycle)
+                          for path, net, cycle in reference_models]
+    opponent_network = (torch.compile(opponent_model, **compile_options) if compile_model else opponent_model
+                        ) if external_opponent else None
     sq = torch.arange(80,device=device)
     indices = sq//8*16+2*(sq%8)+(sq//8%2)
-    batch = Batch(options['train_minibatch'],pinned=dev.cuda)
+    one_side = fixed_opponent and not options.get('both_sides', False)
+    batch = Batch(options['train_minibatch']//2 if one_side else options['train_minibatch'],
+                  pinned=dev.cuda, perspectives=1 if one_side else 2)
     rows = torch.arange(batch.rows,device=device)
+    if fixed_opponent:
+        game_rows = torch.arange(options['n'])
+        current_rows = 2*game_rows + (game_rows >= options['n']//2).long()
+        fixed_rows = 2*game_rows + 1 - (current_rows % 2)
     completed = 0 if restored is None else restored['summary']['cycle']
     stop_cycle = completed + cycles
     summaries = []
-    history = ModelHistory(options['anchor_thresholds'], saved_anchors or ())
-    if restored is not None and saved_anchors is None:
-        history.initialize_anchors(model, completed)
+    history = ModelHistory(options['anchor_interval'])
+    history.initialize_anchors(model, completed)
+    if not external_opponent:
+        training_opponent = (completed, history.snapshot(model)) if fixed_opponent else None
 
     def infer(net, boards):
         with torch.no_grad(), torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
@@ -302,16 +312,33 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                         options=options, model_config=settings[options['model']+'_model'],
                         precision='fp32-weights-bf16-autocast', device=str(device),
                         gpu=torch.cuda.get_device_name(device) if dev.cuda else None,
-                        torch_version=str(torch.__version__), compiled=compile_model)
+                        training_mode='fixed_opponent' if fixed_opponent else 'self_play',
+                        references=[str(path) for path in reference_paths],
+                        torch_version=str(torch.__version__), compiled=compile_model,
+                        compile_mode=('max-autotune' if options.get('compile_max_autotune', False)
+                                      else 'default') if compile_model else None)
         (log_dir/'run.json').write_text(json.dumps(metadata, indent=2)+'\n')
     output.setup(options, device, compile_model)
-    with Arena(library, options, pinned=dev.cuda, seed=(options['seed']+completed)%(2**64)) as arena:
+    if restored is None and checkpoint is not None:
+        initial = dict(cycle=0, evaluations=[], anchor_cycles=[0],
+                       training_mode='fixed_opponent' if fixed_opponent else 'self_play',
+                       training_opponent_cycle=training_opponent[0] if fixed_opponent else None,
+                       next_training_opponent_cycle=training_opponent[0] if fixed_opponent else None,
+                       timestamp=datetime.now(timezone.utc).isoformat())
+        checkpoint(model, optimizer, options, initial, history.checkpoint_anchors(),
+                   training_opponent)
+    with Arena(library, options, pinned=dev.cuda, fixed_opponent=fixed_opponent,
+               seed=(options['seed']+completed)%(2**64)) as arena:
         output.emit(f'  Setup      {perf_counter()-run_start:.2f} s')
         model_time = cpu_time = 0.0
         arena_step = 0
         while cycles == 0 or completed < stop_cycle:
             if arena_step == 0:
                 cycle_start = perf_counter()
+                if fixed_opponent:
+                    played_opponent_cycle = training_opponent[0]
+                    if not external_opponent:
+                        load_core_weights(old, training_opponent[1])
             arena_step += 1
             t = perf_counter()
             boards = arena.inputs()
@@ -319,11 +346,25 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             model.eval()
             torch.compiler.cudagraph_mark_step_begin()
             dev.sync(); t = perf_counter()
-            pi,q = infer(network,boards)
+            if fixed_opponent:
+                if options.get('both_sides', False):
+                    target_pi,target_q = infer(network,boards)
+                    pi,q = target_pi.clone(),target_q.clone()
+                else:
+                    current_pi,current_q = infer(network,boards[current_rows])
+                    pi = torch.empty((2*arena.n,80))
+                    q = torch.empty_like(pi)
+                    pi[current_rows],q[current_rows] = current_pi,current_q
+                fixed_pi,fixed_q = infer(opponent_network if external_opponent else previous,
+                                         boards[fixed_rows])
+                pi[fixed_rows],q[fixed_rows] = fixed_pi,fixed_q
+            else:
+                pi,q = infer(network,boards)
             dev.sync(); model_ms = (perf_counter()-t)*1000
             model_time += model_ms/1000
             t = perf_counter()
-            full = arena.step(pi,q)
+            full = (arena.step(pi,q,target_logits=target_pi,target_q=target_q)
+                    if fixed_opponent and options.get('both_sides', False) else arena.step(pi,q))
             if not full:
                 cpu_ms = (perf_counter()-t+encoding_time)*1000
                 cpu_time += cpu_ms/1000
@@ -339,99 +380,86 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             model.train()
             loss_sum = policy_sum = value_sum = 0.0
             timing_sum = [0.0, 0.0, 0.0]
-            accumulate = options['gradient_accumulation']
-            if accumulate:
-                optimizer.zero_grad(set_to_none=True)
-            for start in range(0,count,batch.rows//2):
+            for start in range(0,count,batch.positions):
                 valid_positions = arena.batch(start,batch)
                 b,stored_target,actions,returns = dev.transfer(batch.tensors)
                 b = b.contiguous(memory_format=torch.channels_last)
-                valid = (rows < 2*valid_positions).float()
-                if not accumulate:
-                    optimizer.zero_grad(set_to_none=True)
+                valid = (rows < batch.perspectives*valid_positions).float()
+                optimizer.zero_grad(set_to_none=True)
                 torch.compiler.cudagraph_mark_step_begin()
                 forward_start = dev.stamp()
                 with torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
                     logits,values = network(b)
-                    target = (recalculated_policy(logits,values,b,valid,options['alpha'],options['beta'])
-                              if options['policy_recalculation'] else stored_target)
-                    policy_loss,value_loss = losses(logits,values,target,actions,returns,valid)
-                    loss = (options['policy_loss_weight'] * policy_loss
-                            + options['q_loss_weight'] * value_loss)
+                    policy_loss,value_loss = losses(logits,values,stored_target,actions,returns,valid)
+                    loss = policy_loss + value_loss
                 forward_end = dev.stamp()
-                # Each minibatch loss is a mean over valid perspectives. Weight
-                # by its position count so the accumulated gradient is the mean
-                # over the whole cycle, including the final partial minibatch.
-                (loss * (valid_positions/count) if accumulate else loss).backward()
+                loss.backward()
                 backward_end = dev.stamp()
-                if not accumulate:
-                    optimizer.step()
+                optimizer.step()
                 optimizer_end = dev.stamp()
                 dev.sync()
                 loss_value = loss.item()
                 if not math.isfinite(loss_value):
                     raise RuntimeError('Nonfinite training loss')
                 loss_sum += loss_value*valid_positions
-                batch_number = start//(batch.rows//2)+1
+                batch_number = start//batch.positions+1
                 policy_sum += policy_loss.item()*valid_positions
                 value_sum += value_loss.item()*valid_positions
                 for j, (first, second) in enumerate(((forward_start,forward_end),
                         (forward_end,backward_end),(backward_end,optimizer_end))):
                     timing_sum[j] += dev.elapsed(first,second)
-            if accumulate:
-                optimizer_start = dev.stamp()
-                optimizer.step()
-                optimizer_end = dev.stamp()
-                dev.sync()
-                timing_sum[2] += dev.elapsed(optimizer_start,optimizer_end)
-            optimizer_steps = 1 if accumulate else batch_number
+            optimizer_steps = batch_number
             arena.clear()
             dev.sync(); training_time = perf_counter()-training_start
             training_exclusive_time = training_time
             cpu_total = cpu_time + shuffle_time
-            test_start = perf_counter()
             model.eval()
             evaluations = []
-            # The first three anchors initially share cycle 1. Reuse that
-            # deterministic match while keeping one report row per threshold.
-            matched_cycles = {}
-            opponents = list(history.opponents())
-            opponents.append(('reference', reference_cycle, None, None))
-            for kind, opponent_cycle, weights, anchor_index in opponents:
-                opponent_start = perf_counter()
-                shared_match = kind != 'reference' and opponent_cycle in matched_cycles
-                if shared_match:
-                    wins,draws,losses_count = matched_cycles[opponent_cycle]
-                else:
-                    if kind == 'reference':
-                        opponent = reference_network
+            test_time = 0.0
+            next_cycle = completed + 1
+            if next_cycle % options['test_interval'] == 0:
+                test_start = perf_counter()
+                matched_cycles = {}
+                for kind, opponent_cycle, weights in history.opponents():
+                    opponent_start = perf_counter()
+                    shared_match = opponent_cycle in matched_cycles
+                    if shared_match:
+                        wins,draws,losses_count = matched_cycles[opponent_cycle]
                     else:
-                        # Reuse one compiled opponent for previous and anchors.
                         load_core_weights(old, weights)
-                        opponent = previous
-                    wins,draws,losses_count = match(opponent)
-                    if kind != 'reference':
+                        wins,draws,losses_count = match(previous)
                         matched_cycles[opponent_cycle] = wins,draws,losses_count
-                dev.sync()
-                evaluations.append(dict(kind=kind, anchor_index=anchor_index,
-                    is_anchor=anchor_index is not None,
-                    age=None if kind == 'reference' else completed+1-opponent_cycle,
-                    opponent_cycle=opponent_cycle,
-                    wins=wins,draws=draws,losses=losses_count,
-                    win_rate=wins/options['test_games'],
-                    score_rate=(wins+0.5*draws)/options['test_games'],
-                    seconds=perf_counter()-opponent_start,
-                    shared_match=shared_match))
-            dev.sync(); test_time = perf_counter()-test_start
-            latest = evaluations[0]
-            wins,draws,losses_count = (latest[k] for k in ('wins','draws','losses'))
+                    dev.sync()
+                    evaluations.append(dict(kind=kind, is_anchor=kind == 'anchor',
+                        age=next_cycle-opponent_cycle, opponent_cycle=opponent_cycle,
+                        wins=wins,draws=draws,losses=losses_count,
+                        win_rate=wins/options['test_games'],
+                        score_rate=(wins+0.5*draws)/options['test_games'],
+                        seconds=perf_counter()-opponent_start,
+                        shared_match=shared_match))
+                for path, opponent, opponent_cycle in reference_networks:
+                    opponent_start = perf_counter()
+                    wins,draws,losses_count = match(opponent)
+                    dev.sync()
+                    evaluations.append(dict(kind='reference', is_anchor=False,
+                        reference_path=path, age=None, opponent_cycle=opponent_cycle,
+                        wins=wins,draws=draws,losses=losses_count,
+                        win_rate=wins/options['test_games'],
+                        score_rate=(wins+0.5*draws)/options['test_games'],
+                        seconds=perf_counter()-opponent_start, shared_match=False))
+                dev.sync(); test_time = perf_counter()-test_start
+            latest = evaluations[0] if evaluations else None
+            wins,draws,losses_count = ((latest[k] for k in ('wins','draws','losses'))
+                                        if latest else (None,None,None))
             completed += 1
-            if not history.anchors:
-                history.initialize_anchors(model, completed)
-                anchor_updates = []
-            else:
-                anchor_updates = history.update_anchors(model, completed, evaluations)
+            anchor_cycle = history.maybe_add_anchor(model, completed)
+            anchor_updates = [dict(new_cycle=anchor_cycle)] if anchor_cycle is not None else []
+            if fixed_opponent and not external_opponent and completed % options['opponent_interval'] == 0:
+                training_opponent = (completed, history.snapshot(model))
             summary = dict(cycle=completed,evaluations=evaluations,states=count,dropped_states=dropped,loss=loss_sum/count,
+                           training_mode='fixed_opponent' if fixed_opponent else 'self_play',
+                           training_opponent_cycle=played_opponent_cycle if fixed_opponent else None,
+                           next_training_opponent_cycle=training_opponent[0] if fixed_opponent else None,
                            anchor_cycles=[cycle for cycle,_ in history.anchors],
                            anchor_updates=anchor_updates,
                            model_seconds=model_time,cpu_seconds=cpu_total,
@@ -445,17 +473,17 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
                            mean_forward_ms=timing_sum[0]/batch_number,
                            mean_backward_ms=timing_sum[1]/batch_number,
                            mean_optimizer_ms=timing_sum[2]/optimizer_steps,
-                           policy_loss=policy_sum/count,q_loss=value_sum/count,
-                           policy_loss_weight=options['policy_loss_weight'],
-                           q_loss_weight=options['q_loss_weight'])
+                           policy_loss=policy_sum/count,q_loss=value_sum/count)
             summary.update(timestamp=datetime.now(timezone.utc).isoformat(),
                            elapsed_seconds=perf_counter()-run_start,
-                           win_rate=latest['win_rate'], score_rate=latest['score_rate'])
-            if checkpoint is not None:
-                checkpoint(model, optimizer, options, summary, history.checkpoint_anchors())
+                           win_rate=latest['win_rate'] if latest else None,
+                           score_rate=latest['score_rate'] if latest else None)
             if log_dir is not None:
                 with (log_dir/'metrics.jsonl').open('a') as stream:
                     stream.write(json.dumps(summary, allow_nan=False)+'\n')
+            if checkpoint is not None:
+                checkpoint(model, optimizer, options, summary, history.checkpoint_anchors(),
+                           training_opponent)
             if cycles:
                 summaries.append(summary)
             # A single report cannot include the duration of its own print call.
@@ -466,6 +494,8 @@ def run(library, options=None, *, cycles=None, device='cuda', compile_model=True
             output.summary(summary, timing)
             arena_step = 0
             model_time = cpu_time = 0.0
+            if max_seconds is not None and perf_counter()-run_start >= max_seconds:
+                break
     return summaries
 
 
@@ -475,19 +505,31 @@ def main():
     parser.add_argument('--device',default='cuda')
     parser.add_argument('--no-compile',action='store_true',help='CPU smoke testing only')
     parser.add_argument('--resume',type=Path,help='Restore weights, optimizer state, architecture and cycle number')
+    parser.add_argument('--reference',action='append',default=None,
+                        help='Strength-test checkpoint path; repeat for multiple references')
+    parser.add_argument('--oponent','--opponent',dest='opponent',type=Path,
+                        help='Train against this exact checkpoint for every cycle')
+    parser.add_argument('--name', help='Run folder name under checkpoints/klent and logs/klent')
     parser.add_argument('--checkpoint-dir',type=Path,help='Output directory; defaults to a new local run')
     parser.add_argument('--log-dir',type=Path,help='Metrics directory; defaults to logs/klent/<run-id>')
     args = parser.parse_args()
     from uuid import uuid4
+    import re
     from klent.checkpoint import save
-    run_id = uuid4().hex
+    if args.name and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}', args.name):
+        parser.error('--name must be 1–100 characters: letters, digits, dots, _ or -')
+    run_id = args.name or uuid4().hex
     directory = args.checkpoint_dir or Path('checkpoints/klent')/run_id
     log_dir = args.log_dir or Path('logs/klent')/run_id
-    def checkpoint(model,optimizer,options,summary,anchors):
-        path = save(directory,model,optimizer,options,summary,anchors)
+    if args.name and ((args.checkpoint_dir is None and directory.exists()) or
+                      (args.log_dir is None and log_dir.exists())):
+        parser.error(f'Run folder already exists: {run_id}')
+    def checkpoint(model,optimizer,options,summary,anchors,training_opponent):
+        path = save(directory,model,optimizer,options,summary,anchors,training_opponent)
         output.emit(f'Checkpoint saved: {path}')
-    run(args.library,device=args.device,compile_model=not args.no_compile,
-        checkpoint=checkpoint,resume=args.resume,log_dir=log_dir)
+    run(args.library,device=args.device,compile_model=False if args.no_compile else None,
+        checkpoint=checkpoint,resume=args.resume,references=args.reference,
+        opponent=args.opponent,log_dir=log_dir)
 
 
 if __name__ == '__main__':
